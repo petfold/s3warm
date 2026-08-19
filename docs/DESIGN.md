@@ -390,6 +390,14 @@ Rationale and exit criteria only; current progress is tracked with checkboxes in
 - **Serve straight from manifests, no index** — rejected for the serving path: Bee has no efficient manifest iteration/pagination API, and S3 listing semantics (delimiter roll-up, tokens) demand an ordered local structure. Kept as the *portability* layer instead.
 - **Per-write-batch feed updates (draft v0.1)** — superseded by the commit chain: history now lives in the immutable manifests themselves, demoting feeds to rare checkpoint anchors (§5). Recorded here because it is the obvious first design, and its costs — a signed, stamped SOC per batch, feed-lookup latency, single-writer feeds — are why it lost.
 
+### Related work
+
+- **[RTradeLtd/s3x](https://github.com/RTradeLtd/s3x)** (S3 over IPFS; dead since ~2021) — the closest prior art, and independent convergence on our three-layer shape: S3 front end, content-addressed store, local "ledger" mapping names to hashes (their ledger = our index, §5). It died with its two load-bearing dependencies: the MinIO gateway framework it forked (removed upstream in 2022) and TemporalX, the proprietary IPFS middleware it required — empirical support for two rejections above and for depending only on the standard Bee API. Two instructive contrasts: IPFS's UnixFS DAG links children of arbitrary size, so s3x got server-side multipart concatenation for free, while Swarm's fixed-arity BMT is exactly why §7 needs composite objects; and s3x's CRDT-replicated ledger option is the AP road we declined for the serving path (§10) — last-writer-wins convergence breaks read-after-write during partitions.
+- **Hosted S3-on-decentralized-storage** ([Filebase](https://filebase.com/), [4EVERLAND](https://www.4everland.org/)) — commercially successful S3 front ends over IPFS/Sia/Arweave, proving client demand for exactly this API shape — but custodial: the provider runs the index, holds the keys, does the pinning. s3warm is the self-hosted variant of the same shape.
+- **Protocol-native gateways** ([Storj gateway-st](https://github.com/storj/gateway-st), [Sia renterd's built-in S3 API](https://sia.tech/)) — the S3 gateways that thrived are first-party software shipped by the protocol team. That is the slot s3warm aims to fill for Swarm.
+
+Why no usable self-hosted S3 gateway exists for IPFS is itself instructive: IPFS has no protocol-level persistence economics — pinning is a business decision outside the protocol — so an honest gateway has no answer to "how long does a 200 last" without becoming a pinning company. Swarm's postage stamps are precisely that missing piece (§9), which is why the honest-semantics goal (§1) is achievable here at all.
+
 ---
 
 ## 21. Open questions
