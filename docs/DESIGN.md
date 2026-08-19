@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft v0.1 |
+| **Status** | Draft v0.2 — adds key-based tenancy via ACT, commit-chain buckets with checkpointed feeds, snapshots/rollback |
 | **Date** | 2026-08-19 |
 | **Scope** | Design of an Amazon S3–compatible HTTP API layer on top of [Swarm](https://www.ethswarm.org/), served by a gateway that talks to a [Bee](https://github.com/ethersphere/bee) node |
 
@@ -61,10 +61,11 @@ S3 clients (aws cli, boto3, rclone, mc, restic, SDKs)
 | **Postage batches (`/stamps`)** | Prepaid storage rights: batch = (amount, depth); TTL derived from amount and storage price; uploads must be stamped | Every write is stamped; stamp manager tracks utilization/TTL |
 | **Erasure coding** | Per-upload redundancy levels 0–4 (NONE, MEDIUM, STRONG, INSANE, PARANOID) | Mapped from `x-amz-storage-class` |
 | **Encryption** | `swarm-encrypt: true` → Bee encrypts; the 64-byte reference embeds the decryption key | Mapped from SSE (`x-amz-server-side-encryption`) |
-| **ACT** | Access Control Trie: grantee-based access to encrypted content | Phase 3 research: native shared access for private buckets |
+| **ACT** | Access Control Trie (Bee ≥ 2.2): per-content grantee lists with a key-wrapping history; grantees decrypt with their own keys | Authorization layer for private buckets — grants readable off-gateway; tenant = Ethereum key pair (§8) |
+| **Local pinning (`/pins`)** | Pin chunks on a node so they survive local GC | Bucket head roots and labeled snapshots stay pinned on the gateway's Bee node (§5) |
 | **`/stewardship`** | Check/repair retrievability of a reference | Ops tooling: periodic health sweep of indexed refs |
 
-Bee endpoints consumed by the gateway: `POST/GET /bytes`, `GET /health`, `GET /stamps`, `GET /stamps/{id}`, `POST /stamps/{amount}/{depth}`, `PATCH /stamps/topup|dilute/...`; phase 2 adds `/chunks` (mantaray node upload), `/soc` (feed updates), `/bzz` (manifest reads), `/tags`.
+Bee endpoints consumed by the gateway: `POST/GET /bytes` (including GET-side redundancy fetch strategy/fallback parameters, §17), `GET /health`, `GET /stamps`, `GET /stamps/{id}`, `POST /stamps/{amount}/{depth}`, `PATCH /stamps/topup|dilute/...`; phase 2 adds `/chunks` (mantaray node upload), `/soc` (feed checkpoints), `/bzz` (manifest reads), `/pins`, `/tags`; phase 3 adds `/grantees` (ACT grants).
 
 ---
 
@@ -82,9 +83,11 @@ Bee endpoints consumed by the gateway: `POST/GET /bytes`, `GET /health`, `GET /s
 | CopyObject | New index row pointing at the **same** reference | Server-side copy is O(1), zero data movement |
 | Storage class | Erasure-coding redundancy level (§12) | |
 | SSE-S3 (`AES256`) | `swarm-encrypt: true`; 64-byte ref held privately in the index | Ref is never exposed for encrypted objects (it contains the key) |
+| Bucket ACL / grants | Per-bucket ACT grantee list; grantee = Ethereum public key | Grants extend to native off-gateway reads; revocation is forward-only (§8) |
+| Bucket snapshot / rollback (extension) | Labeled manifest root from the bucket's commit chain | Atomic O(1) whole-bucket rollback — no S3 equivalent (§5) |
 | Lifecycle / expiry | Postage batch TTL | Read-only mapping: expiry surfaced via headers; extending = topping up the batch |
 | Region | Single configurable label (default `us-east-1` for client compatibility) | SigV4 scope accepted for any region string |
-| Account / credentials | Access-key/secret pairs in gateway config or credential store | Multi-tenant mapping to feed-owner keys + default batches in phase 3 |
+| Account / credentials | Access-key/secret pairs linked to a tenant Ethereum key pair (feed owner + ACT publisher) | Key-based multi-tenancy in phase 3 (§8) |
 | Durability / replication config | Inherent (network-level redundancy + optional erasure coding) | Replication APIs intentionally unsupported |
 
 **The killer property:** because every object is content-addressed, any object written through s3warm is *also* retrievable from any public Swarm gateway via its reference — and a phase-2 bucket is a browsable `bzz://` manifest. S3 compatibility without S3 lock-in.
@@ -118,7 +121,9 @@ S3 semantics that Swarm cannot serve directly — millisecond `HEAD`, ordered li
 ### Schema (logical)
 
 ```
-buckets(name PK, created_at, batch_id, versioning, manifest_ref, feed_topic)
+buckets(name PK, created_at, batch_id, versioning, head_root, commit_seq,
+        checkpoint_root, feed_topic)
+snapshots(bucket, label, root_ref, commit_seq, created_at)
 objects(bucket, key, version_id, swarm_ref, size, etag, content_type,
         user_meta JSONB, storage_class, encrypted, parts JSONB NULL,
         last_modified, is_latest, delete_marker)
@@ -130,19 +135,29 @@ credentials(access_key PK, secret_encrypted, tenant, created_at)
 
 Ordered listing = a range scan over `(bucket, key)`; delimiter roll-up computed by the gateway (§6).
 
-### Manifest sync modes (phase 2)
+### Bucket state as a commit chain (phase 2)
 
-The gateway maintains, per bucket, a mantaray manifest on Swarm whose root is published under a feed (`owner = gateway/tenant key`, `topic = keccak256("s3warm/1/" + bucket)`). Manifest nodes are built gateway-side (Bee's own `manifest/mantaray` Go package) and uploaded as chunks; feed updates are signed SOCs — exactly the mechanism bee-js uses, no server-side manifest editing required.
+The gateway maintains, per bucket, a mantaray manifest on Swarm. Manifest nodes are built gateway-side (Bee's own `manifest/mantaray` Go package) and uploaded as chunks — no server-side manifest editing required. Every manifest root is already an immutable snapshot of the whole bucket, and the design exploits that: a reserved fork, `/.s3warm/commit`, holds the **parent root reference**, a sequence number, a timestamp and an op summary. Each debounced write-batch produces a new root that links backward — a git-like chain in which unchanged forks are structurally shared, so a commit costs only the changed path's node chain. Commits are built per write-batch by default (`commit=async`, debounced) or per PUT (`commit=sync`) for buckets whose `bzz://` view must never lag.
 
-| Mode | Behavior | Use |
+### Feeds as checkpoint anchors
+
+The mutable pointer (feed: `owner = tenant key`, `topic = keccak256("s3warm/1/" + bucket)`, updates as signed SOCs — the bee-js mechanism) is deliberately **not** advanced per write-batch. Feeds are the operationally weakest part of Swarm writes: every update is a signed, stamped SOC; lookups are the latency-sensitive, eventually-consistent path; and concurrent writers cannot share one safely. Because each commit links to its parent, any sufficiently recent root reconstructs the full history — so the feed only needs to advance on a slow cadence:
+
+| Checkpoint policy | Feed advanced | Use |
 |---|---|---|
-| `sync` | Manifest + feed updated before the PUT returns | Small buckets where `bzz://` view must never lag |
-| `async` (default) | Debounced background updates (batches many PUTs into one manifest write) | General use |
-| `off` | Index only | Cheapest; no portable bucket view |
+| `every-commit` | On each commit | Small buckets; recovery anchor never lags |
+| `interval` (default) | Every N commits or T seconds, plus on clean shutdown | General use — write amplification drops from O(write-batches) to O(checkpoints) |
+| `manual` | Only on explicit flush or snapshot | Bulk loads, cost-minimal |
+
+The honest trade-off: content addressing only points backward, so after a **total** index loss, head *discovery* is only as fresh as the last checkpoint — data is never lost, but discoverability of the tail delta is bounded by the checkpoint interval. The interval is the tunable.
+
+### Snapshots & rollback
+
+A snapshot is a labeled commit: record the root reference in `snapshots`, pin it on the gateway's Bee node, optionally re-stamp for retention (snapshot lifetime is otherwise bounded by its batch TTL). Restore is pointing the bucket head at an old root — an **atomic, O(1) rollback of the entire bucket**, something S3 itself cannot do. Exposed as an `x-swarm-*` extension on the bucket resource plus admin CLI rather than a contorted S3 verb; `HeadBucket` returns `x-swarm-bucket-root` and `x-swarm-commit-seq` so any client can capture a snapshot reference cheaply.
 
 ### Recovery
 
-Given the feed owner key and bucket name, a fresh gateway can rebuild its entire index by resolving the feed → walking the manifest (keys, refs, metadata are all in the forks). The index is a cache with a documented rebuild procedure — losing it is an inconvenience, not data loss.
+Given the feed owner key and bucket name, a fresh gateway rebuilds its index by resolving the feed → latest checkpointed root → walking the manifest (keys, refs, metadata are all in the forks), and enumerates history by following parent links. Commits after the last checkpoint are rediscoverable only from the index — hence the clean-shutdown checkpoint. The index remains a cache with a documented rebuild procedure; losing it is an inconvenience, not data loss.
 
 ---
 
@@ -160,7 +175,7 @@ client ──► SigV4 verify (headers only)
        ──► verify x-amz-content-sha256 / Content-MD5 against accumulators
              mismatch → error, index row NOT written (stray stamped bytes simply expire)
        ──► index upsert (bucket, key) → ref, size, etag, metadata   [txn]
-       ──► enqueue manifest sync (phase 2)
+       ──► enqueue commit (phase 2, §5)
        ◄── 200, ETag:"<md5>", x-swarm-reference:<ref>
 ```
 
@@ -170,7 +185,7 @@ Zero-byte objects (directory markers created by consoles/clients) are indexed wi
 
 ### GetObject
 
-Index lookup → conditional headers (`If-Match`/`If-None-Match`/`If-(Un)Modified-Since`) evaluated locally → `GET {bee}/bytes/{ref}` with pass-through `Range` → stream body; gateway sets `ETag`, `Last-Modified`, `Content-Type`, `x-amz-meta-*`, `Accept-Ranges`, `x-swarm-reference` (omitted for encrypted objects — the 64-byte ref embeds the key).
+Index lookup → conditional headers (`If-Match`/`If-None-Match`/`If-(Un)Modified-Since`) evaluated locally → `GET {bee}/bytes/{ref}` with pass-through `Range` and the configured erasure-coding fetch strategy/fallback (§17) → stream body; gateway sets `ETag`, `Last-Modified`, `Content-Type`, `x-amz-meta-*`, `Accept-Ranges`, `x-swarm-reference` (omitted for encrypted objects — the 64-byte ref embeds the key).
 
 ### ListObjectsV2 / V1
 
@@ -178,7 +193,7 @@ Served entirely from the index. Range scan from `(bucket, prefix, after)`; delim
 
 ### DeleteObject / DeleteObjects
 
-Index row(s) removed (versioned buckets: delete marker inserted); manifest fork removed on next sync. Physical bytes remain until their batch expires — stated plainly in docs and in the `x-swarm-*` response headers, because it is a real difference from S3 and users making compliance decisions must know it.
+Index row(s) removed (versioned buckets: delete marker inserted); manifest fork removed on the next commit. Physical bytes remain until their batch expires — stated plainly in docs and in the `x-swarm-*` response headers, because it is a real difference from S3 and users making compliance decisions must know it.
 
 ### CopyObject
 
@@ -202,12 +217,23 @@ On Swarm (manifest view), an unconsolidated composite is represented as a small 
 
 ## 8. Authentication & authorization
 
+Two complementary layers: SigV4 authenticates S3 clients at the gateway; ACT makes the resulting grants *portable* — enforceable by Swarm itself, off-gateway.
+
+### Layer 1 — S3-dialect authentication (gateway-enforced)
+
 - **AWS Signature V4, header-based** (phase 1): canonical request reconstruction with S3's single-encoding path rules; constant-time signature compare; ±15 min clock-skew window; any region label accepted in the credential scope (service must be `s3`).
 - **Presigned URLs** (phase 2): query-string SigV4 (`X-Amz-*` params, `UNSIGNED-PAYLOAD`), expiry enforcement. Enables browser upload/download straight through the gateway.
 - **Streaming signatures** (phase 2): `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` (`aws-chunked`) chunk-signature verification and trailing checksums (`x-amz-checksum-crc32/crc32c/sha1/sha256`) — required for full Java SDK v2 / newer SDK defaults.
 - **Credentials**: provider interface; static pair via env/flags now, file/DB-backed multi-key store later. SigV4 requires the *actual* secret to derive signing keys, so secrets are stored recoverable — encrypted at rest with a gateway master key, never hashed.
 - **Anonymous/dev mode**: explicit opt-in flag for local development; loud warning at startup.
-- **Authorization** (phase 3): per-access-key bucket grants (read/write/owner), a useful subset of bucket policy expressed as simple grants — not the full IAM policy language. ACT integration researched for cryptographic (not gateway-enforced) sharing of encrypted buckets.
+
+### Layer 2 — key-based tenancy and ACT authorization (phase 3)
+
+- **A tenant is an Ethereum key pair**, held by the gateway; the credentials table links S3 access keys to it. The same key owns the bucket's feed and acts as ACT publisher — so bucket ownership handoff is a key handoff.
+- **Private buckets are uploaded with `swarm-act: true`** under the bucket owner's publisher key, with **one grantee list and ACT history per bucket**. Per-object ACT would multiply history lookups and stamp costs for no S3-semantic gain — S3 access patterns are overwhelmingly bucket-granular.
+- **Grants map onto Bee's grantee endpoints** (`POST`/`PATCH /grantees`): grantee ID = Ethereum public key. The S3-facing surface is the `PutBucketAcl`-adjacent grants API; the gateway still checks grants on the fast path, ACT makes the same grants independently true on Swarm.
+- **The payoff:** a grantee reads a private bucket directly from any Bee node with their own key — no s3warm in the path, no trust in the gateway after the grant. This extends the no-lock-in property (§3) from public objects to private data.
+- **Caveats, stated plainly:** revocation is forward-only (ciphertext already readable stays readable — you cannot un-share); reads pay an ACT history lookup; ACT content has 64-byte encrypted references, so `x-swarm-reference` stays suppressed and native access needs the publisher/history headers rather than a bare URL.
 
 ---
 
@@ -238,6 +264,8 @@ Capacity planning cheat-sheet (documented for operators): batch capacity ≈ 2^d
 ## 11. Versioning (phase 3)
 
 Content addressing makes S3 versioning almost free: every overwrite already creates a new reference and the old bytes remain retrievable while stamped. Enabling versioning on a bucket = keep the old index rows (`version_id` = ULID, monotonic, sortable) instead of superseding them, insert delete markers on DELETE, expose `GET ?versionId=`, `ListObjectVersions`. Version lifetime is bounded by stamp TTL, not by S3 lifecycle rules — surfaced in docs and headers.
+
+The commit chain (§5) is the *portable* representation of history: bucket-level, recoverable by walking parent links from any root. The index still materializes per-object versions, because S3 versioning semantics — interleaved version ids, delete markers, `ListObjectVersions` — need ordered per-key access that a per-request DAG walk cannot serve. The two compose: per-object versions for S3 clients, whole-bucket snapshots (§5) for operators.
 
 ---
 
@@ -282,8 +310,8 @@ S3 XML error envelope (`Code`, `Message`, `Resource`, `RequestId`) throughout. H
 Full per-operation matrix: [`docs/API-COMPATIBILITY.md`](API-COMPATIBILITY.md). Summary:
 
 - **Phase 1 (MVP):** ListBuckets, Create/Head/Delete-Bucket, GetBucketLocation, PutObject, GetObject (+Range), HeadObject, DeleteObject(s), CopyObject, ListObjectsV2/V1, SigV4 header auth.
-- **Phase 2:** full multipart set, presigned URLs, streaming signatures + trailing checksums, GetObjectAttributes, conditional PUT, manifest/feed sync, SSE, CORS.
-- **Phase 3:** versioning suite, tagging, policy-subset authorization, multi-tenancy, stamp autopilot, Postgres HA, ACT.
+- **Phase 2:** full multipart set, presigned URLs, streaming signatures + trailing checksums, GetObjectAttributes, conditional PUT, commit-chain manifests + checkpointed feeds, snapshots/rollback, SSE, CORS.
+- **Phase 3:** versioning suite, tagging, ACT-backed grants + key-based multi-tenancy, stamp autopilot, Postgres HA, PSS/GSOC notification research.
 - **Deliberately unsupported:** ACL mutation (canned `private` only), website hosting (that's native `bzz://`), replication/inventory/analytics/Glacier/S3 Select/Object Lock/Torrent.
 
 ---
@@ -302,8 +330,9 @@ Full per-operation matrix: [`docs/API-COMPATIBILITY.md`](API-COMPATIBILITY.md). 
 
 - Structured logs (slog) with request id, access key, bucket/key, Bee latency.
 - Prometheus `/metrics`: request rates/latencies by op, Bee upstream latencies/errors, stamp utilization + TTL gauges, bytes in/out, in-flight multipart sessions.
-- `/healthz` (process) and `/readyz` (Bee reachability + index ping).
-- Admin surface (`s3warmctl` or `/admin` behind separate auth): credential management, batch binding, manifest resync, index rebuild-from-feed, reference import.
+- `/_s3warm/health` (process) and `/_s3warm/ready` (Bee reachability + index ping) — an underscore prefix no valid bucket name can shadow.
+- The gateway's Bee node pins current bucket head roots and labeled snapshots, so the portable representation survives local garbage collection.
+- Admin surface (`s3warmctl` or `/admin` behind separate auth): credential and grantee management, batch binding, checkpoint flush, snapshot/rollback, index rebuild-from-feed, reference import.
 
 ---
 
@@ -312,7 +341,8 @@ Full per-operation matrix: [`docs/API-COMPATIBILITY.md`](API-COMPATIBILITY.md). 
 - Everything streams; per-request memory is O(hash state + copy buffer). No spooling to disk, including multipart.
 - Bee connection pooling with keep-alive; per-op timeouts; upstream parallelism is Bee's chunking pipeline, not the gateway's problem.
 - Listing never touches Bee. HEAD never touches Bee.
-- Manifest/feed writes are debounced and off the hot path.
+- Reads pass Bee's erasure-coding fetch strategy/fallback parameters through (configurable), trading latency for retrieval robustness.
+- Commits are debounced; feed checkpoints are rarer still (§5) — both off the hot path.
 - Optional read-through LRU (ref → recent bytes) for hot small objects — deferred until measured need.
 
 ---
@@ -334,8 +364,8 @@ Full per-operation matrix: [`docs/API-COMPATIBILITY.md`](API-COMPATIBILITY.md). 
 |---|---|---|
 | **0 — skeleton** (this repo) | Design; compiling gateway: routing, SigV4, errors, in-memory index, Bee client, MVP object/bucket ops | `aws s3 cp/ls/rm` round-trips against `bee dev` |
 | **1 — MVP** | SQLite index, stamp manager v1, conditional requests, hardening, docker-compose, CI conformance harness | rclone sync of a real tree; s3-tests subset green |
-| **2 — compatibility** | Multipart, presigned, streaming sigs + checksums, SSE, manifest/feed sync, GetObjectAttributes, CORS | restic + Java SDK v2 work; buckets browsable via `bzz://` |
-| **3 — production** | Versioning, tagging, policy subset, multi-tenant, Postgres HA, stamp autopilot, ACT research | Multi-gateway deployment behind LB |
+| **2 — compatibility** | Multipart, presigned, streaming sigs + checksums, SSE, commit-chain manifests + checkpointed feeds, snapshots/rollback, GetObjectAttributes, CORS | restic + Java SDK v2 work; buckets browsable via `bzz://`; snapshot → rollback round-trip |
+| **3 — production** | Versioning, tagging, ACT-backed grants + key-based multi-tenancy, Postgres HA, stamp autopilot, PSS/GSOC notification research | Multi-gateway behind LB; a grantee reads a private bucket off-gateway |
 
 ---
 
@@ -345,17 +375,21 @@ Full per-operation matrix: [`docs/API-COMPATIBILITY.md`](API-COMPATIBILITY.md). 
 - **Fork MinIO** — rejected: AGPL implications, and the MinIO gateway framework was removed upstream in 2022. Its test corpus and routing patterns remain useful references.
 - **Zenko CloudServer custom backend** — rejected: heavyweight Node.js stack; the surrounding ecosystem (Bee, tooling) is Go.
 - **Serve straight from manifests, no index** — rejected for the serving path: Bee has no efficient manifest iteration/pagination API, and S3 listing semantics (delimiter roll-up, tokens) demand an ordered local structure. Kept as the *portability* layer instead.
+- **Per-write-batch feed updates (draft v0.1)** — superseded by the commit chain: history now lives in the immutable manifests themselves, demoting feeds to rare checkpoint anchors (§5). Recorded here because it is the obvious first design, and its costs — a signed, stamped SOC per batch, feed-lookup latency, single-writer feeds — are why it lost.
 
 ---
 
 ## 21. Open questions
 
-1. Feed topic scheme for multi-writer / transferred buckets (bucket ownership handoff = feed owner key handoff?).
+1. Bucket ownership handoff = handing over the tenant key (feed owner + ACT publisher). Is a re-key-and-copy flow needed for handoffs that must not share the old key?
 2. Should consolidation of composite objects default on (bzz-parity) or off (cheaper)? Needs cost measurement on real Bee.
 3. Global bucket namespace vs per-access-key namespaces for multi-tenant deployments.
 4. Best surfacing of stamp economics: synthetic lifecycle rules vs `x-swarm-*` headers only.
 5. Integrity for `UNSIGNED-PAYLOAD` writes: require trailing CRC checksums when signature doesn't cover the body?
 6. `bee dev` fidelity limits for CI (postage semantics differ from mainnet in places) — how much needs a testnet job?
+7. Checkpoint cadence defaults: what N commits / T seconds balances write cost against recovery freshness, and is the clean-shutdown flush enough for most operators?
+8. S3 Event Notifications over Swarm's native pub-sub (PSS/GSOC): the mechanism exists — is the demand worth the API surface?
+9. ACT revocation vs S3 expectations: forward-only revocation must be surfaced loudly — in docs, headers, or the grants API response?
 
 ---
 

@@ -24,14 +24,15 @@ Design rationale: [`DESIGN.md`](DESIGN.md).
 | GetBucketVersioning | 🪧 | Empty config (unversioned) until P3 |
 | PutBucketVersioning | 🎯 P3 | |
 | ListObjectVersions | 🎯 P3 | |
-| GetBucketAcl / PutBucketAcl | 🪧 P2 | Canned `private` returned; mutation rejected |
+| GetBucketAcl / PutBucketAcl | 🎯 P3 | Grants map to the bucket's ACT grantee list (grantee = Ethereum public key, design §8); canned `private` until then |
 | GetBucketPolicy / PutBucketPolicy | 🎯 P3 | Grant-subset only, not full IAM policy language |
 | GetBucketCors / PutBucketCors | 🎯 P2 | Gateway-level CORS |
 | GetBucketLifecycleConfiguration | 🎯 P2 | Read-only synthetic rule derived from postage batch TTL |
 | PutBucketLifecycleConfiguration | ❌ | Expiry is postage TTL; extend by topping up the batch |
 | GetBucketTagging / PutBucketTagging | 🎯 P3 | |
 | ListMultipartUploads | 🎯 P2 | |
-| Website / Replication / Inventory / Analytics / Metrics / Accelerate / Logging / Notification / RequestPayment / ObjectLock config | ❌ | Website = native `bzz://`; replication is inherent to Swarm |
+| Get/PutBucketNotificationConfiguration | 🎯 research | Candidate mapping to Swarm's native pub-sub (PSS/GSOC), design §21 |
+| Website / Replication / Inventory / Analytics / Metrics / Accelerate / Logging / RequestPayment / ObjectLock config | ❌ | Website = native `bzz://`; replication is inherent to Swarm |
 
 ## Object operations
 
@@ -68,8 +69,13 @@ Design rationale: [`DESIGN.md`](DESIGN.md).
 
 ## Semantics extensions (`x-swarm-*`)
 
-| Header | Direction | Meaning |
+| Extension | Direction | Meaning |
 |---|---|---|
 | `x-swarm-reference` | response | Swarm reference of the object (omitted for encrypted objects) |
 | `x-swarm-postage-batch-id` | request | Batch override for this write / bucket default at CreateBucket |
 | `x-swarm-batch-ttl` | response | 🎯 P1 — seconds until the object's batch expires |
+| `x-swarm-bucket-root` | response | 🎯 P2 — current commit root of the bucket (HeadBucket); capture it to snapshot |
+| `x-swarm-commit-seq` | response | 🎯 P2 — bucket commit sequence number (HeadBucket) |
+| Snapshot / rollback | extension op | 🎯 P2 — label a commit root; restore the bucket head to one (bucket-resource extension + admin CLI, design §5) |
+| `x-swarm-redundancy-strategy` | request | 🎯 P2 — erasure-coding fetch strategy/fallback override on GET |
+| Grants API | extension op | 🎯 P3 — per-bucket ACT grantee management; grants readable off-gateway (design §8) |
