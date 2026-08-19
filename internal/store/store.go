@@ -115,6 +115,16 @@ type Object struct {
 	// Tags holds the object's tag set as JSON ("" = none). Tags are
 	// per-version and mutable in place.
 	Tags string
+	// ActAt (unix seconds) and ActHistory pin the object's ACT decryption
+	// epoch (design §8): the history address the bytes were uploaded under
+	// and the write time to look it up at. Both are required — grant
+	// mutations (revokes especially) re-key into a *new* history that cannot
+	// decrypt every older epoch (verified against a live Bee node). Copies
+	// carry the source's values: the bytes are the source's. Zero values on
+	// non-ACT objects and pre-ACT rows (readers fall back to LastModified
+	// and the bucket's current history).
+	ActAt      int64
+	ActHistory string
 	// Versioning fields (design §11). VersionID is "null" for writes into
 	// never-versioned or suspended buckets; VSeq orders a key's versions
 	// (write-time UnixNano); DeleteMarker rows shadow the key.
@@ -135,6 +145,9 @@ type Part struct {
 	Size         int64
 	ETag         string // hex MD5 of the part, unquoted
 	LastModified time.Time
+	// ActAt/ActHistory: see Object — parts have their own write epochs.
+	ActAt      int64  `json:",omitempty"`
+	ActHistory string `json:",omitempty"`
 }
 
 // MultipartUpload is an in-progress upload session (design §7).

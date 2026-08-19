@@ -275,9 +275,9 @@ race two histories into existence.
 | `PUT /{bucket}?x-swarm-grants` | Mutate grants: JSON body `{"add": [pubkey...], "revoke": [pubkey...]}`. Grantees are compressed secp256k1 public keys (66 hex chars, `02`/`03` prefix) — e.g. another Bee node's `publicKey` from its `GET /addresses` |
 
 **The payoff.** A grantee reads the bucket's objects directly from *any*
-Bee node with their own key: take `x-swarm-reference` from an object plus
-`x-swarm-act-history` and `x-swarm-act-publisher` (on object responses and
-HeadBucket), then
+Bee node with their own key: take `x-swarm-reference`,
+`x-swarm-act-history` and `x-swarm-act-publisher` from the object's
+response, then
 
 ```
 curl http://<their-bee>/bytes/<reference> \
@@ -291,6 +291,12 @@ uploaded *before* the grant become readable too.
 **Caveats, stated plainly** (design §8):
 - **Revocation is forward-only.** Content a grantee already fetched (or
   could have fetched) stays decryptable by them — you cannot un-share.
+- **Grant mutations re-key.** Each mutation (revokes especially) starts a
+  new history epoch; content must be decrypted with the history and time it
+  was *written* under (verified against a live node). The gateway pins both
+  per object and serves the right pair on every response — an object's
+  `x-swarm-act-history` is its own epoch's, which may differ from
+  HeadBucket's current one.
 - Reads pay an ACT history lookup on the Bee node.
 - ACT references are 64-byte encrypted references: possession alone grants
   nothing, so `x-swarm-reference` is still exposed — but a bare `bzz://`

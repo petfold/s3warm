@@ -94,9 +94,10 @@ func main() {
 			io.WriteString(w, `{"code":404,"message":"not found"}`) //nolint:errcheck
 			return
 		}
+		// Epoch-strict, like a real node after grant mutations: only the
+		// exact history the bytes were written under decrypts them.
 		if isAct {
-			_ = actHistory // any known history may unlock it after patches
-			if r.Header.Get("swarm-act-history-address") == "" ||
+			if r.Header.Get("swarm-act-history-address") != actHistory ||
 				r.Header.Get("swarm-act-publisher") != publisherKey {
 				w.WriteHeader(http.StatusNotFound)
 				io.WriteString(w, `{"code":404,"message":"act credentials required"}`) //nolint:errcheck

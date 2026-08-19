@@ -103,6 +103,10 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 		Checksum:          res.Checksum,
 		Encrypted:         encrypt,
 	}
+	if b.ACT {
+		obj.ActAt = obj.LastModified.Unix()
+		obj.ActHistory = res.ActHistory
+	}
 	versionHeader := stampVersion(&obj, b.Versioning)
 	// On a precondition race the object is not indexed; the stray stamped
 	// bytes simply expire (design §6).
@@ -170,6 +174,7 @@ type uploadResult struct {
 	ETag              string // hex MD5, unquoted
 	ChecksumAlgorithm string // uppercase, when a flexible checksum was requested
 	Checksum          string // base64
+	ActHistory        string // the ACT history the bytes were written under ("" = not ACT)
 }
 
 // uploadBody streams r's body to Bee while hashing — MD5 for the S3 ETag,
@@ -234,7 +239,10 @@ func (s *Server) uploadBody(r *http.Request, b *store.Bucket, batch, storageClas
 	}
 
 	act := b != nil && b.ACT
-	var ref string
+	var ref, actHistory string
+	if act {
+		actHistory = b.ActHistory
+	}
 	if length != 0 {
 		opts := bee.UploadOptions{
 			BatchID:         batch,
@@ -257,11 +265,14 @@ func (s *Server) uploadBody(r *http.Request, b *store.Bucket, batch, storageClas
 			e := beeError(err)
 			return nil, &e
 		}
-		if act && history != "" && history != b.ActHistory {
-			// The history normally stays fixed (created at bucket creation);
-			// track it anyway in case the node started a fresh one.
-			if serr := s.store.SetBucketACT(r.Context(), b.Name, history, b.ActGrantees); serr == nil {
-				b.ActHistory = history
+		if act && history != "" {
+			actHistory = history
+			if history != b.ActHistory {
+				// The history normally stays fixed between grant mutations;
+				// track it anyway in case the node started a fresh one.
+				if serr := s.store.SetBucketACT(r.Context(), b.Name, history, b.ActGrantees); serr == nil {
+					b.ActHistory = history
+				}
 			}
 		}
 	} else if chunked != nil {
@@ -292,6 +303,9 @@ func (s *Server) uploadBody(r *http.Request, b *store.Bucket, batch, storageClas
 	}
 
 	res := &uploadResult{Ref: ref, Size: counted.n, ETag: hex.EncodeToString(md5sum)}
+	if act && ref != "" {
+		res.ActHistory = actHistory
+	}
 	if ck != nil {
 		digest := base64.StdEncoding.EncodeToString(ckHash.Sum(nil))
 		expected := ck.expected
@@ -311,7 +325,25 @@ func (s *Server) uploadBody(r *http.Request, b *store.Bucket, batch, storageClas
 // downloadOptions builds read options: erasure-coding fetch strategy from
 // the per-request x-swarm-redundancy-strategy override or the configured
 // default (design §17).
-func (s *Server) downloadOptions(r *http.Request, rangeSpec string, b *store.Bucket) bee.DownloadOptions {
+// actWriteTime resolves the ACT history-lookup timestamp for stored bytes:
+// the recorded ActAt, or the row's LastModified for pre-ACT rows.
+func actWriteTime(actAt int64, fallback time.Time) int64 {
+	if actAt > 0 {
+		return actAt
+	}
+	return fallback.Unix()
+}
+
+// actHistoryFor resolves the history to decrypt stored bytes with: the one
+// recorded at write time, or the bucket's current one for pre-ACT rows.
+func actHistoryFor(recorded string, b *store.Bucket) string {
+	if recorded != "" {
+		return recorded
+	}
+	return b.ActHistory
+}
+
+func (s *Server) downloadOptions(r *http.Request, rangeSpec string, b *store.Bucket, actHistory string, writtenAt int64) bee.DownloadOptions {
 	strategy := r.Header.Get("x-swarm-redundancy-strategy")
 	if strategy == "" {
 		strategy = s.cfg.FetchStrategy
@@ -322,9 +354,13 @@ func (s *Server) downloadOptions(r *http.Request, rangeSpec string, b *store.Buc
 		FallbackMode: r.Header.Get("x-swarm-redundancy-fallback-mode"),
 	}
 	if b != nil && b.ACT {
-		// The gateway reads its own ACT content as publisher (design §8).
-		o.ActHistory = b.ActHistory
+		// The gateway reads its own ACT content as publisher (design §8),
+		// with the *write-time* history and timestamp: grant mutations
+		// (revokes especially) re-key into a new history that cannot decrypt
+		// every older epoch (verified against a live node).
+		o.ActHistory = actHistoryFor(actHistory, b)
 		o.ActPublisher, _ = s.publisherKey(r)
+		o.ActTimestamp = writtenAt
 	}
 	return o
 }
@@ -463,7 +499,8 @@ func (s *Server) handleGetObject(w http.ResponseWriter, r *http.Request, bucket,
 		h.Set("x-swarm-reference", obj.SwarmRef)
 	}
 	if b.ACT {
-		h.Set("x-swarm-act-history", b.ActHistory)
+		// The object's own write-epoch history — the one that decrypts it.
+		h.Set("x-swarm-act-history", actHistoryFor(obj.ActHistory, b))
 		if pub, perr := s.publisherKey(r); perr == nil {
 			h.Set("x-swarm-act-publisher", pub)
 		}
@@ -501,7 +538,7 @@ func (s *Server) handleGetObject(w http.ResponseWriter, r *http.Request, bucket,
 		return
 	}
 
-	resp, err := s.bee.DownloadBytes(ctx, obj.SwarmRef, s.downloadOptions(r, r.Header.Get("Range"), b))
+	resp, err := s.bee.DownloadBytes(ctx, obj.SwarmRef, s.downloadOptions(r, r.Header.Get("Range"), b, obj.ActHistory, actWriteTime(obj.ActAt, obj.LastModified)))
 	if err != nil {
 		s.writeError(w, r, beeError(err))
 		return
@@ -657,6 +694,16 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, bucket
 	obj := *srcObj
 	obj.Bucket, obj.Key = bucket, key
 	obj.LastModified = time.Now().UTC()
+	if b.ACT {
+		// The copied reference keeps the source's encryption epoch — pin it
+		// for pre-ActAt source rows too.
+		if obj.ActAt == 0 {
+			obj.ActAt = srcObj.LastModified.Unix()
+		}
+		if obj.ActHistory == "" {
+			obj.ActHistory = srcB.ActHistory
+		}
+	}
 	if directive == "REPLACE" {
 		obj.ContentType = r.Header.Get("Content-Type")
 		obj.UserMetadata = userMetadata(r.Header)
@@ -869,7 +916,9 @@ func (s *Server) serveComposite(w http.ResponseWriter, r *http.Request, obj *sto
 		}
 		lo := max(start-partStart, 0)
 		hi := min(p.Size-1, lo+remaining-1)
-		resp, err := s.bee.DownloadBytes(ctx, p.SwarmRef, s.downloadOptions(r, fmt.Sprintf("bytes=%d-%d", lo, hi), b))
+		// Parts carry their own write epochs — the composite's LastModified
+		// is the completion time, which may postdate a history rotation.
+		resp, err := s.bee.DownloadBytes(ctx, p.SwarmRef, s.downloadOptions(r, fmt.Sprintf("bytes=%d-%d", lo, hi), b, p.ActHistory, actWriteTime(p.ActAt, p.LastModified)))
 		if err != nil {
 			// Headers are already written; the truncated body is all we can
 			// signal with. Log loudly.

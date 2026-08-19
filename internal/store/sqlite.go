@@ -64,6 +64,8 @@ CREATE TABLE IF NOT EXISTS objects (
 	content_enc   TEXT NOT NULL DEFAULT '',
 	encrypted     INTEGER NOT NULL DEFAULT 0,
 	tags          TEXT NOT NULL DEFAULT '',
+	act_at        INTEGER NOT NULL DEFAULT 0,
+	act_history   TEXT NOT NULL DEFAULT '',
 	PRIMARY KEY (bucket, key, version_id)
 );
 CREATE INDEX IF NOT EXISTS objects_latest ON objects (bucket, key) WHERE is_latest = 1;
@@ -86,6 +88,8 @@ CREATE TABLE IF NOT EXISTS multipart_parts (
 	size          INTEGER NOT NULL,
 	etag          TEXT NOT NULL,
 	last_modified TEXT NOT NULL,
+	act_at        INTEGER NOT NULL DEFAULT 0,
+	act_history   TEXT NOT NULL DEFAULT '',
 	PRIMARY KEY (upload_id, part_number)
 );
 `
@@ -123,6 +127,10 @@ func OpenSQLite(path string) (*SQLite, error) {
 		`ALTER TABLE buckets ADD COLUMN act INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE buckets ADD COLUMN act_history TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE buckets ADD COLUMN act_grantees TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE objects ADD COLUMN act_at INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE multipart_parts ADD COLUMN act_at INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE objects ADD COLUMN act_history TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE multipart_parts ADD COLUMN act_history TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := db.Exec(mig); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			db.Close()
@@ -163,10 +171,12 @@ func migrateObjectsToVersioned(db *sql.DB) error {
 			parts TEXT NOT NULL DEFAULT '', checksum_alg TEXT NOT NULL DEFAULT '',
 			checksum TEXT NOT NULL DEFAULT '', content_enc TEXT NOT NULL DEFAULT '',
 			encrypted INTEGER NOT NULL DEFAULT 0,
+			tags TEXT NOT NULL DEFAULT '', act_at INTEGER NOT NULL DEFAULT 0,
+			act_history TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY (bucket, key, version_id))`,
 		`INSERT INTO objects
-			(bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted, tags)
-		 SELECT bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted, tags
+			(bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted, tags, act_at, act_history)
+		 SELECT bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted, tags, act_at, act_history
 		 FROM objects_v1`,
 		`DROP TABLE objects_v1`,
 		`CREATE INDEX IF NOT EXISTS objects_latest ON objects (bucket, key) WHERE is_latest = 1`,
@@ -456,12 +466,12 @@ func (s *SQLite) RestoreBucket(ctx context.Context, bucket string, objects []Obj
 		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO objects
-			 (bucket, key, version_id, vseq, is_latest, delete_marker, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted, tags)
-			 VALUES (?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 (bucket, key, version_id, vseq, is_latest, delete_marker, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted, tags, act_at, act_history)
+			 VALUES (?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			o.Bucket, o.Key, o.VersionID, o.VSeq,
 			o.SwarmRef, o.BatchID, o.Size, o.ETag, o.ContentType,
 			o.StorageClass, string(meta), o.LastModified.UTC().Format(timeLayout), parts,
-			o.ChecksumAlgorithm, o.Checksum, o.ContentEncoding, o.Encrypted, o.Tags); err != nil {
+			o.ChecksumAlgorithm, o.Checksum, o.ContentEncoding, o.Encrypted, o.Tags, o.ActAt, o.ActHistory); err != nil {
 			return err
 		}
 	}
@@ -519,12 +529,12 @@ func (s *SQLite) PutObject(ctx context.Context, o Object, cond *PutCondition) er
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT OR REPLACE INTO objects
-		 (bucket, key, version_id, vseq, is_latest, delete_marker, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted, tags)
-		 VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 (bucket, key, version_id, vseq, is_latest, delete_marker, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted, tags, act_at, act_history)
+		 VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		o.Bucket, o.Key, o.VersionID, o.VSeq, o.DeleteMarker,
 		o.SwarmRef, o.BatchID, o.Size, o.ETag, o.ContentType,
 		o.StorageClass, string(meta), o.LastModified.UTC().Format(timeLayout), parts,
-		o.ChecksumAlgorithm, o.Checksum, o.ContentEncoding, o.Encrypted, o.Tags); err != nil {
+		o.ChecksumAlgorithm, o.Checksum, o.ContentEncoding, o.Encrypted, o.Tags, o.ActAt, o.ActHistory); err != nil {
 		return err
 	}
 	// A same-version replace (suspended "null" overwrites) may have removed
@@ -643,7 +653,7 @@ func (s *SQLite) ListVersions(ctx context.Context, bucket, prefix, keyMarker, ve
 	return out, rows.Err()
 }
 
-const objectColumns = `bucket, key, version_id, vseq, is_latest, delete_marker, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted, tags`
+const objectColumns = `bucket, key, version_id, vseq, is_latest, delete_marker, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted, tags, act_at, act_history`
 
 func scanObject(row interface{ Scan(...any) error }) (*Object, error) {
 	var o Object
@@ -651,7 +661,7 @@ func scanObject(row interface{ Scan(...any) error }) (*Object, error) {
 	if err := row.Scan(&o.Bucket, &o.Key, &o.VersionID, &o.VSeq, &o.IsLatest, &o.DeleteMarker,
 		&o.SwarmRef, &o.BatchID, &o.Size, &o.ETag,
 		&o.ContentType, &o.StorageClass, &meta, &modified, &parts,
-		&o.ChecksumAlgorithm, &o.Checksum, &o.ContentEncoding, &o.Encrypted, &o.Tags); err != nil {
+		&o.ChecksumAlgorithm, &o.Checksum, &o.ContentEncoding, &o.Encrypted, &o.Tags, &o.ActAt, &o.ActHistory); err != nil {
 		return nil, err
 	}
 	json.Unmarshal([]byte(meta), &o.UserMetadata) //nolint:errcheck // written by us
@@ -766,11 +776,11 @@ func (s *SQLite) GetMultipartUpload(ctx context.Context, bucket, key, uploadID s
 func (s *SQLite) PutPart(ctx context.Context, uploadID string, p Part) error {
 	res, err := s.db.ExecContext(ctx,
 		`INSERT OR REPLACE INTO multipart_parts
-		 (upload_id, part_number, swarm_ref, size, etag, last_modified)
-		 SELECT ?, ?, ?, ?, ?, ?
+		 (upload_id, part_number, swarm_ref, size, etag, last_modified, act_at, act_history)
+		 SELECT ?, ?, ?, ?, ?, ?, ?, ?
 		 WHERE EXISTS (SELECT 1 FROM multipart_uploads WHERE upload_id = ?1)`,
 		uploadID, p.PartNumber, p.SwarmRef, p.Size, p.ETag,
-		p.LastModified.UTC().Format(timeLayout))
+		p.LastModified.UTC().Format(timeLayout), p.ActAt, p.ActHistory)
 	if err != nil {
 		return err
 	}
@@ -794,7 +804,7 @@ func (s *SQLite) ListParts(ctx context.Context, uploadID string, afterPart, limi
 		limit = -1
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT part_number, swarm_ref, size, etag, last_modified
+		`SELECT part_number, swarm_ref, size, etag, last_modified, act_at, act_history
 		 FROM multipart_parts WHERE upload_id = ? AND part_number > ?
 		 ORDER BY part_number LIMIT ?`, uploadID, afterPart, limit)
 	if err != nil {
@@ -805,7 +815,7 @@ func (s *SQLite) ListParts(ctx context.Context, uploadID string, afterPart, limi
 	for rows.Next() {
 		var p Part
 		var modified string
-		if err := rows.Scan(&p.PartNumber, &p.SwarmRef, &p.Size, &p.ETag, &modified); err != nil {
+		if err := rows.Scan(&p.PartNumber, &p.SwarmRef, &p.Size, &p.ETag, &modified, &p.ActAt, &p.ActHistory); err != nil {
 			return nil, err
 		}
 		p.LastModified, _ = time.Parse(timeLayout, modified)

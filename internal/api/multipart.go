@@ -120,6 +120,10 @@ func (s *Server) handleUploadPart(w http.ResponseWriter, r *http.Request, bucket
 		ETag:         res.ETag,
 		LastModified: time.Now().UTC(),
 	}
+	if b.ACT {
+		part.ActAt = part.LastModified.Unix()
+		part.ActHistory = res.ActHistory
+	}
 	if err := s.store.PutPart(ctx, upload.UploadID, part); err != nil {
 		s.writeError(w, r, storeError(err))
 		return
@@ -177,6 +181,11 @@ func (s *Server) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, bu
 		part.SwarmRef = srcObj.SwarmRef
 		part.Size = srcObj.Size
 		part.ETag = srcObj.ETag
+		if srcB.ACT {
+			// The reused reference keeps the source's encryption epoch.
+			part.ActAt = actWriteTime(srcObj.ActAt, srcObj.LastModified)
+			part.ActHistory = actHistoryFor(srcObj.ActHistory, srcB)
+		}
 	} else {
 		// x-amz-copy-source-range is strictly bytes=first-last, within bounds
 		// (no clamping, no suffix/open forms).
@@ -187,7 +196,7 @@ func (s *Server) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, bu
 			s.writeError(w, r, errInvalidRange)
 			return
 		}
-		dopts := s.downloadOptions(r, fmt.Sprintf("bytes=%d-%d", st, en), srcB)
+		dopts := s.downloadOptions(r, fmt.Sprintf("bytes=%d-%d", st, en), srcB, srcObj.ActHistory, actWriteTime(srcObj.ActAt, srcObj.LastModified))
 		dopts.FallbackMode = "" // per-request header is for the outer read, not this internal one
 		resp, err := s.bee.DownloadBytes(ctx, srcObj.SwarmRef, dopts)
 		if err != nil {
@@ -201,14 +210,20 @@ func (s *Server) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, bu
 			uopts.Act = true
 			uopts.ActHistory = dstB.ActHistory
 		}
-		ref, _, err := s.bee.UploadBytes(ctx, io.TeeReader(resp.Body, md5h), uopts)
+		ref, hist, err := s.bee.UploadBytes(ctx, io.TeeReader(resp.Body, md5h), uopts)
 		if err != nil {
 			s.writeError(w, r, beeError(err))
 			return
 		}
+		if dstB.ACT {
+			part.ActHistory = actHistoryFor(hist, dstB)
+		}
 		part.SwarmRef = ref
 		part.Size = en - st + 1
 		part.ETag = hex.EncodeToString(md5h.Sum(nil))
+		if dstB.ACT {
+			part.ActAt = time.Now().Unix()
+		}
 	}
 
 	if err := s.store.PutPart(ctx, upload.UploadID, part); err != nil {

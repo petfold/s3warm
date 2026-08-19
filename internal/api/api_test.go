@@ -43,7 +43,7 @@ func newFakeBee(t *testing.T) *httptest.Server {
 	t.Helper()
 	var mu sync.Mutex
 	blobs := map[string][]byte{}
-	actRefs := map[string]bool{}
+	actRefs := map[string]string{} // act ref -> exact history it was written under
 	grantees := map[string][]string{}
 	var hexCounter int
 	newHex := func(n int) string {
@@ -76,7 +76,7 @@ func newFakeBee(t *testing.T) *httptest.Server {
 				history = newHex(32)
 			}
 			ref = newHex(64)
-			actRefs[ref] = true
+			actRefs[ref] = history
 			w.Header().Set("Swarm-Act-History-Address", history)
 		}
 		blobs[ref] = data
@@ -87,14 +87,16 @@ func newFakeBee(t *testing.T) *httptest.Server {
 	mux.HandleFunc("GET /bytes/{ref}", func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		data, ok := blobs[r.PathValue("ref")]
-		isAct := actRefs[r.PathValue("ref")]
+		actHistory, isAct := actRefs[r.PathValue("ref")]
 		mu.Unlock()
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			io.WriteString(w, `{"code":404,"message":"not found"}`)
 			return
 		}
-		if isAct && (r.Header.Get("swarm-act-history-address") == "" ||
+		// Epoch-strict, like a real node after grant mutations: only the
+		// exact history the bytes were written under decrypts them.
+		if isAct && (r.Header.Get("swarm-act-history-address") != actHistory ||
 			r.Header.Get("swarm-act-publisher") != fakePublisher) {
 			w.WriteHeader(http.StatusNotFound)
 			io.WriteString(w, `{"code":404,"message":"act credentials required"}`)
@@ -1337,6 +1339,23 @@ func TestACTGrants(t *testing.T) {
 	resp.Body.Close()
 	if string(body) != "classified" {
 		t.Fatalf("act copy read %q", body)
+	}
+
+	// Epoch pinning: the pre-grant object still reads after the grant+revoke
+	// rotated the bucket history (the fake node is epoch-strict, like a real
+	// one), and post-revoke writes read under the newest epoch.
+	resp = do(t, http.MethodGet, base+"/vault/secret.txt", nil, nil, http.StatusOK)
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "classified" {
+		t.Fatalf("pre-grant object after rotations read %q", body)
+	}
+	do(t, http.MethodPut, base+"/vault/post-revoke.txt", strings.NewReader("late"), nil, http.StatusOK).Body.Close()
+	resp = do(t, http.MethodGet, base+"/vault/post-revoke.txt", nil, nil, http.StatusOK)
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "late" {
+		t.Fatalf("post-revoke object read %q", body)
 	}
 
 	// The public commit chain stays off: snapshots refuse ACT buckets.
