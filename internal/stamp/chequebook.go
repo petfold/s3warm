@@ -26,12 +26,13 @@ type Chequebook struct {
 	log      *slog.Logger
 	min      *big.Int // PLUR
 	target   *big.Int // PLUR
+	reserve  *big.Int // PLUR: wallet xBZZ never taken — postage has priority
 	interval time.Duration
 }
 
 // NewChequebook builds a keeper with thresholds in xBZZ. minBZZ <= 0
 // returns nil: automatic top-up disabled (Run and check are nil-safe).
-func NewChequebook(beeClient *bee.Client, minBZZ, targetBZZ float64, logger *slog.Logger) *Chequebook {
+func NewChequebook(beeClient *bee.Client, minBZZ, targetBZZ, reserveBZZ float64, logger *slog.Logger) *Chequebook {
 	if minBZZ <= 0 {
 		return nil
 	}
@@ -43,6 +44,7 @@ func NewChequebook(beeClient *bee.Client, minBZZ, targetBZZ float64, logger *slo
 		log:      logger,
 		min:      bzzToPlur(minBZZ),
 		target:   bzzToPlur(targetBZZ),
+		reserve:  bzzToPlur(reserveBZZ),
 		interval: DefaultChequebookInterval,
 	}
 }
@@ -107,13 +109,17 @@ func (c *Chequebook) check(ctx context.Context) {
 			"available_bzz", plurToBZZ(available), "wallet_bzz", plurToBZZ(walletBZZ))
 		return
 	}
-	if walletBZZ.Cmp(need) < 0 {
-		// Deposit what there is rather than nothing.
-		need = walletBZZ
+	// Only wallet funds above the reserve may fund bandwidth: the wallet is
+	// what pays for postage, and storage outranks bandwidth.
+	depositable := new(big.Int).Sub(walletBZZ, c.reserve)
+	if need.Cmp(depositable) > 0 {
+		need = depositable
 	}
 	if need.Sign() <= 0 {
-		c.log.Warn("chequebook needs a top-up but the wallet has no xBZZ",
-			"available_bzz", plurToBZZ(available))
+		c.log.Warn("chequebook needs a top-up but the wallet is at or below the postage reserve",
+			"available_bzz", plurToBZZ(available),
+			"wallet_bzz", plurToBZZ(walletBZZ),
+			"reserve_bzz", plurToBZZ(c.reserve))
 		return
 	}
 

@@ -57,30 +57,35 @@ type Config struct {
 	// ChequebookMin/ChequebookTarget (xBZZ) drive automatic chequebook
 	// top-ups: when the daily check finds the available balance below Min,
 	// the gateway deposits from the node wallet up to Target. Min 0
-	// disables.
+	// disables. Bandwidth is cheap on Swarm, so these stay small.
 	ChequebookMin    float64
 	ChequebookTarget float64
+	// ChequebookReserve (xBZZ) is never taken from the wallet by top-ups:
+	// the wallet is what pays for postage — the expensive resource — so it
+	// has priority over bandwidth funding.
+	ChequebookReserve float64
 }
 
 func Load(args []string) (*Config, error) {
 	cfg := &Config{
-		ListenAddr:       envStr("S3WARM_LISTEN", ":8333"),
-		BeeAPI:           envStr("S3WARM_BEE_API", "http://127.0.0.1:1633"),
-		BatchID:          envStr("S3WARM_BATCH_ID", ""),
-		BatchIDFile:      envStr("S3WARM_BATCH_ID_FILE", ""),
-		Region:           envStr("S3WARM_REGION", "us-east-1"),
-		AccessKey:        envStr("S3WARM_ACCESS_KEY", ""),
-		SecretKey:        envStr("S3WARM_SECRET_KEY", ""),
-		RedundancyLevel:  envInt("S3WARM_REDUNDANCY", 0),
-		Encrypt:          envBool("S3WARM_ENCRYPT", false),
-		Ack:              envStr("S3WARM_ACK", "node"),
-		Domain:           envStr("S3WARM_DOMAIN", ""),
-		DB:               envStr("S3WARM_DB", "s3warm.db"),
-		Commit:           envStr("S3WARM_COMMIT", "async"),
-		FeedKey:          envStr("S3WARM_FEED_KEY", ""),
-		FetchStrategy:    envStr("S3WARM_FETCH_STRATEGY", ""),
-		ChequebookMin:    envFloat("S3WARM_CHEQUEBOOK_MIN", 1),
-		ChequebookTarget: envFloat("S3WARM_CHEQUEBOOK_TARGET", 5),
+		ListenAddr:        envStr("S3WARM_LISTEN", ":8333"),
+		BeeAPI:            envStr("S3WARM_BEE_API", "http://127.0.0.1:1633"),
+		BatchID:           envStr("S3WARM_BATCH_ID", ""),
+		BatchIDFile:       envStr("S3WARM_BATCH_ID_FILE", ""),
+		Region:            envStr("S3WARM_REGION", "us-east-1"),
+		AccessKey:         envStr("S3WARM_ACCESS_KEY", ""),
+		SecretKey:         envStr("S3WARM_SECRET_KEY", ""),
+		RedundancyLevel:   envInt("S3WARM_REDUNDANCY", 0),
+		Encrypt:           envBool("S3WARM_ENCRYPT", false),
+		Ack:               envStr("S3WARM_ACK", "node"),
+		Domain:            envStr("S3WARM_DOMAIN", ""),
+		DB:                envStr("S3WARM_DB", "s3warm.db"),
+		Commit:            envStr("S3WARM_COMMIT", "async"),
+		FeedKey:           envStr("S3WARM_FEED_KEY", ""),
+		FetchStrategy:     envStr("S3WARM_FETCH_STRATEGY", ""),
+		ChequebookMin:     envFloat("S3WARM_CHEQUEBOOK_MIN", 0.2),
+		ChequebookTarget:  envFloat("S3WARM_CHEQUEBOOK_TARGET", 1),
+		ChequebookReserve: envFloat("S3WARM_CHEQUEBOOK_RESERVE", 1),
 	}
 
 	fs := flag.NewFlagSet("s3warm", flag.ContinueOnError)
@@ -101,6 +106,7 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar(&cfg.FetchStrategy, "fetch-strategy", cfg.FetchStrategy, "default erasure-coding fetch strategy for reads (0-4, empty = node default)")
 	fs.Float64Var(&cfg.ChequebookMin, "chequebook-min", cfg.ChequebookMin, "auto top-up the chequebook when its available balance falls below this many xBZZ (0 disables)")
 	fs.Float64Var(&cfg.ChequebookTarget, "chequebook-target", cfg.ChequebookTarget, "top the chequebook up to this many xBZZ")
+	fs.Float64Var(&cfg.ChequebookReserve, "chequebook-reserve", cfg.ChequebookReserve, "wallet xBZZ never taken by chequebook top-ups (kept for postage)")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -114,6 +120,9 @@ func Load(args []string) (*Config, error) {
 	}
 	if cfg.ChequebookMin > 0 && cfg.ChequebookTarget < cfg.ChequebookMin {
 		return nil, fmt.Errorf("chequebook-target (%g) must be at least chequebook-min (%g)", cfg.ChequebookTarget, cfg.ChequebookMin)
+	}
+	if cfg.ChequebookReserve < 0 {
+		return nil, fmt.Errorf("chequebook-reserve must not be negative, got %g", cfg.ChequebookReserve)
 	}
 	if cfg.Commit != "async" && cfg.Commit != "off" {
 		return nil, fmt.Errorf("commit mode must be async or off, got %q", cfg.Commit)

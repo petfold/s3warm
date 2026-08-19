@@ -29,8 +29,9 @@ One static binary, configured by flags with environment-variable defaults
 | `-commit` | `S3WARM_COMMIT` | `async` | Bucket commit chain: `async` (debounced on-Swarm manifests) or `off` |
 | `-feed-key` | `S3WARM_FEED_KEY` | — | Hex secp256k1 private key; publishes each commit as a feed checkpoint (see commit chain) |
 | `-fetch-strategy` | `S3WARM_FETCH_STRATEGY` | — | Default erasure-coding fetch strategy for reads (0–4; empty = node default) |
-| `-chequebook-min` | `S3WARM_CHEQUEBOOK_MIN` | `1` | Auto top-up the node's chequebook when its available balance falls below this many xBZZ (`0` disables the keeper) |
-| `-chequebook-target` | `S3WARM_CHEQUEBOOK_TARGET` | `5` | Top the chequebook up to this many xBZZ |
+| `-chequebook-min` | `S3WARM_CHEQUEBOOK_MIN` | `0.2` | Auto top-up the node's chequebook when its available balance falls below this many xBZZ (`0` disables the keeper). Bandwidth is cheap on Swarm — a fraction of an xBZZ covers a lot of traffic |
+| `-chequebook-target` | `S3WARM_CHEQUEBOOK_TARGET` | `1` | Top the chequebook up to this many xBZZ |
+| `-chequebook-reserve` | `S3WARM_CHEQUEBOOK_RESERVE` | `1` | Wallet xBZZ never taken by chequebook top-ups — kept for postage, the expensive resource |
 | `-domain` | `S3WARM_DOMAIN` | — | Base domain enabling virtual-host-style addressing (`bucket.<domain>`) |
 
 ### Ack policy
@@ -277,8 +278,10 @@ never refills it; the gateway checks it daily (first check ~30 s after
 start) and deposits from the node wallet when the available balance is
 below `-chequebook-min`, topping up to `-chequebook-target`. Guards: the
 deposit is skipped (with a warning) when the wallet lacks xDAI for gas,
-and clamped to the wallet's xBZZ when that is short. Every automatic
-deposit is logged and counted in `s3warm_chequebook_deposits_total`.
+and only wallet funds **above `-chequebook-reserve`** may be taken — the
+wallet pays for postage batches, and storage outranks bandwidth. Every
+automatic deposit is logged and counted in
+`s3warm_chequebook_deposits_total`.
 
 ### Limits & defaults
 

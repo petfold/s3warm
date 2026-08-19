@@ -119,13 +119,16 @@ One caveat that s3warm handles for you: Bee's chequebook seeding is a
 **one-time** event — Bee itself never tops the chequebook up from the
 wallet later, however full the wallet is, and a drained chequebook means
 peers stop serving the node. The gateway therefore checks the chequebook
-daily and, whenever the available balance falls below **1 xBZZ**,
-automatically refills it to **5 xBZZ** from the wallet (thresholds:
-`-chequebook-min` / `-chequebook-target`; set `-chequebook-min 0` to manage
-it manually). So the standing rule is simply: **keep some xBZZ and a
-little xDAI in the node wallet**, and gas, chequebook, and postage top-ups
-all keep working. Balances are visible as Prometheus gauges at
-`/_s3warm/metrics`, and every automatic deposit is logged.
+daily and, whenever the available balance falls below **0.2 xBZZ**,
+automatically refills it to **1 xBZZ** from the wallet (bandwidth is cheap
+on Swarm — this is plenty). It deliberately never takes the last
+**1 xBZZ** out of the wallet, because the wallet is what pays for postage
+— the expensive resource — and storage outranks bandwidth. All three
+thresholds are flags (`-chequebook-min` / `-target` / `-reserve`;
+`-chequebook-min 0` turns the keeper off). So the standing rule is simply:
+**keep some xBZZ and a little xDAI in the node wallet**, and gas,
+chequebook, and postage top-ups all keep working. Balances are Prometheus
+gauges at `/_s3warm/metrics`, and every automatic deposit is logged.
 
 ### Buying a postage batch
 

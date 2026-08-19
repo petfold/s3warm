@@ -43,25 +43,26 @@ func (f *fakeChequebook) server(t *testing.T) *httptest.Server {
 	return srv
 }
 
+// newTestChequebook uses min 0.2, target 1, reserve 1 — the defaults.
 func newTestChequebook(t *testing.T, f *fakeChequebook) *Chequebook {
 	t.Helper()
 	srv := f.server(t)
-	return NewChequebook(bee.New(srv.URL), 1, 5, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return NewChequebook(bee.New(srv.URL), 0.2, 1, 1, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 func TestChequebookTopUp(t *testing.T) {
 	bzz := func(v float64) *big.Int { return bzzToPlur(v) }
 
 	t.Run("below min tops up to target", func(t *testing.T) {
-		f := &fakeChequebook{available: bzz(0.2), walletBZZ: bzz(100), native: big.NewInt(1e18)}
+		f := &fakeChequebook{available: bzz(0.1), walletBZZ: bzz(100), native: big.NewInt(1e18)}
 		newTestChequebook(t, f).check(context.Background())
-		if f.deposited == nil || f.deposited.Cmp(bzz(4.8)) != 0 {
-			t.Fatalf("deposited = %v, want %v", f.deposited, bzz(4.8))
+		if f.deposited == nil || f.deposited.Cmp(bzz(0.9)) != 0 {
+			t.Fatalf("deposited = %v, want %v", f.deposited, bzz(0.9))
 		}
 	})
 
 	t.Run("above min does nothing", func(t *testing.T) {
-		f := &fakeChequebook{available: bzz(2), walletBZZ: bzz(100), native: big.NewInt(1e18)}
+		f := &fakeChequebook{available: bzz(0.5), walletBZZ: bzz(100), native: big.NewInt(1e18)}
 		newTestChequebook(t, f).check(context.Background())
 		if f.deposited != nil {
 			t.Fatalf("unexpected deposit %v", f.deposited)
@@ -69,23 +70,32 @@ func TestChequebookTopUp(t *testing.T) {
 	})
 
 	t.Run("no gas skips", func(t *testing.T) {
-		f := &fakeChequebook{available: bzz(0.2), walletBZZ: bzz(100), native: big.NewInt(0)}
+		f := &fakeChequebook{available: bzz(0.1), walletBZZ: bzz(100), native: big.NewInt(0)}
 		newTestChequebook(t, f).check(context.Background())
 		if f.deposited != nil {
 			t.Fatalf("unexpected deposit %v", f.deposited)
 		}
 	})
 
-	t.Run("short wallet deposits what it has", func(t *testing.T) {
-		f := &fakeChequebook{available: bzz(0.2), walletBZZ: bzz(1.5), native: big.NewInt(1e18)}
+	t.Run("postage reserve is never taken", func(t *testing.T) {
+		// Wallet at the reserve: bandwidth must not raid postage funds.
+		f := &fakeChequebook{available: bzz(0.1), walletBZZ: bzz(1), native: big.NewInt(1e18)}
 		newTestChequebook(t, f).check(context.Background())
-		if f.deposited == nil || f.deposited.Cmp(bzz(1.5)) != 0 {
-			t.Fatalf("deposited = %v, want %v", f.deposited, bzz(1.5))
+		if f.deposited != nil {
+			t.Fatalf("unexpected deposit %v", f.deposited)
+		}
+	})
+
+	t.Run("deposits only the surplus above the reserve", func(t *testing.T) {
+		f := &fakeChequebook{available: bzz(0.1), walletBZZ: bzz(1.3), native: big.NewInt(1e18)}
+		newTestChequebook(t, f).check(context.Background())
+		if f.deposited == nil || f.deposited.Cmp(bzz(0.3)) != 0 {
+			t.Fatalf("deposited = %v, want %v", f.deposited, bzz(0.3))
 		}
 	})
 
 	t.Run("disabled by min zero", func(t *testing.T) {
-		if NewChequebook(nil, 0, 5, nil) != nil {
+		if NewChequebook(nil, 0, 1, 1, nil) != nil {
 			t.Fatal("min 0 must disable the keeper")
 		}
 	})
