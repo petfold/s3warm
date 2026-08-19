@@ -24,6 +24,7 @@ import (
 	"github.com/petfold/s3warm/internal/api"
 	"github.com/petfold/s3warm/internal/bee"
 	"github.com/petfold/s3warm/internal/config"
+	"github.com/petfold/s3warm/internal/manifest"
 	"github.com/petfold/s3warm/internal/store"
 )
 
@@ -98,7 +99,10 @@ func newGateway(t *testing.T) string {
 		Ack:     "node",
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(api.New(cfg, store.NewMemory(), bee.New(fakeBee.URL), nil, logger))
+	st := store.NewMemory()
+	beeClient := bee.New(fakeBee.URL)
+	commits := manifest.NewCommitter(st, beeClient, testBatch, true, nil, logger)
+	srv := httptest.NewServer(api.New(cfg, st, beeClient, nil, commits, logger))
 	t.Cleanup(srv.Close)
 	return srv.URL
 }
@@ -330,6 +334,87 @@ func TestConditionalPut(t *testing.T) {
 		"x-amz-copy-source":          "/cond/k",
 		"x-amz-copy-source-if-match": `"` + md5hex("stale") + `"`,
 	}, http.StatusPreconditionFailed).Body.Close()
+}
+
+func TestSnapshotAndRestore(t *testing.T) {
+	base := newGateway(t)
+	do(t, http.MethodPut, base+"/chain", nil, nil, http.StatusOK).Body.Close()
+
+	put := func(key, val string) {
+		t.Helper()
+		do(t, http.MethodPut, base+"/chain/"+key, strings.NewReader(val), nil, http.StatusOK).Body.Close()
+	}
+	get := func(key string, wantStatus int) string {
+		t.Helper()
+		resp := do(t, http.MethodGet, base+"/chain/"+key, nil, nil, wantStatus)
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return string(b)
+	}
+
+	// State v1: two objects, snapshot it.
+	put("a.txt", "version-one")
+	put("b.txt", "keep-me")
+	resp := do(t, http.MethodPut, base+"/chain?x-swarm-snapshot=v1", nil, nil, http.StatusOK)
+	var snap struct {
+		Root string `json:"root"`
+		Seq  int64  `json:"seq"`
+	}
+	json.NewDecoder(resp.Body).Decode(&snap)
+	resp.Body.Close()
+	if snap.Root == "" || snap.Seq != 1 {
+		t.Fatalf("snapshot v1: %+v", snap)
+	}
+
+	// HeadBucket exposes the commit head.
+	resp = do(t, http.MethodHead, base+"/chain", nil, nil, http.StatusOK)
+	resp.Body.Close()
+	if got := resp.Header.Get("x-swarm-bucket-root"); got != snap.Root {
+		t.Fatalf("head root = %q, want %q", got, snap.Root)
+	}
+
+	// Mutate: overwrite, delete, add — then snapshot v2.
+	put("a.txt", "version-two")
+	do(t, http.MethodDelete, base+"/chain/b.txt", nil, nil, http.StatusNoContent).Body.Close()
+	put("c.txt", "newcomer")
+	resp = do(t, http.MethodPut, base+"/chain?x-swarm-snapshot=v2", nil, nil, http.StatusOK)
+	var snap2 struct {
+		Root string `json:"root"`
+		Seq  int64  `json:"seq"`
+	}
+	json.NewDecoder(resp.Body).Decode(&snap2)
+	resp.Body.Close()
+	if snap2.Root == snap.Root || snap2.Seq != 2 {
+		t.Fatalf("snapshot v2: %+v", snap2)
+	}
+
+	// Both snapshots listed.
+	resp = do(t, http.MethodGet, base+"/chain?x-swarm-snapshot", nil, nil, http.StatusOK)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `"v1"`) || !strings.Contains(string(body), `"v2"`) {
+		t.Fatalf("snapshot list: %s", body)
+	}
+
+	// Rollback to v1 by label: the whole bucket state returns atomically.
+	do(t, http.MethodPost, base+"/chain?x-swarm-restore=v1", nil, nil, http.StatusOK).Body.Close()
+	if got := get("a.txt", http.StatusOK); got != "version-one" {
+		t.Fatalf("after restore a.txt = %q", got)
+	}
+	if got := get("b.txt", http.StatusOK); got != "keep-me" {
+		t.Fatalf("after restore b.txt = %q", got)
+	}
+	get("c.txt", http.StatusNotFound)
+
+	// Roll forward to v2 by raw commit root.
+	do(t, http.MethodPost, base+"/chain?x-swarm-restore="+snap2.Root, nil, nil, http.StatusOK).Body.Close()
+	if got := get("a.txt", http.StatusOK); got != "version-two" {
+		t.Fatalf("after re-restore a.txt = %q", got)
+	}
+	get("b.txt", http.StatusNotFound)
+	if got := get("c.txt", http.StatusOK); got != "newcomer" {
+		t.Fatalf("after re-restore c.txt = %q", got)
+	}
 }
 
 func TestSSE(t *testing.T) {

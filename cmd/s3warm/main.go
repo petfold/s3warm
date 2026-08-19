@@ -15,6 +15,7 @@ import (
 	"github.com/petfold/s3warm/internal/api"
 	"github.com/petfold/s3warm/internal/bee"
 	"github.com/petfold/s3warm/internal/config"
+	"github.com/petfold/s3warm/internal/manifest"
 	"github.com/petfold/s3warm/internal/stamp"
 	"github.com/petfold/s3warm/internal/store"
 )
@@ -62,7 +63,21 @@ func main() {
 		cancel()
 	}
 
-	handler := api.New(cfg, st, beeClient, stamps, logger)
+	var commits *manifest.Committer
+	if cfg.Commit == "async" {
+		var feed *manifest.FeedPublisher
+		if cfg.FeedKey != "" {
+			feed, err = manifest.NewFeedPublisher(cfg.FeedKey, beeClient, logger)
+			if err != nil {
+				logger.Error("feed key", "err", err)
+				os.Exit(2)
+			}
+			logger.Info("feed checkpoints enabled", "owner", feed.Owner())
+		}
+		commits = manifest.NewCommitter(st, beeClient, cfg.BatchID, cfg.Ack != "network", feed, logger)
+	}
+
+	handler := api.New(cfg, st, beeClient, stamps, commits, logger)
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           handler,
@@ -72,6 +87,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go stamps.Run(ctx)
+	go commits.Run(ctx)
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

@@ -159,6 +159,47 @@ func (c *Client) Stamp(ctx context.Context, batchID string) (*Stamp, error) {
 	return &out, nil
 }
 
+// UploadSOC uploads a signed single-owner chunk (feed checkpoint updates,
+// design §5). data is the wrapped content-addressed chunk's binary form.
+func (c *Client) UploadSOC(ctx context.Context, owner, id, signature string, data []byte, batchID string) error {
+	url := fmt.Sprintf("%s/soc/%s/%s?sig=%s", c.base, owner, id, signature)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(data)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("swarm-postage-batch-id", batchID)
+	resp, err := c.do("soc_upload", req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return newStatusError(resp)
+	}
+	io.Copy(io.Discard, resp.Body) //nolint:errcheck // draining for connection reuse
+	return nil
+}
+
+// Pin pins a reference on the node so it survives local garbage collection
+// (bucket head roots and snapshots, design §5).
+func (c *Client) Pin(ctx context.Context, ref string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/pins/"+ref, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.do("pin", req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return newStatusError(resp)
+	}
+	io.Copy(io.Discard, resp.Body) //nolint:errcheck // draining for connection reuse
+	return nil
+}
+
 func (c *Client) Health(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/health", nil)
 	if err != nil {

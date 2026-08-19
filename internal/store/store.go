@@ -16,6 +16,7 @@ var (
 	ErrBucketNotEmpty     = errors.New("bucket not empty")
 	ErrObjectNotFound     = errors.New("object not found")
 	ErrUploadNotFound     = errors.New("multipart upload not found")
+	ErrSnapshotNotFound   = errors.New("snapshot not found")
 	ErrPreconditionFailed = errors.New("precondition failed")
 )
 
@@ -57,6 +58,20 @@ type Bucket struct {
 	// Encryption is the bucket-default SSE algorithm: "" or "AES256"
 	// (design §12 — mapped to swarm-encrypt).
 	Encryption string
+	// HeadRoot/CommitSeq track the bucket's commit chain (design §5): the
+	// Swarm manifest root of the latest commit and its sequence number.
+	HeadRoot  string
+	CommitSeq int64
+}
+
+// Snapshot is a labeled commit root (design §5): restoring one is an atomic
+// whole-bucket rollback.
+type Snapshot struct {
+	Bucket    string
+	Label     string
+	Root      string
+	Seq       int64
+	CreatedAt time.Time
 }
 
 type Object struct {
@@ -119,6 +134,16 @@ type Store interface {
 	DeleteBucket(ctx context.Context, name string) error
 	// SetBucketEncryption sets the bucket-default SSE algorithm ("" clears).
 	SetBucketEncryption(ctx context.Context, bucket, algorithm string) error
+	// SetBucketHead records the bucket's latest commit root and sequence.
+	SetBucketHead(ctx context.Context, bucket, root string, seq int64) error
+
+	PutSnapshot(ctx context.Context, s Snapshot) error
+	GetSnapshot(ctx context.Context, bucket, label string) (*Snapshot, error)
+	ListSnapshots(ctx context.Context, bucket string) ([]Snapshot, error)
+	// RestoreBucket atomically replaces the bucket's entire object set and
+	// points its head at the given commit (design §5: rollback is O(1) on
+	// Swarm; the index swap happens here).
+	RestoreBucket(ctx context.Context, bucket string, objects []Object, root string, seq int64) error
 
 	// PutObject upserts; overwriting a key is last-writer-wins, as in S3.
 	// A non-nil cond is checked atomically with the write and fails with

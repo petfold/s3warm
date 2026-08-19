@@ -113,6 +113,7 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 	w.Header().Set("ETag", `"`+res.ETag+`"`)
 	w.WriteHeader(http.StatusOK)
 	metrics.ObjectBytesIn.Add(float64(res.Size))
+	s.commits.Notify(bucket)
 }
 
 // resolveSSE decides whether a write is encrypted (design §12): request SSE
@@ -433,6 +434,7 @@ func (s *Server) handleDeleteObject(w http.ResponseWriter, r *http.Request, buck
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+	s.commits.Notify(bucket)
 }
 
 func (s *Server) handleDeleteObjects(w http.ResponseWriter, r *http.Request, bucket string) {
@@ -467,6 +469,7 @@ func (s *Server) handleDeleteObjects(w http.ResponseWriter, r *http.Request, buc
 		}
 	}
 	writeXML(w, http.StatusOK, result)
+	s.commits.Notify(bucket)
 }
 
 func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
@@ -525,6 +528,7 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, bucket
 		LastModified: xmlTime(obj.LastModified),
 		ETag:         `"` + obj.ETag + `"`,
 	})
+	s.commits.Notify(bucket)
 }
 
 // checkConditionals evaluates If-Match / If-None-Match / If-Modified-Since /

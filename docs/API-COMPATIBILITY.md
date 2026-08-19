@@ -78,8 +78,9 @@ Design rationale: [`DESIGN.md`](DESIGN.md).
 | `x-swarm-reference` | response | Swarm reference of the object (omitted for encrypted objects) |
 | `x-swarm-postage-batch-id` | request + response | Request: batch override for this write / bucket default at CreateBucket. Response: the batch that stamped the object (PUT/GET/HEAD) |
 | `x-swarm-batch-ttl` | response | ✅ Estimated seconds until the object's batch expires (PUT/GET/HEAD) |
-| `x-swarm-bucket-root` | response | 🎯 P2 — current commit root of the bucket (HeadBucket); capture it to snapshot |
-| `x-swarm-commit-seq` | response | 🎯 P2 — bucket commit sequence number (HeadBucket) |
-| Snapshot / rollback | extension op | 🎯 P2 — label a commit root; restore the bucket head to one (bucket-resource extension + admin CLI, design §5) |
+| `x-swarm-bucket-root` | response | ✅ Current commit root (HeadBucket): the whole bucket is browsable at any Bee via `GET /bzz/{root}/{key}` |
+| `x-swarm-commit-seq` | response | ✅ Bucket commit sequence number (HeadBucket) |
+| Snapshot / rollback | extension op | ✅ `PUT ?x-swarm-snapshot=<label>` (forces a commit, pins the root), `GET ?x-swarm-snapshot` (list), `POST ?x-swarm-restore=<label\|root>` — atomic whole-bucket rollback (design §5) |
+| Feed checkpoint anchor | config | ✅ With `-feed-key`, every commit publishes to the bucket's sequence feed (`owner` = key, topic = keccak256("s3warm/1/"+bucket)) — resolvable at any Bee via `GET /feeds/{owner}/{topic}` |
 | `x-swarm-redundancy-strategy` | request | 🎯 P2 — erasure-coding fetch strategy/fallback override on GET |
 | Grants API | extension op | 🎯 P3 — per-bucket ACT grantee management; grants readable off-gateway (design §8) |

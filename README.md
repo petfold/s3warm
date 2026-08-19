@@ -57,6 +57,8 @@ With rclone: `rclone config` → type `s3`, provider `Other`, endpoint `http://l
 | `-redundancy` | `S3WARM_REDUNDANCY` | `0` | Default erasure-coding level 0–4 (`STANDARD` storage class) |
 | `-encrypt` | `S3WARM_ENCRYPT` | `false` | Encrypt uploads on Swarm (SSE) |
 | `-ack` | `S3WARM_ACK` | `node` | PUT ack policy (design §6): `node` (Bee local store, network push follows) or `network` (pushed before ack) |
+| `-commit` | `S3WARM_COMMIT` | `async` | Bucket commit chain (design §5): debounced on-Swarm manifest per write batch (`off` disables) |
+| `-feed-key` | `S3WARM_FEED_KEY` | — | Hex secp256k1 key; anchors each commit under a Swarm feed (`GET /feeds/{owner}/{topic}` resolves the bucket root anywhere) |
 | `-domain` | `S3WARM_DOMAIN` | — | Base domain for virtual-host-style addressing (`bucket.domain`) |
 
 Operational endpoints (never shadowed by buckets): `/_s3warm/health`, `/_s3warm/ready`,

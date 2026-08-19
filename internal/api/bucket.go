@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -67,9 +68,16 @@ func (s *Server) handleCreateBucket(w http.ResponseWriter, r *http.Request, buck
 }
 
 func (s *Server) handleHeadBucket(w http.ResponseWriter, r *http.Request, bucket string) {
-	if _, err := s.store.GetBucket(r.Context(), bucket); err != nil {
+	b, err := s.store.GetBucket(r.Context(), bucket)
+	if err != nil {
 		s.writeError(w, r, storeError(err))
 		return
+	}
+	// The commit chain's head (design §5): capture x-swarm-bucket-root to
+	// browse the bucket via bzz:// or to snapshot this exact state.
+	if b.HeadRoot != "" {
+		w.Header().Set("x-swarm-bucket-root", b.HeadRoot)
+		w.Header().Set("x-swarm-commit-seq", strconv.FormatInt(b.CommitSeq, 10))
 	}
 	w.WriteHeader(http.StatusOK)
 }

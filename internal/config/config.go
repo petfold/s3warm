@@ -42,6 +42,14 @@ type Config struct {
 	// DB is the SQLite metadata index path. Empty selects the in-memory
 	// index (development only — metadata is lost on restart).
 	DB string
+	// Commit selects the bucket commit-chain mode (design §5):
+	// "async" (default) builds a debounced manifest commit per write batch;
+	// "off" disables the portable on-Swarm representation.
+	Commit string
+	// FeedKey is a hex secp256k1 private key; when set, every commit is
+	// anchored under a sequence feed (owner = this key,
+	// topic = keccak256("s3warm/1/"+bucket)) as its checkpoint (design §5).
+	FeedKey string
 }
 
 func Load(args []string) (*Config, error) {
@@ -58,6 +66,8 @@ func Load(args []string) (*Config, error) {
 		Ack:             envStr("S3WARM_ACK", "node"),
 		Domain:          envStr("S3WARM_DOMAIN", ""),
 		DB:              envStr("S3WARM_DB", "s3warm.db"),
+		Commit:          envStr("S3WARM_COMMIT", "async"),
+		FeedKey:         envStr("S3WARM_FEED_KEY", ""),
 	}
 
 	fs := flag.NewFlagSet("s3warm", flag.ContinueOnError)
@@ -73,6 +83,8 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar(&cfg.Ack, "ack", cfg.Ack, "PUT ack policy: node (Bee local store, default) or network (pushed before ack)")
 	fs.StringVar(&cfg.Domain, "domain", cfg.Domain, "base domain for virtual-host-style bucket addressing")
 	fs.StringVar(&cfg.DB, "db", cfg.DB, "SQLite metadata index path (empty = in-memory, dev only)")
+	fs.StringVar(&cfg.Commit, "commit", cfg.Commit, "bucket commit-chain mode: async (default) or off")
+	fs.StringVar(&cfg.FeedKey, "feed-key", cfg.FeedKey, "hex secp256k1 key for feed checkpoint anchors (empty = no feed publishing)")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -83,6 +95,9 @@ func Load(args []string) (*Config, error) {
 			return nil, fmt.Errorf("reading batch-id-file: %w", err)
 		}
 		cfg.BatchID = strings.TrimSpace(string(b))
+	}
+	if cfg.Commit != "async" && cfg.Commit != "off" {
+		return nil, fmt.Errorf("commit mode must be async or off, got %q", cfg.Commit)
 	}
 	if cfg.Ack != "node" && cfg.Ack != "network" {
 		return nil, fmt.Errorf("ack policy must be node or network, got %q", cfg.Ack)

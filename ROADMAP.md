@@ -39,8 +39,8 @@ Exit: restic + Java SDK v2 work; buckets browsable via `bzz://`; snapshot → ro
 - [x] Presigned URLs (§8): AWS doc vector in unit tests; expiry semantics match AWS
 - [x] Streaming signatures (aws-chunked) + flexible checksums (§8): all three payload variants, chunk/trailer signature chains, five checksum algorithms; multipart composite/FULL_OBJECT checksums still open
 - [x] SSE via `swarm-encrypt` (§12): per-request AES256, bucket default-encryption config, gateway-wide flag; key-bearing references stay private; verified against a live Bee node (encrypt on PUT, transparent decrypt on GET)
-- [ ] Commit-chain manifests + checkpointed feeds (§5)
-- [ ] Snapshots & rollback, `x-swarm-bucket-root`/`x-swarm-commit-seq` (§5)
+- [x] Commit-chain manifests + feed checkpoints (§5): debounced mantaray commits (Bee's own mantaray package over /bytes), commit document with parent links, `-feed-key` sequence-feed anchors; verified live — bucket browsable via `GET /bzz/{root}/{key}` on the node, feed resolves to the commit root. Still open: interval/manual checkpoint policies (currently every-commit), incremental manifest builds
+- [x] Snapshots & rollback (§5): `?x-swarm-snapshot` create/list (pinned roots), `?x-swarm-restore` atomic whole-bucket rollback by label or raw root; HeadBucket exposes `x-swarm-bucket-root`/`x-swarm-commit-seq`
 - [ ] Read-side erasure-coding fetch strategies (§17)
 - [ ] GetObjectAttributes, CORS
 

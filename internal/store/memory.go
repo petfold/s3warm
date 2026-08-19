@@ -16,8 +16,9 @@ type Memory struct {
 }
 
 type memBucket struct {
-	meta    Bucket
-	objects map[string]Object
+	meta      Bucket
+	objects   map[string]Object
+	snapshots map[string]Snapshot
 }
 
 type memUpload struct {
@@ -41,7 +42,11 @@ func (m *Memory) CreateBucket(_ context.Context, b Bucket) error {
 	if b.CreatedAt.IsZero() {
 		b.CreatedAt = time.Now().UTC()
 	}
-	m.buckets[b.Name] = &memBucket{meta: b, objects: make(map[string]Object)}
+	m.buckets[b.Name] = &memBucket{
+		meta:      b,
+		objects:   make(map[string]Object),
+		snapshots: make(map[string]Snapshot),
+	}
 	return nil
 }
 
@@ -89,6 +94,76 @@ func (m *Memory) SetBucketEncryption(_ context.Context, bucket, algorithm string
 		return ErrBucketNotFound
 	}
 	b.meta.Encryption = algorithm
+	return nil
+}
+
+func (m *Memory) SetBucketHead(_ context.Context, bucket, root string, seq int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.buckets[bucket]
+	if !ok {
+		return ErrBucketNotFound
+	}
+	b.meta.HeadRoot, b.meta.CommitSeq = root, seq
+	return nil
+}
+
+func (m *Memory) PutSnapshot(_ context.Context, s Snapshot) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.buckets[s.Bucket]
+	if !ok {
+		return ErrBucketNotFound
+	}
+	if s.CreatedAt.IsZero() {
+		s.CreatedAt = time.Now().UTC()
+	}
+	b.snapshots[s.Label] = s
+	return nil
+}
+
+func (m *Memory) GetSnapshot(_ context.Context, bucket, label string) (*Snapshot, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	b, ok := m.buckets[bucket]
+	if !ok {
+		return nil, ErrBucketNotFound
+	}
+	s, ok := b.snapshots[label]
+	if !ok {
+		return nil, ErrSnapshotNotFound
+	}
+	return &s, nil
+}
+
+func (m *Memory) ListSnapshots(_ context.Context, bucket string) ([]Snapshot, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	b, ok := m.buckets[bucket]
+	if !ok {
+		return nil, ErrBucketNotFound
+	}
+	out := make([]Snapshot, 0, len(b.snapshots))
+	for _, s := range b.snapshots {
+		out = append(out, s)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Label < out[j].Label })
+	return out, nil
+}
+
+func (m *Memory) RestoreBucket(_ context.Context, bucket string, objects []Object, root string, seq int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.buckets[bucket]
+	if !ok {
+		return ErrBucketNotFound
+	}
+	b.objects = make(map[string]Object, len(objects))
+	for _, o := range objects {
+		o.Bucket = bucket
+		b.objects[o.Key] = o
+	}
+	b.meta.HeadRoot, b.meta.CommitSeq = root, seq
 	return nil
 }
 

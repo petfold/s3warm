@@ -293,6 +293,7 @@ func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Re
 		w.Header().Set("x-amz-server-side-encryption", "AES256")
 	}
 	s.writeCompleteResult(w, r, bucket, key, obj.ETag)
+	s.commits.Notify(bucket)
 }
 
 // alreadyCompleted reports whether (bucket, key) holds the object produced

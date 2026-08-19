@@ -24,7 +24,17 @@ CREATE TABLE IF NOT EXISTS buckets (
 	name       TEXT PRIMARY KEY,
 	created_at TEXT NOT NULL,
 	batch_id   TEXT NOT NULL DEFAULT '',
-	sse        TEXT NOT NULL DEFAULT ''
+	sse        TEXT NOT NULL DEFAULT '',
+	head_root  TEXT NOT NULL DEFAULT '',
+	commit_seq INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS snapshots (
+	bucket     TEXT NOT NULL,
+	label      TEXT NOT NULL,
+	root       TEXT NOT NULL,
+	seq        INTEGER NOT NULL,
+	created_at TEXT NOT NULL,
+	PRIMARY KEY (bucket, label)
 );
 CREATE TABLE IF NOT EXISTS objects (
 	bucket        TEXT NOT NULL,
@@ -88,6 +98,8 @@ func OpenSQLite(path string) (*SQLite, error) {
 		`ALTER TABLE objects ADD COLUMN encrypted INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE buckets ADD COLUMN sse TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE multipart_uploads ADD COLUMN encrypted INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE buckets ADD COLUMN head_root TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE buckets ADD COLUMN commit_seq INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := db.Exec(mig); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			db.Close()
@@ -106,9 +118,9 @@ func (s *SQLite) CreateBucket(ctx context.Context, b Bucket) error {
 		b.CreatedAt = time.Now().UTC()
 	}
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO buckets (name, created_at, batch_id, sse) VALUES (?, ?, ?, ?)
+		`INSERT INTO buckets (name, created_at, batch_id, sse, head_root, commit_seq) VALUES (?, ?, ?, ?, ?, ?)
 		 ON CONFLICT (name) DO NOTHING`,
-		b.Name, b.CreatedAt.UTC().Format(timeLayout), b.BatchID, b.Encryption)
+		b.Name, b.CreatedAt.UTC().Format(timeLayout), b.BatchID, b.Encryption, b.HeadRoot, b.CommitSeq)
 	if err != nil {
 		return err
 	}
@@ -120,10 +132,10 @@ func (s *SQLite) CreateBucket(ctx context.Context, b Bucket) error {
 
 func (s *SQLite) GetBucket(ctx context.Context, name string) (*Bucket, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT name, created_at, batch_id, sse FROM buckets WHERE name = ?`, name)
+		`SELECT name, created_at, batch_id, sse, head_root, commit_seq FROM buckets WHERE name = ?`, name)
 	var b Bucket
 	var created string
-	if err := row.Scan(&b.Name, &created, &b.BatchID, &b.Encryption); err != nil {
+	if err := row.Scan(&b.Name, &created, &b.BatchID, &b.Encryption, &b.HeadRoot, &b.CommitSeq); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrBucketNotFound
 		}
@@ -135,7 +147,7 @@ func (s *SQLite) GetBucket(ctx context.Context, name string) (*Bucket, error) {
 
 func (s *SQLite) ListBuckets(ctx context.Context) ([]Bucket, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT name, created_at, batch_id, sse FROM buckets ORDER BY name`)
+		`SELECT name, created_at, batch_id, sse, head_root, commit_seq FROM buckets ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -144,7 +156,7 @@ func (s *SQLite) ListBuckets(ctx context.Context) ([]Bucket, error) {
 	for rows.Next() {
 		var b Bucket
 		var created string
-		if err := rows.Scan(&b.Name, &created, &b.BatchID, &b.Encryption); err != nil {
+		if err := rows.Scan(&b.Name, &created, &b.BatchID, &b.Encryption, &b.HeadRoot, &b.CommitSeq); err != nil {
 			return nil, err
 		}
 		b.CreatedAt, _ = time.Parse(timeLayout, created)
@@ -191,6 +203,120 @@ func (s *SQLite) SetBucketEncryption(ctx context.Context, bucket, algorithm stri
 		return ErrBucketNotFound
 	}
 	return nil
+}
+
+// SetBucketHead records the bucket's latest commit root and sequence.
+func (s *SQLite) SetBucketHead(ctx context.Context, bucket, root string, seq int64) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE buckets SET head_root = ?, commit_seq = ? WHERE name = ?`, root, seq, bucket)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return ErrBucketNotFound
+	}
+	return nil
+}
+
+func (s *SQLite) PutSnapshot(ctx context.Context, snap Snapshot) error {
+	if _, err := s.GetBucket(ctx, snap.Bucket); err != nil {
+		return err
+	}
+	if snap.CreatedAt.IsZero() {
+		snap.CreatedAt = time.Now().UTC()
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT OR REPLACE INTO snapshots (bucket, label, root, seq, created_at) VALUES (?, ?, ?, ?, ?)`,
+		snap.Bucket, snap.Label, snap.Root, snap.Seq, snap.CreatedAt.UTC().Format(timeLayout))
+	return err
+}
+
+func (s *SQLite) GetSnapshot(ctx context.Context, bucket, label string) (*Snapshot, error) {
+	if _, err := s.GetBucket(ctx, bucket); err != nil {
+		return nil, err
+	}
+	row := s.db.QueryRowContext(ctx,
+		`SELECT bucket, label, root, seq, created_at FROM snapshots WHERE bucket = ? AND label = ?`,
+		bucket, label)
+	var snap Snapshot
+	var created string
+	if err := row.Scan(&snap.Bucket, &snap.Label, &snap.Root, &snap.Seq, &created); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrSnapshotNotFound
+		}
+		return nil, err
+	}
+	snap.CreatedAt, _ = time.Parse(timeLayout, created)
+	return &snap, nil
+}
+
+func (s *SQLite) ListSnapshots(ctx context.Context, bucket string) ([]Snapshot, error) {
+	if _, err := s.GetBucket(ctx, bucket); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT bucket, label, root, seq, created_at FROM snapshots WHERE bucket = ? ORDER BY label`, bucket)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Snapshot
+	for rows.Next() {
+		var snap Snapshot
+		var created string
+		if err := rows.Scan(&snap.Bucket, &snap.Label, &snap.Root, &snap.Seq, &created); err != nil {
+			return nil, err
+		}
+		snap.CreatedAt, _ = time.Parse(timeLayout, created)
+		out = append(out, snap)
+	}
+	return out, rows.Err()
+}
+
+// RestoreBucket atomically replaces the bucket's object set and head.
+func (s *SQLite) RestoreBucket(ctx context.Context, bucket string, objects []Object, root string, seq int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after commit
+
+	res, err := tx.ExecContext(ctx,
+		`UPDATE buckets SET head_root = ?, commit_seq = ? WHERE name = ?`, root, seq, bucket)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return ErrBucketNotFound
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM objects WHERE bucket = ?`, bucket); err != nil {
+		return err
+	}
+	for _, o := range objects {
+		o.Bucket = bucket
+		meta, err := json.Marshal(o.UserMetadata)
+		if err != nil {
+			return err
+		}
+		parts := ""
+		if len(o.Parts) > 0 {
+			b, err := json.Marshal(o.Parts)
+			if err != nil {
+				return err
+			}
+			parts = string(b)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO objects
+			 (bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			o.Bucket, o.Key, o.SwarmRef, o.BatchID, o.Size, o.ETag, o.ContentType,
+			o.StorageClass, string(meta), o.LastModified.UTC().Format(timeLayout), parts,
+			o.ChecksumAlgorithm, o.Checksum, o.ContentEncoding, o.Encrypted); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *SQLite) PutObject(ctx context.Context, o Object, cond *PutCondition) error {

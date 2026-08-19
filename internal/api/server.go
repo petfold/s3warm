@@ -19,6 +19,7 @@ import (
 	"github.com/petfold/s3warm/internal/auth"
 	"github.com/petfold/s3warm/internal/bee"
 	"github.com/petfold/s3warm/internal/config"
+	"github.com/petfold/s3warm/internal/manifest"
 	"github.com/petfold/s3warm/internal/metrics"
 	"github.com/petfold/s3warm/internal/stamp"
 	"github.com/petfold/s3warm/internal/store"
@@ -29,11 +30,12 @@ type Server struct {
 	store    store.Store
 	bee      *bee.Client
 	stamps   *stamp.Manager
+	commits  *manifest.Committer // nil = commit chain disabled
 	verifier *auth.Verifier
 	log      *slog.Logger
 }
 
-func New(cfg *config.Config, st store.Store, beeClient *bee.Client, stamps *stamp.Manager, logger *slog.Logger) *Server {
+func New(cfg *config.Config, st store.Store, beeClient *bee.Client, stamps *stamp.Manager, commits *manifest.Committer, logger *slog.Logger) *Server {
 	creds := auth.StaticCredentials{}
 	if cfg.AccessKey != "" {
 		creds[cfg.AccessKey] = cfg.SecretKey
@@ -45,10 +47,11 @@ func New(cfg *config.Config, st store.Store, beeClient *bee.Client, stamps *stam
 		stamps = stamp.NewManager(beeClient, logger)
 	}
 	return &Server{
-		cfg:    cfg,
-		store:  st,
-		bee:    beeClient,
-		stamps: stamps,
+		cfg:     cfg,
+		store:   st,
+		bee:     beeClient,
+		stamps:  stamps,
+		commits: commits,
 		verifier: &auth.Verifier{
 			Creds:          creds,
 			AllowAnonymous: cfg.AccessKey == "",
@@ -151,6 +154,8 @@ func (s *Server) dispatchBucket(w http.ResponseWriter, r *http.Request, bucket s
 			s.handleListMultipartUploads(w, r, bucket)
 		case q.Has("encryption"):
 			s.handleGetBucketEncryption(w, r, bucket)
+		case q.Has("x-swarm-snapshot"):
+			s.handleListSnapshots(w, r, bucket)
 		case anySubresource(q, "acl", "policy", "cors", "tagging",
 			"lifecycle", "website", "object-lock", "replication",
 			"logging", "notification", "requestPayment", "accelerate",
@@ -167,6 +172,10 @@ func (s *Server) dispatchBucket(w http.ResponseWriter, r *http.Request, bucket s
 	case http.MethodPut:
 		if q.Has("encryption") {
 			s.handlePutBucketEncryption(w, r, bucket)
+			return
+		}
+		if q.Has("x-swarm-snapshot") {
+			s.handleCreateSnapshot(w, r, bucket)
 			return
 		}
 		if len(q) > 0 {
@@ -189,6 +198,10 @@ func (s *Server) dispatchBucket(w http.ResponseWriter, r *http.Request, bucket s
 	case http.MethodPost:
 		if q.Has("delete") {
 			s.handleDeleteObjects(w, r, bucket)
+			return
+		}
+		if q.Has("x-swarm-restore") {
+			s.handleRestoreBucket(w, r, bucket)
 			return
 		}
 		s.notImplemented(w, r, "bucket POST")
