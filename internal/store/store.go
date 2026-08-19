@@ -54,6 +54,9 @@ type Bucket struct {
 	// BatchID is the bucket-default postage batch (may be empty; the gateway
 	// default applies then).
 	BatchID string
+	// Encryption is the bucket-default SSE algorithm: "" or "AES256"
+	// (design §12 — mapped to swarm-encrypt).
+	Encryption string
 }
 
 type Object struct {
@@ -74,6 +77,9 @@ type Object struct {
 	// provided one.
 	ChecksumAlgorithm string
 	Checksum          string
+	// Encrypted marks SSE objects: the Swarm reference embeds the
+	// decryption key and must stay private (design §12).
+	Encrypted bool
 	// Parts is non-empty for composite (multipart) objects: the ordered
 	// part list the gateway stitches on reads (design §7). SwarmRef is
 	// empty for composites.
@@ -99,6 +105,7 @@ type MultipartUpload struct {
 	StorageClass string
 	UserMetadata map[string]string
 	BatchID      string
+	Encrypted    bool
 }
 
 // Store is the metadata index. Implementations must be safe for concurrent
@@ -110,6 +117,8 @@ type Store interface {
 	ListBuckets(ctx context.Context) ([]Bucket, error)
 	// DeleteBucket fails with ErrBucketNotEmpty when objects remain.
 	DeleteBucket(ctx context.Context, name string) error
+	// SetBucketEncryption sets the bucket-default SSE algorithm ("" clears).
+	SetBucketEncryption(ctx context.Context, bucket, algorithm string) error
 
 	// PutObject upserts; overwriting a key is last-writer-wins, as in S3.
 	// A non-nil cond is checked atomically with the write and fails with

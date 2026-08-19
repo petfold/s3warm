@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/xml"
 	"io"
 	"net"
 	"net/http"
@@ -92,6 +93,53 @@ func (s *Server) handleGetBucketLocation(w http.ResponseWriter, r *http.Request,
 		loc = ""
 	}
 	writeXML(w, http.StatusOK, locationConstraint{Xmlns: s3Xmlns, Value: loc})
+}
+
+func (s *Server) handleGetBucketEncryption(w http.ResponseWriter, r *http.Request, bucket string) {
+	b, err := s.store.GetBucket(r.Context(), bucket)
+	if err != nil {
+		s.writeError(w, r, storeError(err))
+		return
+	}
+	if b.Encryption == "" {
+		s.writeError(w, r, errNoSSEConfig)
+		return
+	}
+	writeXML(w, http.StatusOK, sseConfiguration{
+		Xmlns: s3Xmlns,
+		Rules: []sseRule{{Apply: sseDefault{SSEAlgorithm: b.Encryption}}},
+	})
+}
+
+func (s *Server) handlePutBucketEncryption(w http.ResponseWriter, r *http.Request, bucket string) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+	if err != nil {
+		s.writeError(w, r, errInternal.withMessage(err.Error()))
+		return
+	}
+	var cfg sseConfiguration
+	if err := xml.Unmarshal(body, &cfg); err != nil || len(cfg.Rules) == 0 {
+		s.writeError(w, r, errMalformedXML)
+		return
+	}
+	if alg := cfg.Rules[0].Apply.SSEAlgorithm; alg != "AES256" {
+		s.writeError(w, r, errNotImplemented.withMessage(
+			"only SSE-S3 (AES256) is supported, got "+alg))
+		return
+	}
+	if err := s.store.SetBucketEncryption(r.Context(), bucket, "AES256"); err != nil {
+		s.writeError(w, r, storeError(err))
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) handleDeleteBucketEncryption(w http.ResponseWriter, r *http.Request, bucket string) {
+	if err := s.store.SetBucketEncryption(r.Context(), bucket, ""); err != nil {
+		s.writeError(w, r, storeError(err))
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleGetBucketVersioning(w http.ResponseWriter, r *http.Request, bucket string) {

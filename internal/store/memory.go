@@ -81,6 +81,17 @@ func (m *Memory) DeleteBucket(_ context.Context, name string) error {
 	return nil
 }
 
+func (m *Memory) SetBucketEncryption(_ context.Context, bucket, algorithm string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.buckets[bucket]
+	if !ok {
+		return ErrBucketNotFound
+	}
+	b.meta.Encryption = algorithm
+	return nil
+}
+
 func (m *Memory) PutObject(_ context.Context, o Object, cond *PutCondition) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -27,6 +27,7 @@ Design rationale: [`DESIGN.md`](DESIGN.md).
 | GetBucketAcl / PutBucketAcl | 🎯 P3 | Grants map to the bucket's ACT grantee list (grantee = Ethereum public key, design §8); canned `private` until then |
 | GetBucketPolicy / PutBucketPolicy | 🎯 P3 | Grant-subset only, not full IAM policy language |
 | GetBucketCors / PutBucketCors | 🎯 P2 | Gateway-level CORS |
+| Get/Put/DeleteBucketEncryption | ✅ | SSE-S3 (AES256) default-encryption config; KMS rejected |
 | GetBucketLifecycleConfiguration | 🎯 P2 | Read-only synthetic rule derived from postage batch TTL |
 | PutBucketLifecycleConfiguration | ❌ | Expiry is postage TTL; extend by topping up the batch |
 | GetBucketTagging / PutBucketTagging | 🎯 P3 | |
@@ -56,6 +57,7 @@ Design rationale: [`DESIGN.md`](DESIGN.md).
 | GetObjectTagging / PutObjectTagging / DeleteObjectTagging | 🎯 P3 | |
 | GetObjectAcl / PutObjectAcl | 🪧 P2 | Canned `private` |
 | RestoreObject / SelectObjectContent / GetObjectTorrent | ❌ | |
+| SSE-S3 (`x-amz-server-side-encryption: AES256`) | ✅ | Mapped to `swarm-encrypt`: Bee encrypts/decrypts; the key-bearing 64-byte reference stays private (design §12). Per-request, bucket-default, or gateway-wide. SSE-C/KMS rejected |
 | Conditional PUT (`If-None-Match` / `If-Match`) | ✅ | Checked atomically with the index write; `If-Match` on a missing key is 404, as on AWS |
 
 ## Authentication

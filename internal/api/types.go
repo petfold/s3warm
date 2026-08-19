@@ -210,6 +210,21 @@ type listMultipartUploadsResult struct {
 	Uploads            []xmlUpload `xml:"Upload"`
 }
 
+type sseDefault struct {
+	SSEAlgorithm   string `xml:"SSEAlgorithm"`
+	KMSMasterKeyID string `xml:"KMSMasterKeyID,omitempty"`
+}
+
+type sseRule struct {
+	Apply sseDefault `xml:"ApplyServerSideEncryptionByDefault"`
+}
+
+type sseConfiguration struct {
+	XMLName xml.Name  `xml:"ServerSideEncryptionConfiguration"`
+	Xmlns   string    `xml:"xmlns,attr,omitempty"`
+	Rules   []sseRule `xml:"Rule"`
+}
+
 type deleteRequest struct {
 	XMLName xml.Name `xml:"Delete"`
 	Quiet   bool     `xml:"Quiet"`

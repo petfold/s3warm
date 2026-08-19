@@ -63,7 +63,13 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 		}
 	}
 
-	res, apiErr := s.uploadBody(r, batch, r.Header.Get("x-amz-storage-class"))
+	encrypt, apiErr := s.resolveSSE(r, b)
+	if apiErr != nil {
+		s.writeError(w, r, *apiErr)
+		return
+	}
+
+	res, apiErr := s.uploadBody(r, batch, r.Header.Get("x-amz-storage-class"), encrypt)
 	if apiErr != nil {
 		s.writeError(w, r, *apiErr)
 		return
@@ -83,6 +89,7 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 		LastModified:      time.Now().UTC(),
 		ChecksumAlgorithm: res.ChecksumAlgorithm,
 		Checksum:          res.Checksum,
+		Encrypted:         encrypt,
 	}
 	// On a precondition race the object is not indexed; the stray stamped
 	// bytes simply expire (design §6).
@@ -91,10 +98,13 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 		return
 	}
 
-	if res.Ref != "" && !s.cfg.Encrypt {
+	if res.Ref != "" && !encrypt {
 		// For encrypted objects the 64-byte reference embeds the decryption
 		// key, so it stays private (design §12).
 		w.Header().Set("x-swarm-reference", res.Ref)
+	}
+	if encrypt {
+		w.Header().Set("x-amz-server-side-encryption", "AES256")
 	}
 	s.setBatchHeaders(ctx, w.Header(), batch)
 	if res.Checksum != "" {
@@ -103,6 +113,27 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 	w.Header().Set("ETag", `"`+res.ETag+`"`)
 	w.WriteHeader(http.StatusOK)
 	metrics.ObjectBytesIn.Add(float64(res.Size))
+}
+
+// resolveSSE decides whether a write is encrypted (design §12): request SSE
+// header, then bucket default, then the gateway-wide -encrypt flag. SSE-C
+// and SSE-KMS are rejected.
+func (s *Server) resolveSSE(r *http.Request, b *store.Bucket) (bool, *apiError) {
+	h := r.Header
+	if h.Get("x-amz-server-side-encryption-customer-algorithm") != "" ||
+		h.Get("x-amz-server-side-encryption-customer-key") != "" {
+		e := errNotImplemented.withMessage("SSE-C is not supported; use SSE-S3 (AES256)")
+		return false, &e
+	}
+	switch sse := h.Get("x-amz-server-side-encryption"); sse {
+	case "AES256":
+		return true, nil
+	case "":
+		return s.cfg.Encrypt || b.Encryption == "AES256", nil
+	default: // aws:kms, aws:kms:dsse
+		e := errNotImplemented.withMessage("only SSE-S3 (AES256) is supported, got " + sse)
+		return false, &e
+	}
 }
 
 // resolveBatch picks the postage batch for a write: request header override,
@@ -132,7 +163,7 @@ type uploadResult struct {
 // chunks and trailers) on the way. Zero-byte bodies are not uploaded. On
 // error nothing is indexed by the caller; stray stamped bytes expire with
 // their batch (design §6).
-func (s *Server) uploadBody(r *http.Request, batch, storageClass string) (*uploadResult, *apiError) {
+func (s *Server) uploadBody(r *http.Request, batch, storageClass string, encrypt bool) (*uploadResult, *apiError) {
 	md5h := md5.New()
 	writers := []io.Writer{md5h}
 	rawSHA := r.Header.Get("X-Amz-Content-Sha256")
@@ -192,7 +223,7 @@ func (s *Server) uploadBody(r *http.Request, batch, storageClass string) (*uploa
 		var err error
 		ref, err = s.bee.UploadBytes(r.Context(), counted, bee.UploadOptions{
 			BatchID:         batch,
-			Encrypt:         s.cfg.Encrypt,
+			Encrypt:         encrypt,
 			RedundancyLevel: s.redundancyFor(storageClass),
 			Deferred:        s.cfg.Ack != "network",
 			ContentLength:   length,
@@ -339,8 +370,11 @@ func (s *Server) handleGetObject(w http.ResponseWriter, r *http.Request, bucket,
 		// all-lowercase.
 		h["x-amz-meta-"+k] = []string{v}
 	}
-	if obj.SwarmRef != "" && !s.cfg.Encrypt {
+	if obj.SwarmRef != "" && !obj.Encrypted {
 		h.Set("x-swarm-reference", obj.SwarmRef)
+	}
+	if obj.Encrypted {
+		h.Set("x-amz-server-side-encryption", "AES256")
 	}
 	// The stored checksum covers the full object, so it must not accompany
 	// partial (ranged or part-numbered) responses — clients validate response

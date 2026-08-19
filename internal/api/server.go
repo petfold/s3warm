@@ -149,8 +149,10 @@ func (s *Server) dispatchBucket(w http.ResponseWriter, r *http.Request, bucket s
 			s.handleListObjectVersions(w, r, bucket)
 		case q.Has("uploads"):
 			s.handleListMultipartUploads(w, r, bucket)
+		case q.Has("encryption"):
+			s.handleGetBucketEncryption(w, r, bucket)
 		case anySubresource(q, "acl", "policy", "cors", "tagging",
-			"lifecycle", "encryption", "website", "object-lock", "replication",
+			"lifecycle", "website", "object-lock", "replication",
 			"logging", "notification", "requestPayment", "accelerate",
 			"intelligent-tiering", "inventory", "metrics", "analytics", "ownershipControls",
 			"publicAccessBlock", "policyStatus"):
@@ -163,6 +165,10 @@ func (s *Server) dispatchBucket(w http.ResponseWriter, r *http.Request, bucket s
 			s.handleListObjects(w, r, bucket, 1)
 		}
 	case http.MethodPut:
+		if q.Has("encryption") {
+			s.handlePutBucketEncryption(w, r, bucket)
+			return
+		}
 		if len(q) > 0 {
 			s.notImplemented(w, r, "bucket subresource")
 			return
@@ -171,6 +177,10 @@ func (s *Server) dispatchBucket(w http.ResponseWriter, r *http.Request, bucket s
 	case http.MethodHead:
 		s.handleHeadBucket(w, r, bucket)
 	case http.MethodDelete:
+		if q.Has("encryption") {
+			s.handleDeleteBucketEncryption(w, r, bucket)
+			return
+		}
 		if len(q) > 0 {
 			s.notImplemented(w, r, "bucket subresource")
 			return

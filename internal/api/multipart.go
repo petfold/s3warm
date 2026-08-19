@@ -45,6 +45,11 @@ func (s *Server) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Requ
 			return
 		}
 	}
+	encrypt, apiErr := s.resolveSSE(r, b)
+	if apiErr != nil {
+		s.writeError(w, r, *apiErr)
+		return
+	}
 
 	var id [16]byte
 	rand.Read(id[:]) //nolint:errcheck // crypto/rand.Read never fails
@@ -57,10 +62,14 @@ func (s *Server) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Requ
 		StorageClass: storageClassOf(r.Header.Get("x-amz-storage-class")),
 		UserMetadata: userMetadata(r.Header),
 		BatchID:      batch,
+		Encrypted:    encrypt,
 	}
 	if err := s.store.CreateMultipartUpload(ctx, upload); err != nil {
 		s.writeError(w, r, storeError(err))
 		return
+	}
+	if encrypt {
+		w.Header().Set("x-amz-server-side-encryption", "AES256")
 	}
 	writeXML(w, http.StatusOK, initiateMultipartUploadResult{
 		Xmlns:    s3Xmlns,
@@ -83,7 +92,7 @@ func (s *Server) handleUploadPart(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
-	res, apiErr := s.uploadBody(r, upload.BatchID, upload.StorageClass)
+	res, apiErr := s.uploadBody(r, upload.BatchID, upload.StorageClass, upload.Encrypted)
 	if apiErr != nil {
 		s.writeError(w, r, *apiErr)
 		return
@@ -98,6 +107,9 @@ func (s *Server) handleUploadPart(w http.ResponseWriter, r *http.Request, bucket
 	if err := s.store.PutPart(ctx, upload.UploadID, part); err != nil {
 		s.writeError(w, r, storeError(err))
 		return
+	}
+	if upload.Encrypted {
+		w.Header().Set("x-amz-server-side-encryption", "AES256")
 	}
 	w.Header().Set("ETag", `"`+res.ETag+`"`)
 	w.WriteHeader(http.StatusOK)
@@ -162,7 +174,8 @@ func (s *Server) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, bu
 		}
 		defer resp.Body.Close()
 		md5h := md5.New()
-		ref, err := s.bee.UploadBytes(ctx, io.TeeReader(resp.Body, md5h), s.uploadOptions(upload.BatchID, upload.StorageClass, en-st+1))
+		ref, err := s.bee.UploadBytes(ctx, io.TeeReader(resp.Body, md5h),
+			s.uploadOptions(upload.BatchID, upload.StorageClass, upload.Encrypted, en-st+1))
 		if err != nil {
 			s.writeError(w, r, beeError(err))
 			return
@@ -259,6 +272,7 @@ func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Re
 		UserMetadata: upload.UserMetadata,
 		LastModified: time.Now().UTC(),
 		Parts:        parts,
+		Encrypted:    upload.Encrypted,
 	}
 	// Conditional completion, same semantics as conditional PUT (design §10).
 	var cond *store.PutCondition
@@ -275,6 +289,9 @@ func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Re
 		s.log.Warn("deleting completed upload", "uploadId", upload.UploadID, "err", err)
 	}
 
+	if upload.Encrypted {
+		w.Header().Set("x-amz-server-side-encryption", "AES256")
+	}
 	s.writeCompleteResult(w, r, bucket, key, obj.ETag)
 }
 
@@ -455,10 +472,10 @@ func parseCopySource(r *http.Request) (string, string, *apiError) {
 }
 
 // uploadOptions builds Bee upload options for a known-length stream.
-func (s *Server) uploadOptions(batch, storageClass string, contentLength int64) bee.UploadOptions {
+func (s *Server) uploadOptions(batch, storageClass string, encrypt bool, contentLength int64) bee.UploadOptions {
 	return bee.UploadOptions{
 		BatchID:         batch,
-		Encrypt:         s.cfg.Encrypt,
+		Encrypt:         encrypt,
 		RedundancyLevel: s.redundancyFor(storageClass),
 		Deferred:        s.cfg.Ack != "network",
 		ContentLength:   contentLength,

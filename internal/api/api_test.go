@@ -49,6 +49,10 @@ func newFakeBee(t *testing.T) *httptest.Server {
 		}
 		sum := sha256.Sum256(data)
 		ref := hex.EncodeToString(sum[:])
+		if r.Header.Get("swarm-encrypt") == "true" {
+			// Encrypted references are 64 bytes: hash plus decryption key.
+			ref += hex.EncodeToString(sum[:])
+		}
 		mu.Lock()
 		blobs[ref] = data
 		mu.Unlock()
@@ -326,6 +330,58 @@ func TestConditionalPut(t *testing.T) {
 		"x-amz-copy-source":          "/cond/k",
 		"x-amz-copy-source-if-match": `"` + md5hex("stale") + `"`,
 	}, http.StatusPreconditionFailed).Body.Close()
+}
+
+func TestSSE(t *testing.T) {
+	base := newGateway(t)
+	do(t, http.MethodPut, base+"/sse", nil, nil, http.StatusOK).Body.Close()
+
+	// Per-request SSE-S3: encrypted, reference suppressed, header echoed.
+	resp := do(t, http.MethodPut, base+"/sse/secret", strings.NewReader("hidden"),
+		map[string]string{"x-amz-server-side-encryption": "AES256"}, http.StatusOK)
+	resp.Body.Close()
+	if got := resp.Header.Get("x-amz-server-side-encryption"); got != "AES256" {
+		t.Fatalf("SSE header = %q", got)
+	}
+	if resp.Header.Get("x-swarm-reference") != "" {
+		t.Fatal("encrypted reference must not be exposed")
+	}
+	resp = do(t, http.MethodGet, base+"/sse/secret", nil, nil, http.StatusOK)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "hidden" || resp.Header.Get("x-amz-server-side-encryption") != "AES256" ||
+		resp.Header.Get("x-swarm-reference") != "" {
+		t.Fatalf("encrypted GET: body=%q sse=%q ref=%q", body,
+			resp.Header.Get("x-amz-server-side-encryption"), resp.Header.Get("x-swarm-reference"))
+	}
+
+	// SSE-KMS and SSE-C are rejected.
+	do(t, http.MethodPut, base+"/sse/kms", strings.NewReader("x"),
+		map[string]string{"x-amz-server-side-encryption": "aws:kms"}, http.StatusNotImplemented).Body.Close()
+
+	// Bucket default encryption.
+	do(t, http.MethodGet, base+"/sse?encryption", nil, nil, http.StatusNotFound).Body.Close()
+	sseCfg := `<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>`
+	do(t, http.MethodPut, base+"/sse?encryption", strings.NewReader(sseCfg), nil, http.StatusOK).Body.Close()
+	resp = do(t, http.MethodGet, base+"/sse?encryption", nil, nil, http.StatusOK)
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), "<SSEAlgorithm>AES256</SSEAlgorithm>") {
+		t.Fatalf("GetBucketEncryption: %s", body)
+	}
+	// Plain PUT now encrypts by default.
+	resp = do(t, http.MethodPut, base+"/sse/defaulted", strings.NewReader("x"), nil, http.StatusOK)
+	resp.Body.Close()
+	if resp.Header.Get("x-amz-server-side-encryption") != "AES256" {
+		t.Fatal("bucket default encryption not applied")
+	}
+	// Clear it again.
+	do(t, http.MethodDelete, base+"/sse?encryption", nil, nil, http.StatusNoContent).Body.Close()
+	resp = do(t, http.MethodPut, base+"/sse/plain", strings.NewReader("x"), nil, http.StatusOK)
+	resp.Body.Close()
+	if resp.Header.Get("x-amz-server-side-encryption") != "" {
+		t.Fatal("encryption applied after config delete")
+	}
 }
 
 func TestChecksums(t *testing.T) {

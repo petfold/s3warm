@@ -38,7 +38,7 @@ Exit: restic + Java SDK v2 work; buckets browsable via `bzz://`; snapshot → ro
 - [x] Multipart uploads (§7): full API set, composite objects with range-stitched reads, retry-idempotent + conditional complete, `?partNumber` reads; manifest at 250 s3-tests. Still open: async consolidation, UploadPartCopy from composite sources
 - [x] Presigned URLs (§8): AWS doc vector in unit tests; expiry semantics match AWS
 - [x] Streaming signatures (aws-chunked) + flexible checksums (§8): all three payload variants, chunk/trailer signature chains, five checksum algorithms; multipart composite/FULL_OBJECT checksums still open
-- [ ] SSE via `swarm-encrypt` (§12)
+- [x] SSE via `swarm-encrypt` (§12): per-request AES256, bucket default-encryption config, gateway-wide flag; key-bearing references stay private; verified against a live Bee node (encrypt on PUT, transparent decrypt on GET)
 - [ ] Commit-chain manifests + checkpointed feeds (§5)
 - [ ] Snapshots & rollback, `x-swarm-bucket-root`/`x-swarm-commit-seq` (§5)
 - [ ] Read-side erasure-coding fetch strategies (§17)

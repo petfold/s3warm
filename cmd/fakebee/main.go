@@ -43,6 +43,10 @@ func main() {
 		}
 		sum := sha256.Sum256(data)
 		ref := hex.EncodeToString(sum[:])
+		if r.Header.Get("swarm-encrypt") == "true" {
+			// Encrypted references are 64 bytes: hash plus decryption key.
+			ref += hex.EncodeToString(sum[:])
+		}
 		mu.Lock()
 		blobs[ref] = data
 		mu.Unlock()

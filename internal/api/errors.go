@@ -45,6 +45,7 @@ var (
 	errInvalidPart        = apiError{"InvalidPart", http.StatusBadRequest, "One or more of the specified parts could not be found. The part may not have been uploaded, or the specified entity tag may not match the part's entity tag"}
 	errInvalidPartOrder   = apiError{"InvalidPartOrder", http.StatusBadRequest, "The list of parts was not in ascending order. Parts must be ordered by part number"}
 	errEntityTooSmall     = apiError{"EntityTooSmall", http.StatusBadRequest, "Your proposed upload is smaller than the minimum allowed object size. Each part must be at least 5 MB in size, except the last part"}
+	errNoSSEConfig        = apiError{"ServerSideEncryptionConfigurationNotFoundError", http.StatusNotFound, "The server side encryption configuration was not found"}
 	errInvalidRange       = apiError{"InvalidRange", http.StatusRequestedRangeNotSatisfiable, "The requested range is not satisfiable"}
 	// errSwarmPostage is an s3warm extension (design §9): postage batch
 	// problems are 402 so SDKs fail fast instead of retry-looping.
