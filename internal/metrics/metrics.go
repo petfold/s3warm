@@ -67,6 +67,16 @@ var (
 		Name: "s3warm_chequebook_deposits_total",
 		Help: "Automatic chequebook top-ups performed.",
 	})
+
+	StampTopupsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "s3warm_stamp_topups_total",
+		Help: "Automatic postage batch top-ups performed by the autopilot.",
+	})
+
+	StampDilutesTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "s3warm_stamp_dilutes_total",
+		Help: "Automatic postage batch dilutions performed by the autopilot.",
+	})
 )
 
 // Handler serves the Prometheus exposition endpoint.

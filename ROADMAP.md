@@ -54,5 +54,5 @@ Exit: multi-gateway behind LB; a grantee reads a private bucket off-gateway.
 - [x] Object/bucket tagging: per-version object tag sets and bucket tag sets, `x-amz-tagging` header on PUT/initiate-multipart, copy `x-amz-tagging-directive`, `x-amz-tagging-count` on reads
 - [x] Postgres index for HA (§10): `-db postgres://…` selects the shared index; full store conformance suite (CI runs it against a Postgres 16 service), per-key advisory locks for cross-gateway write serialization, `COLLATE "C"` key ordering, race-safe schema init; two-gateway shared-index consistency and the full 307-test s3-tests sweep verified on Postgres; `docker compose --profile ha` runs the shape locally
 - [x] Chequebook auto top-up: daily check, deposits wallet→chequebook below `-chequebook-min`, never touching the postage reserve (first slice of the money autopilot)
-- [ ] Stamp autopilot (§9)
+- [x] Stamp autopilot (§9): opt-in `-stamp-autopilot` keeper — hourly, tops up node-issued batches below `-stamp-ttl-min` (to `-stamp-ttl-target`, priced from `/chainstate`) and dilutes mutable batches at `-stamp-dilute-at` utilization; one action per batch per cycle; wallet xBZZ/xDAI guards; immutable-batch and foreign-batch cases handled honestly; Prometheus counters
 - [ ] PSS/GSOC notification research (§21)

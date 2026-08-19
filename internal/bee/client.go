@@ -202,6 +202,85 @@ func (c *Client) Stamp(ctx context.Context, batchID string) (*Stamp, error) {
 	return &out, nil
 }
 
+// ListStamps returns the postage batches this node issued (the only ones it
+// can top up or dilute).
+func (c *Client) ListStamps(ctx context.Context) ([]Stamp, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/stamps", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do("stamps_list", req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, newStatusError(resp)
+	}
+	var out struct {
+		Stamps []Stamp `json:"stamps"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("bee: decoding stamps list: %w", err)
+	}
+	return out.Stamps, nil
+}
+
+// TopupBatch adds amount PLUR per chunk to a batch, extending its TTL
+// (an on-chain transaction: xBZZ from the node wallet, gas in xDAI).
+func (c *Client) TopupBatch(ctx context.Context, batchID string, amount *big.Int) error {
+	return c.patchStamps(ctx, "stamps_topup",
+		fmt.Sprintf("%s/stamps/topup/%s/%s", c.base, batchID, amount.String()))
+}
+
+// DiluteBatch raises a batch's depth to newDepth, multiplying capacity —
+// and spreading the remaining balance thinner: TTL halves per +1 depth.
+func (c *Client) DiluteBatch(ctx context.Context, batchID string, newDepth uint8) error {
+	return c.patchStamps(ctx, "stamps_dilute",
+		fmt.Sprintf("%s/stamps/dilute/%s/%d", c.base, batchID, newDepth))
+}
+
+func (c *Client) patchStamps(ctx context.Context, op, url string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.do(op, req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusOK {
+		return newStatusError(resp)
+	}
+	io.Copy(io.Discard, resp.Body) //nolint:errcheck // draining for connection reuse
+	return nil
+}
+
+// ChainState reports the chain's current storage price (PLUR per chunk per
+// block) — what TTL arithmetic needs.
+func (c *Client) ChainState(ctx context.Context) (currentPrice *big.Int, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/chainstate", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do("chainstate", req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, newStatusError(resp)
+	}
+	var out struct {
+		CurrentPrice bigIntJSON `json:"currentPrice"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("bee: decoding chainstate: %w", err)
+	}
+	return (*big.Int)(&out.CurrentPrice), nil
+}
+
 // bigIntJSON tolerates Bee's big integers arriving as strings or numbers.
 type bigIntJSON big.Int
 

@@ -164,6 +164,16 @@ The gateway logs warnings when a batch passes 80% capacity or drops under
 Extend a batch's life anytime with a top-up on your node:
 `curl -X PATCH "http://localhost:1633/stamps/topup/<batch>/<amount>"`.
 
+**Or let the gateway do it.** Start with `-stamp-autopilot` and batches
+your node issued are kept alive automatically: topped up from the node
+wallet whenever their remaining life drops under 30 days (back up to 90),
+and grown (diluted) when they approach capacity. It's off by default
+because it spends your xBZZ — the thresholds are flags
+(`-stamp-ttl-min/-target`, `-stamp-dilute-at`), every action is logged,
+and it never acts when the wallet can't afford it. Combined with the
+automatic chequebook top-up above, the standing rule really is just:
+**keep the node wallet funded**.
+
 ## 4. Pointing your existing tools at s3warm
 
 The pattern is always the same three settings: **endpoint URL**, **your

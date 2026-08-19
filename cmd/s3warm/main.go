@@ -110,6 +110,7 @@ func main() {
 	go stamps.Run(ctx)
 	go commits.Run(ctx)
 	go stamp.NewChequebook(beeClient, cfg.ChequebookMin, cfg.ChequebookTarget, cfg.ChequebookReserve, logger).Run(ctx)
+	go stamp.NewAutopilot(stamps, beeClient, cfg.StampAutopilot, cfg.StampTTLMin, cfg.StampTTLTarget, cfg.StampDiluteAt, logger).Run(ctx)
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

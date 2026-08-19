@@ -33,6 +33,10 @@ One static binary, configured by flags with environment-variable defaults
 | `-chequebook-min` | `S3WARM_CHEQUEBOOK_MIN` | `0.2` | Auto top-up the node's chequebook when its available balance falls below this many xBZZ (`0` disables the keeper). Bandwidth is cheap on Swarm — a fraction of an xBZZ covers a lot of traffic |
 | `-chequebook-target` | `S3WARM_CHEQUEBOOK_TARGET` | `1` | Top the chequebook up to this many xBZZ |
 | `-chequebook-reserve` | `S3WARM_CHEQUEBOOK_RESERVE` | `1` | Wallet xBZZ never taken by chequebook top-ups — kept for postage, the expensive resource |
+| `-stamp-autopilot` | `S3WARM_STAMP_AUTOPILOT` | `false` | Keep used batches alive automatically: topup below `-stamp-ttl-min`, dilute at `-stamp-dilute-at`. **Opt-in — spends wallet xBZZ** (see Operations) |
+| `-stamp-ttl-min` | `S3WARM_STAMP_TTL_MIN` | `30` | Autopilot: top a batch up when its TTL falls below this many days |
+| `-stamp-ttl-target` | `S3WARM_STAMP_TTL_TARGET` | `90` | Autopilot: top batches up to this many days of TTL |
+| `-stamp-dilute-at` | `S3WARM_STAMP_DILUTE_AT` | `0.85` | Autopilot: dilute (double capacity) at this utilization ratio |
 | `-domain` | `S3WARM_DOMAIN` | — | Base domain enabling virtual-host-style addressing (`bucket.<domain>`) |
 
 ### Ack policy
@@ -344,9 +348,25 @@ expired batch.
 | `s3warm_chequebook_available_bzz` | gauge | — |
 | `s3warm_wallet_bzz` | gauge | — |
 | `s3warm_chequebook_deposits_total` | counter | — |
+| `s3warm_stamp_topups_total` / `s3warm_stamp_dilutes_total` | counter | — |
 
 The stamp manager refreshes tracked batches every 5 minutes and logs
 warnings at ≥80% utilization or <30 days TTL.
+
+**Stamp autopilot** (`-stamp-autopilot`, off by default — it spends xBZZ
+from the node wallet). Hourly, for every batch the gateway uses *that this
+node issued* (foreign batches can only be managed by their issuing node):
+when TTL falls below `-stamp-ttl-min` (default 30 days) it tops the batch
+up to `-stamp-ttl-target` (default 90 days) at the current chain storage
+price; when utilization reaches `-stamp-dilute-at` (default 0.85) it
+dilutes to depth+1 — doubling capacity, which spreads the remaining
+balance and halves TTL, so a follow-up topup lands the next cycle. One
+action per batch per cycle, decisions always from observed (mined) state.
+Guards: skipped with a warning when the wallet lacks xDAI for gas or the
+topup's total cost (per-chunk amount × 2^depth) exceeds the wallet's xBZZ.
+Immutable batches cannot be diluted — approaching capacity they get a
+warning telling the operator to roll to a new batch. Every action is
+logged and counted in `s3warm_stamp_topups_total` / `_dilutes_total`.
 
 **Chequebook keeper.** Bee seeds its chequebook once at deployment and
 never refills it; the gateway checks it daily (first check ~30 s after

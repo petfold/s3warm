@@ -70,6 +70,14 @@ type Config struct {
 	// the wallet is what pays for postage — the expensive resource — so it
 	// has priority over bandwidth funding.
 	ChequebookReserve float64
+	// StampAutopilot enables automatic batch keeping (design §9): topping a
+	// batch up when its TTL sinks below StampTTLMin days (to StampTTLTarget
+	// days) and diluting when utilization reaches StampDiluteAt. Opt-in —
+	// it spends xBZZ from the node wallet.
+	StampAutopilot bool
+	StampTTLMin    float64
+	StampTTLTarget float64
+	StampDiluteAt  float64
 }
 
 func Load(args []string) (*Config, error) {
@@ -93,6 +101,10 @@ func Load(args []string) (*Config, error) {
 		ChequebookMin:     envFloat("S3WARM_CHEQUEBOOK_MIN", 0.2),
 		ChequebookTarget:  envFloat("S3WARM_CHEQUEBOOK_TARGET", 1),
 		ChequebookReserve: envFloat("S3WARM_CHEQUEBOOK_RESERVE", 1),
+		StampAutopilot:    envBool("S3WARM_STAMP_AUTOPILOT", false),
+		StampTTLMin:       envFloat("S3WARM_STAMP_TTL_MIN", 30),
+		StampTTLTarget:    envFloat("S3WARM_STAMP_TTL_TARGET", 90),
+		StampDiluteAt:     envFloat("S3WARM_STAMP_DILUTE_AT", 0.85),
 	}
 
 	fs := flag.NewFlagSet("s3warm", flag.ContinueOnError)
@@ -115,6 +127,10 @@ func Load(args []string) (*Config, error) {
 	fs.Float64Var(&cfg.ChequebookMin, "chequebook-min", cfg.ChequebookMin, "auto top-up the chequebook when its available balance falls below this many xBZZ (0 disables)")
 	fs.Float64Var(&cfg.ChequebookTarget, "chequebook-target", cfg.ChequebookTarget, "top the chequebook up to this many xBZZ")
 	fs.Float64Var(&cfg.ChequebookReserve, "chequebook-reserve", cfg.ChequebookReserve, "wallet xBZZ never taken by chequebook top-ups (kept for postage)")
+	fs.BoolVar(&cfg.StampAutopilot, "stamp-autopilot", cfg.StampAutopilot, "keep used batches alive automatically: topup below -stamp-ttl-min, dilute at -stamp-dilute-at (spends wallet xBZZ; opt-in)")
+	fs.Float64Var(&cfg.StampTTLMin, "stamp-ttl-min", cfg.StampTTLMin, "autopilot: top a batch up when its TTL falls below this many days")
+	fs.Float64Var(&cfg.StampTTLTarget, "stamp-ttl-target", cfg.StampTTLTarget, "autopilot: top batches up to this many days of TTL")
+	fs.Float64Var(&cfg.StampDiluteAt, "stamp-dilute-at", cfg.StampDiluteAt, "autopilot: dilute (double capacity) when utilization reaches this ratio")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -140,6 +156,14 @@ func Load(args []string) (*Config, error) {
 	}
 	if cfg.RedundancyLevel < 0 || cfg.RedundancyLevel > 4 {
 		return nil, fmt.Errorf("redundancy level must be between 0 and 4, got %d", cfg.RedundancyLevel)
+	}
+	if cfg.StampAutopilot {
+		if cfg.StampTTLMin <= 0 || cfg.StampTTLTarget < cfg.StampTTLMin {
+			return nil, fmt.Errorf("stamp-ttl-target (%g) must be at least stamp-ttl-min (%g), both positive", cfg.StampTTLTarget, cfg.StampTTLMin)
+		}
+		if cfg.StampDiluteAt <= 0 || cfg.StampDiluteAt > 1 {
+			return nil, fmt.Errorf("stamp-dilute-at must be in (0, 1], got %g", cfg.StampDiluteAt)
+		}
 	}
 	if (cfg.AccessKey == "") != (cfg.SecretKey == "") {
 		return nil, fmt.Errorf("access-key and secret-key must be set together")

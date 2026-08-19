@@ -187,13 +187,75 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"status":"ok","version":"fakebee"}`) //nolint:errcheck
 	})
-	mux.HandleFunc("GET /stamps/{id}", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
-			"batchID": r.PathValue("id"), "exists": true, "usable": true,
+	// Bought batches are stateful so the stamp autopilot's surface works:
+	// topup extends TTL, dilute raises depth and halves TTL (like Bee).
+	type batchState struct {
+		Depth int
+		TTL   int64
+	}
+	var stampMu sync.Mutex
+	bought := map[string]*batchState{}
+	const chainPrice = 24000 // PLUR per chunk per block (5s)
+	stampJSON := func(id string, b *batchState) map[string]any {
+		depth, ttl := 24, int64(86400*365)
+		if b != nil {
+			depth, ttl = b.Depth, b.TTL
+		}
+		return map[string]any{
+			"batchID": id, "exists": true, "usable": true,
 			"utilization": 0, "utilizationRatio": 0.0,
-			"depth": 24, "bucketDepth": 16, "amount": "100000000000",
-			"batchTTL": 86400 * 365, "immutableFlag": false,
-		})
+			"depth": depth, "bucketDepth": 16, "amount": "100000000000",
+			"batchTTL": ttl, "immutableFlag": false,
+		}
+	}
+	mux.HandleFunc("GET /stamps", func(w http.ResponseWriter, _ *http.Request) {
+		stampMu.Lock()
+		list := []map[string]any{}
+		for id, b := range bought {
+			list = append(list, stampJSON(id, b))
+		}
+		stampMu.Unlock()
+		json.NewEncoder(w).Encode(map[string]any{"stamps": list}) //nolint:errcheck
+	})
+	mux.HandleFunc("GET /stamps/{id}", func(w http.ResponseWriter, r *http.Request) {
+		stampMu.Lock()
+		out := stampJSON(r.PathValue("id"), bought[r.PathValue("id")])
+		stampMu.Unlock()
+		json.NewEncoder(w).Encode(out) //nolint:errcheck
+	})
+	mux.HandleFunc("GET /chainstate", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintf(w, `{"chainTip":1,"block":1,"totalAmount":"0","currentPrice":"%d"}`, chainPrice)
+	})
+	mux.HandleFunc("PATCH /stamps/topup/{id}/{amount}", func(w http.ResponseWriter, r *http.Request) {
+		amt, ok := new(big.Int).SetString(r.PathValue("amount"), 10)
+		stampMu.Lock()
+		b := bought[r.PathValue("id")]
+		if !ok || b == nil {
+			stampMu.Unlock()
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{"code":404,"message":"issuer does not exist"}`) //nolint:errcheck
+			return
+		}
+		b.TTL += new(big.Int).Div(amt, big.NewInt(chainPrice)).Int64() * 5
+		stampMu.Unlock()
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]string{"batchID": r.PathValue("id")}) //nolint:errcheck
+	})
+	mux.HandleFunc("PATCH /stamps/dilute/{id}/{depth}", func(w http.ResponseWriter, r *http.Request) {
+		var depth int
+		fmt.Sscanf(r.PathValue("depth"), "%d", &depth) //nolint:errcheck
+		stampMu.Lock()
+		b := bought[r.PathValue("id")]
+		if b == nil || depth <= b.Depth {
+			stampMu.Unlock()
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		b.TTL >>= uint(depth - b.Depth)
+		b.Depth = depth
+		stampMu.Unlock()
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]string{"batchID": r.PathValue("id")}) //nolint:errcheck
 	})
 	// Chequebook/wallet: the auto top-up keeper's surface. Starts low so a
 	// dev stack exercises the deposit path.
@@ -223,9 +285,19 @@ func main() {
 		io.WriteString(w, `{"transactionHash":"0xfa4ebee"}`) //nolint:errcheck
 	})
 
-	mux.HandleFunc("POST /stamps/{amount}/{depth}", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("POST /stamps/{amount}/{depth}", func(w http.ResponseWriter, r *http.Request) {
 		var id [32]byte
 		rand.Read(id[:]) //nolint:errcheck
+		var depth int
+		fmt.Sscanf(r.PathValue("depth"), "%d", &depth) //nolint:errcheck
+		amt, _ := new(big.Int).SetString(r.PathValue("amount"), 10)
+		ttl := int64(86400 * 365)
+		if amt != nil {
+			ttl = new(big.Int).Div(amt, big.NewInt(chainPrice)).Int64() * 5
+		}
+		stampMu.Lock()
+		bought[hex.EncodeToString(id[:])] = &batchState{Depth: depth, TTL: ttl}
+		stampMu.Unlock()
 		w.WriteHeader(http.StatusCreated)
 		json.NewEncoder(w).Encode(map[string]string{"batchID": hex.EncodeToString(id[:])}) //nolint:errcheck
 	})
