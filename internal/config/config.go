@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 )
 
 type Config struct {
@@ -16,6 +17,9 @@ type Config struct {
 	BeeAPI string
 	// BatchID is the default postage batch id used to stamp uploads.
 	BatchID string
+	// BatchIDFile is read (trimmed) into BatchID when BatchID is empty —
+	// lets an init step provision a batch and hand it to the gateway.
+	BatchIDFile string
 	// Region is the region label reported to S3 clients.
 	Region string
 	// AccessKey/SecretKey form the single static credential pair.
@@ -42,6 +46,7 @@ func Load(args []string) (*Config, error) {
 		ListenAddr:      envStr("S3WARM_LISTEN", ":8333"),
 		BeeAPI:          envStr("S3WARM_BEE_API", "http://127.0.0.1:1633"),
 		BatchID:         envStr("S3WARM_BATCH_ID", ""),
+		BatchIDFile:     envStr("S3WARM_BATCH_ID_FILE", ""),
 		Region:          envStr("S3WARM_REGION", "us-east-1"),
 		AccessKey:       envStr("S3WARM_ACCESS_KEY", ""),
 		SecretKey:       envStr("S3WARM_SECRET_KEY", ""),
@@ -56,6 +61,7 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar(&cfg.ListenAddr, "listen", cfg.ListenAddr, "S3 API listen address")
 	fs.StringVar(&cfg.BeeAPI, "bee-api", cfg.BeeAPI, "Bee node API endpoint")
 	fs.StringVar(&cfg.BatchID, "batch-id", cfg.BatchID, "default postage batch id used for uploads")
+	fs.StringVar(&cfg.BatchIDFile, "batch-id-file", cfg.BatchIDFile, "file to read the default batch id from when -batch-id is empty")
 	fs.StringVar(&cfg.Region, "region", cfg.Region, "region label reported to S3 clients")
 	fs.StringVar(&cfg.AccessKey, "access-key", cfg.AccessKey, "access key id (empty enables anonymous dev mode)")
 	fs.StringVar(&cfg.SecretKey, "secret-key", cfg.SecretKey, "secret access key")
@@ -68,6 +74,13 @@ func Load(args []string) (*Config, error) {
 		return nil, err
 	}
 
+	if cfg.BatchID == "" && cfg.BatchIDFile != "" {
+		b, err := os.ReadFile(cfg.BatchIDFile)
+		if err != nil {
+			return nil, fmt.Errorf("reading batch-id-file: %w", err)
+		}
+		cfg.BatchID = strings.TrimSpace(string(b))
+	}
 	if cfg.RedundancyLevel < 0 || cfg.RedundancyLevel > 4 {
 		return nil, fmt.Errorf("redundancy level must be between 0 and 4, got %d", cfg.RedundancyLevel)
 	}

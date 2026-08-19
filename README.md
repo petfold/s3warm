@@ -59,6 +59,28 @@ With rclone: `rclone config` → type `s3`, provider `Other`, endpoint `http://l
 | `-deferred` | `S3WARM_DEFERRED` | `true` | Deferred (async) upload to the network — lower PUT latency |
 | `-domain` | `S3WARM_DOMAIN` | — | Base domain for virtual-host-style addressing (`bucket.domain`) |
 
+## Docker / compose
+
+```bash
+docker compose up -d --build   # fakebee (in-memory Bee stand-in) + s3warm on :8333
+```
+
+Bee removed its `dev` mode, so the compose stack ships `fakebee` — an in-memory
+stand-in for the Bee API subset s3warm uses. To run against a real Bee node,
+drop the `bee`/`batch-init` services and set `S3WARM_BEE_API` + `S3WARM_BATCH_ID`.
+
+## Conformance (Ceph s3-tests)
+
+The compatibility claim is executable: [`test/s3tests/passing.txt`](test/s3tests/passing.txt)
+lists every test from [Ceph's s3-tests](https://github.com/ceph/s3-tests) suite
+that s3warm passes, and CI runs exactly that manifest against the gateway
+(backed by fakebee). The manifest itself is curated against a real Bee node.
+
+```bash
+docker compose up -d --build
+test/s3tests/run.sh            # clones s3-tests, sets up a venv, runs the manifest
+```
+
 ## Development
 
 ```bash

@@ -126,9 +126,11 @@ func (s *Server) dispatchBucket(w http.ResponseWriter, r *http.Request, bucket s
 			s.handleGetBucketLocation(w, r, bucket)
 		case q.Has("versioning"):
 			s.handleGetBucketVersioning(w, r, bucket)
+		case q.Has("versions"):
+			s.handleListObjectVersions(w, r, bucket)
 		case anySubresource(q, "uploads", "acl", "policy", "cors", "tagging",
 			"lifecycle", "encryption", "website", "object-lock", "replication",
-			"logging", "notification", "requestPayment", "versions", "accelerate",
+			"logging", "notification", "requestPayment", "accelerate",
 			"intelligent-tiering", "inventory", "metrics", "analytics", "ownershipControls",
 			"publicAccessBlock", "policyStatus"):
 			s.notImplemented(w, r, "bucket subresource")

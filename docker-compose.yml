@@ -1,0 +1,58 @@
+# Dev/CI stack: fakebee (an in-memory stand-in for the Bee API subset s3warm
+# uses — Bee ≥2.x removed its `dev` mode), a one-shot init that buys a
+# postage batch, and the s3warm gateway wired to both.
+#
+#   docker compose up -d --build
+#   AWS_ACCESS_KEY_ID=s3warmdev AWS_SECRET_ACCESS_KEY=s3warmdevsecret \
+#     aws --endpoint-url http://localhost:8333 s3 mb s3://demo
+#
+# To run against a REAL Bee node instead: drop the bee/batch-init services
+# and set S3WARM_BEE_API + S3WARM_BATCH_ID on the s3warm service.
+services:
+  bee:
+    build: .
+    entrypoint: ["fakebee"]
+    ports:
+      - "1733:1633" # host port chosen not to clash with a real node on 1633
+
+  batch-init:
+    image: curlimages/curl:8.11.1
+    user: "0" # the shared volume is root-owned
+    depends_on:
+      - bee
+    volumes:
+      - batch:/shared
+    entrypoint: /bin/sh
+    command:
+      - -ec
+      - |
+        until curl -sf http://bee:1633/health > /dev/null; do sleep 1; done
+        if [ ! -s /shared/batch-id ]; then
+          echo "buying dev postage batch..."
+          curl -sf -X POST 'http://bee:1633/stamps/100000000000/24' \
+            | sed -n 's/.*"batchID":"\([0-9a-f]*\)".*/\1/p' > /shared/batch-id
+          chmod 444 /shared/batch-id
+        fi
+        test -s /shared/batch-id
+        echo "batch: $$(cat /shared/batch-id)"
+
+  s3warm:
+    build: .
+    depends_on:
+      batch-init:
+        condition: service_completed_successfully
+    environment:
+      S3WARM_BEE_API: http://bee:1633
+      S3WARM_BATCH_ID_FILE: /shared/batch-id
+      S3WARM_ACCESS_KEY: ${S3WARM_ACCESS_KEY:-s3warmdev}
+      S3WARM_SECRET_KEY: ${S3WARM_SECRET_KEY:-s3warmdevsecret}
+      S3WARM_DB: /data/s3warm.db
+    ports:
+      - "8333:8333"
+    volumes:
+      - batch:/shared
+      - data:/data
+
+volumes:
+  batch:
+  data:

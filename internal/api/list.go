@@ -188,3 +188,84 @@ func (s *Server) handleListObjects(w http.ResponseWriter, r *http.Request, bucke
 	}
 	writeXML(w, http.StatusOK, resp)
 }
+
+// handleListObjectVersions serves ListObjectVersions with unversioned
+// semantics, as S3 does for never-versioned buckets: every object is one
+// Version with VersionId "null" and IsLatest true. Real versioning is
+// phase 3 (design §11).
+func (s *Server) handleListObjectVersions(w http.ResponseWriter, r *http.Request, bucket string) {
+	ctx := r.Context()
+	if _, err := s.store.GetBucket(ctx, bucket); err != nil {
+		s.writeError(w, r, storeError(err))
+		return
+	}
+
+	q := r.URL.Query()
+	prefix := q.Get("prefix")
+	delimiter := q.Get("delimiter")
+	encoding := q.Get("encoding-type")
+	if encoding != "" && encoding != "url" {
+		s.writeError(w, r, errInvalidArgument.withMessage("invalid encoding-type"))
+		return
+	}
+	maxKeys := 1000
+	if mk := q.Get("max-keys"); mk != "" {
+		n, err := strconv.Atoi(mk)
+		if err != nil || n < 0 {
+			s.writeError(w, r, errInvalidArgument.withMessage("invalid max-keys"))
+			return
+		}
+		maxKeys = min(n, 1000)
+	}
+	keyMarker := q.Get("key-marker")
+	// version-id-marker is accepted and ignored: one version per key.
+
+	res, err := s.scanObjects(ctx, bucket, prefix, delimiter, keyMarker, maxKeys)
+	if err != nil {
+		s.writeError(w, r, storeError(err))
+		return
+	}
+
+	enc := func(v string) string {
+		if encoding == "url" {
+			return auth.EncodePath(v)
+		}
+		return v
+	}
+	versions := make([]xmlVersion, len(res.contents))
+	for i, o := range res.contents {
+		versions[i] = xmlVersion{
+			Key:          enc(o.Key),
+			VersionID:    "null",
+			IsLatest:     true,
+			LastModified: xmlTime(o.LastModified),
+			ETag:         `"` + o.ETag + `"`,
+			Size:         o.Size,
+			StorageClass: o.StorageClass,
+			Owner:        xmlOwner{ID: "s3warm", DisplayName: "s3warm"},
+		}
+	}
+	prefixes := make([]xmlCommonPrefix, len(res.prefixes))
+	for i, p := range res.prefixes {
+		prefixes[i] = xmlCommonPrefix{Prefix: enc(p)}
+	}
+
+	resp := listVersionsResult{
+		Xmlns:           s3Xmlns,
+		Name:            bucket,
+		Prefix:          enc(prefix),
+		KeyMarker:       enc(keyMarker),
+		VersionIDMarker: q.Get("version-id-marker"),
+		MaxKeys:         maxKeys,
+		Delimiter:       enc(delimiter),
+		EncodingType:    encoding,
+		IsTruncated:     res.truncated,
+		Versions:        versions,
+		CommonPrefixes:  prefixes,
+	}
+	if res.truncated {
+		resp.NextKeyMarker = enc(res.resumeAfter)
+		resp.NextVersionIDMarker = "null"
+	}
+	writeXML(w, http.StatusOK, resp)
+}

@@ -23,7 +23,7 @@ Design rationale: [`DESIGN.md`](DESIGN.md).
 | ListObjects (V1) | ✅ | marker/NextMarker semantics |
 | GetBucketVersioning | 🪧 | Empty config (unversioned) until P3 |
 | PutBucketVersioning | 🎯 P3 | |
-| ListObjectVersions | 🎯 P3 | |
+| ListObjectVersions | ✅ / 🎯 P3 | Unversioned (null-version) semantics served now, as S3 does for never-versioned buckets; real version history is P3 |
 | GetBucketAcl / PutBucketAcl | 🎯 P3 | Grants map to the bucket's ACT grantee list (grantee = Ethereum public key, design §8); canned `private` until then |
 | GetBucketPolicy / PutBucketPolicy | 🎯 P3 | Grant-subset only, not full IAM policy language |
 | GetBucketCors / PutBucketCors | 🎯 P2 | Gateway-level CORS |

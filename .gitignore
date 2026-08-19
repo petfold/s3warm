@@ -8,6 +8,14 @@
 *.out
 coverage.html
 
+# s3-tests harness clone + venv
+/test/s3tests/.s3-tests/
+
+# gateway index databases
+*.db
+*.db-shm
+*.db-wal
+
 # local env / editor
 .env
 .envrc

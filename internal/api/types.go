@@ -86,6 +86,34 @@ type listBucketResultV1 struct {
 	CommonPrefixes []xmlCommonPrefix `xml:"CommonPrefixes"`
 }
 
+type xmlVersion struct {
+	Key          string   `xml:"Key"`
+	VersionID    string   `xml:"VersionId"`
+	IsLatest     bool     `xml:"IsLatest"`
+	LastModified string   `xml:"LastModified"`
+	ETag         string   `xml:"ETag"`
+	Size         int64    `xml:"Size"`
+	StorageClass string   `xml:"StorageClass"`
+	Owner        xmlOwner `xml:"Owner"`
+}
+
+type listVersionsResult struct {
+	XMLName             xml.Name          `xml:"ListVersionsResult"`
+	Xmlns               string            `xml:"xmlns,attr"`
+	Name                string            `xml:"Name"`
+	Prefix              string            `xml:"Prefix"`
+	KeyMarker           string            `xml:"KeyMarker"`
+	VersionIDMarker     string            `xml:"VersionIdMarker"`
+	NextKeyMarker       string            `xml:"NextKeyMarker,omitempty"`
+	NextVersionIDMarker string            `xml:"NextVersionIdMarker,omitempty"`
+	MaxKeys             int               `xml:"MaxKeys"`
+	Delimiter           string            `xml:"Delimiter,omitempty"`
+	EncodingType        string            `xml:"EncodingType,omitempty"`
+	IsTruncated         bool              `xml:"IsTruncated"`
+	Versions            []xmlVersion      `xml:"Version"`
+	CommonPrefixes      []xmlCommonPrefix `xml:"CommonPrefixes"`
+}
+
 type copyObjectResult struct {
 	XMLName      xml.Name `xml:"CopyObjectResult"`
 	Xmlns        string   `xml:"xmlns,attr"`

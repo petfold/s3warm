@@ -1,0 +1,7 @@
+.git
+bin/
+dist/
+*.db
+*.db-*
+test/s3tests/.s3-tests/
+docs/

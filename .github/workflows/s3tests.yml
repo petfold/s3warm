@@ -1,0 +1,33 @@
+name: s3-tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build gateway and fakebee
+        run: go build -o bin/ ./cmd/s3warm ./cmd/fakebee
+      - name: Start stack
+        run: |
+          ./bin/fakebee &
+          BATCH=$(curl -sf --retry 15 --retry-connrefused -X POST \
+            http://localhost:1633/stamps/100000000000/24 \
+            | sed -n 's/.*"batchID":"\([0-9a-f]*\)".*/\1/p')
+          echo "batch: $BATCH"
+          S3WARM_BATCH_ID=$BATCH \
+          S3WARM_ACCESS_KEY=s3warmdev S3WARM_SECRET_KEY=s3warmdevsecret \
+            ./bin/s3warm &
+          curl -sf --retry 15 --retry-connrefused http://localhost:8333/_s3warm/ready
+      - name: Run conformance subset (passing.txt manifest)
+        run: test/s3tests/run.sh
