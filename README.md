@@ -2,116 +2,92 @@
 
 **An Amazon S3–compatible API gateway for [Swarm](https://www.ethswarm.org/).**
 
-s3warm exposes the S3 REST API (AWS Signature V4, XML, the whole dialect) and translates it onto a [Bee](https://github.com/ethersphere/bee) node — so the enormous ecosystem of S3 tooling (`aws` CLI, boto3, rclone, `mc`, restic, every SDK) can read and write decentralized, content-addressed, censorship-resistant storage without knowing Swarm exists.
+s3warm exposes the S3 REST API (AWS Signature V4, XML, the whole dialect) and
+translates it onto a [Bee](https://github.com/ethersphere/bee) node — so the
+enormous ecosystem of S3 tooling (`aws` CLI, boto3, rclone, `mc`, every SDK)
+can read and write decentralized, content-addressed, censorship-resistant
+storage without knowing Swarm exists.
 
-And without lock-in in the other direction either: every object written through s3warm has a public Swarm reference (returned as `x-swarm-reference`) and remains retrievable from *any* Swarm gateway.
-
-> **Status: design + early skeleton.** The [design document](docs/DESIGN.md) is the primary artifact; the Go code implements the phase-0 skeleton (routing, SigV4, S3 errors, in-memory index, Bee client, core bucket/object operations). See the [API compatibility matrix](docs/API-COMPATIBILITY.md).
+And without lock-in in the other direction either: every object has a public
+Swarm reference (`x-swarm-reference`), and every bucket becomes a real Swarm
+manifest — browsable via `bzz://{root}/{key}` on **any** Bee node, no gateway
+in the path.
 
 ```
 S3 clients (aws cli, boto3, rclone, mc, restic, SDKs)
         │  S3 REST + SigV4
         ▼
-   s3warm gateway  ── metadata index (listings, ETags, metadata)
-        │  Bee HTTP API (/bytes, /stamps, /feeds, …)
+   s3warm gateway  ── metadata index (listings, ETags, snapshots)
+        │  Bee HTTP API (/bytes, /stamps, /soc, …)
         ▼
    Bee node ──► Swarm network
 ```
 
-## Quickstart (local dev)
+**Status:** 259 tests of Ceph's s3-tests conformance suite green in CI
+([the executable claim](test/s3tests/passing.txt)); objects, listings,
+multipart, conditional writes, presigned URLs, streaming signatures,
+checksums, SSE-S3, CORS — plus Swarm-native commit chains with atomic
+whole-bucket snapshot/rollback. See the
+[compatibility matrix](docs/API-COMPATIBILITY.md) and [roadmap](ROADMAP.md).
 
-Requires Go ≥ 1.22 and a Bee binary.
+## Try it in ten minutes
 
 ```bash
-# 1. Run a dev-mode Bee node (in-memory, fake chain)
-bee dev
+docker compose up -d --build     # gateway + in-memory dev backend on :8333
 
-# 2. Buy a (dev) postage batch
-BATCH=$(curl -s -X POST http://localhost:1633/stamps/100000000/24 | sed -n 's/.*"batchID":"\([^"]*\)".*/\1/p')
-
-# 3. Run s3warm
-S3WARM_BATCH_ID=$BATCH \
-S3WARM_ACCESS_KEY=dev S3WARM_SECRET_KEY=devsecret \
-go run ./cmd/s3warm
-
-# 4. Use any S3 client
-export AWS_ACCESS_KEY_ID=dev AWS_SECRET_ACCESS_KEY=devsecret AWS_DEFAULT_REGION=us-east-1
+export AWS_ACCESS_KEY_ID=s3warmdev AWS_SECRET_ACCESS_KEY=s3warmdevsecret AWS_DEFAULT_REGION=us-east-1
 aws --endpoint-url http://localhost:8333 s3 mb s3://demo
-aws --endpoint-url http://localhost:8333 s3 cp README.md s3://demo/docs/readme.md
-aws --endpoint-url http://localhost:8333 s3 ls s3://demo/docs/
+aws --endpoint-url http://localhost:8333 s3 cp README.md s3://demo/
 ```
 
-With rclone: `rclone config` → type `s3`, provider `Other`, endpoint `http://localhost:8333`.
+Then follow the **[User Guide](docs/USER-GUIDE.md)** — written for people who
+know S3 and don't know Swarm: the three things that genuinely differ
+(prepaid storage, delete semantics, public content addresses), pointing your
+existing tools at the gateway, and running against a real node.
 
-## Configuration
+## Demos
 
-| Flag | Env | Default | Meaning |
-|---|---|---|---|
-| `-listen` | `S3WARM_LISTEN` | `:8333` | S3 API listen address |
-| `-db` | `S3WARM_DB` | `s3warm.db` | SQLite metadata index path (empty = in-memory, dev only) |
-| `-bee-api` | `S3WARM_BEE_API` | `http://127.0.0.1:1633` | Bee node API endpoint |
-| `-batch-id` | `S3WARM_BATCH_ID` | — | Default postage batch id (required for writes) |
-| `-access-key` | `S3WARM_ACCESS_KEY` | — | Access key id (empty = anonymous dev mode) |
-| `-secret-key` | `S3WARM_SECRET_KEY` | — | Secret access key |
-| `-region` | `S3WARM_REGION` | `us-east-1` | Region label reported to clients |
-| `-redundancy` | `S3WARM_REDUNDANCY` | `0` | Default erasure-coding level 0–4 (`STANDARD` storage class) |
-| `-encrypt` | `S3WARM_ENCRYPT` | `false` | Encrypt uploads on Swarm (SSE) |
-| `-ack` | `S3WARM_ACK` | `node` | PUT ack policy (design §6): `node` (Bee local store, network push follows) or `network` (pushed before ack) |
-| `-commit` | `S3WARM_COMMIT` | `async` | Bucket commit chain (design §5): debounced on-Swarm manifest per write batch (`off` disables) |
-| `-feed-key` | `S3WARM_FEED_KEY` | — | Hex secp256k1 key; anchors each commit under a Swarm feed (`GET /feeds/{owner}/{topic}` resolves the bucket root anywhere) |
-| `-domain` | `S3WARM_DOMAIN` | — | Base domain for virtual-host-style addressing (`bucket.domain`) |
+Runnable walkthroughs in [`demos/`](demos/):
 
-Operational endpoints (never shadowed by buckets): `/_s3warm/health`, `/_s3warm/ready`,
-and Prometheus metrics at `/_s3warm/metrics` (requests, Bee upstream latencies,
-object bytes in/out, postage batch TTL and utilization gauges).
+| | Popular use case |
+|---|---|
+| [01](demos/01-quickstart.sh) | First bucket with the unchanged AWS CLI |
+| [02](demos/02-backup-restore.sh) | Folder backup + byte-identical restore with rclone |
+| [03](demos/03-static-site/publish.sh) | Deploy a website with `aws s3 sync`, browse it Swarm-natively via `bzz://` |
+| [04](demos/04-boto3-switch/app.py) | Move an existing boto3 app with one constructor change; presigned share links |
+| [05](demos/05-snapshot-rollback.sh) | Snapshot a bucket, wreck it, roll it back atomically — the thing S3 can't do |
 
-## Docker / compose
+## Documentation
 
-```bash
-docker compose up -d --build   # fakebee (in-memory Bee stand-in) + s3warm on :8333
-```
-
-Bee removed its `dev` mode, so the compose stack ships `fakebee` — an in-memory
-stand-in for the Bee API subset s3warm uses. To run against a real Bee node,
-drop the `bee`/`batch-init` services and set `S3WARM_BEE_API` + `S3WARM_BATCH_ID`.
-
-## Conformance (Ceph s3-tests)
-
-The compatibility claim is executable: [`test/s3tests/passing.txt`](test/s3tests/passing.txt)
-lists every test from [Ceph's s3-tests](https://github.com/ceph/s3-tests) suite
-that s3warm passes, and CI runs exactly that manifest against the gateway
-(backed by fakebee). The manifest itself is curated against a real Bee node.
-
-```bash
-docker compose up -d --build
-test/s3tests/run.sh            # clones s3-tests, sets up a venv, runs the manifest
-```
+- **[User Guide](docs/USER-GUIDE.md)** — tutorial for S3 users moving to Swarm.
+- **[Reference Manual](docs/REFERENCE.md)** — every flag, header, extension, error, metric and limit.
+- **[Design](docs/DESIGN.md)** — architecture, S3↔Swarm concept mapping, consistency model, rationale.
+- **[API compatibility matrix](docs/API-COMPATIBILITY.md)** — per-operation status.
+- **[Roadmap](ROADMAP.md)** — phase-by-phase progress.
 
 ## Development
 
 ```bash
 make build   # go build ./...
-make test    # go test ./... (includes AWS SigV4 test vectors + API round-trip vs a fake Bee)
-make run     # run the gateway
+make test    # unit tests: AWS SigV4 vectors, store conformance, API round-trips
+test/s3tests/run.sh   # the 259-test conformance manifest (needs the compose stack)
 ```
 
 Repository layout:
 
 ```
-cmd/s3warm/        entry point
-internal/api/      S3 REST routing, XML types, error envelope, handlers
-internal/auth/     AWS Signature V4 verification
+cmd/s3warm/        the gateway
+cmd/fakebee/       in-memory Bee-API stand-in for dev/CI
+internal/api/      S3 REST routing, XML, handlers, CORS, snapshots
+internal/auth/     SigV4: header, presigned, streaming (aws-chunked)
 internal/bee/      Bee HTTP API client
-internal/store/    metadata index (interface + SQLite and in-memory implementations)
-internal/config/   configuration
-docs/              design document + compatibility matrix
+internal/manifest/ commit chain: mantaray manifests, feeds, committer
+internal/stamp/    postage batch manager
+internal/store/    metadata index (SQLite + in-memory)
+demos/             runnable walkthroughs
+docs/              user guide, reference, design, matrix
+test/s3tests/      Ceph s3-tests conformance harness + passing manifest
 ```
-
-## Documents
-
-- [Design](docs/DESIGN.md) — architecture, S3↔Swarm concept mapping, multipart strategy, postage stamp management, consistency model, roadmap rationale.
-- [Roadmap](ROADMAP.md) — phase-by-phase progress with tickmarks.
-- [API compatibility matrix](docs/API-COMPATIBILITY.md) — per-operation status.
 
 ## License
 

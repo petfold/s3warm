@@ -1,0 +1,13 @@
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  font-family: system-ui, sans-serif;
+  background: #10161d;
+  color: #e8ecf0;
+}
+main { max-width: 34rem; padding: 2rem; line-height: 1.6; }
+h1 { color: #e9962f; }
+a { color: #e9962f; }
+code { background: #182129; padding: 0.15em 0.4em; border-radius: 4px; }
