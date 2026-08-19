@@ -1,0 +1,15 @@
+# binaries
+/s3warm
+/bin/
+/dist/
+
+# test & coverage artifacts
+*.test
+*.out
+coverage.html
+
+# local env / editor
+.env
+.envrc
+.idea/
+.vscode/
