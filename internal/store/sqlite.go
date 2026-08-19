@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS buckets (
 	batch_id   TEXT NOT NULL DEFAULT '',
 	sse        TEXT NOT NULL DEFAULT '',
 	head_root  TEXT NOT NULL DEFAULT '',
-	commit_seq INTEGER NOT NULL DEFAULT 0
+	commit_seq INTEGER NOT NULL DEFAULT 0,
+	cors       TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS snapshots (
 	bucket     TEXT NOT NULL,
@@ -100,6 +101,7 @@ func OpenSQLite(path string) (*SQLite, error) {
 		`ALTER TABLE multipart_uploads ADD COLUMN encrypted INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE buckets ADD COLUMN head_root TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE buckets ADD COLUMN commit_seq INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE buckets ADD COLUMN cors TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := db.Exec(mig); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			db.Close()
@@ -118,9 +120,9 @@ func (s *SQLite) CreateBucket(ctx context.Context, b Bucket) error {
 		b.CreatedAt = time.Now().UTC()
 	}
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO buckets (name, created_at, batch_id, sse, head_root, commit_seq) VALUES (?, ?, ?, ?, ?, ?)
+		`INSERT INTO buckets (name, created_at, batch_id, sse, head_root, commit_seq, cors) VALUES (?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT (name) DO NOTHING`,
-		b.Name, b.CreatedAt.UTC().Format(timeLayout), b.BatchID, b.Encryption, b.HeadRoot, b.CommitSeq)
+		b.Name, b.CreatedAt.UTC().Format(timeLayout), b.BatchID, b.Encryption, b.HeadRoot, b.CommitSeq, b.CORS)
 	if err != nil {
 		return err
 	}
@@ -132,10 +134,10 @@ func (s *SQLite) CreateBucket(ctx context.Context, b Bucket) error {
 
 func (s *SQLite) GetBucket(ctx context.Context, name string) (*Bucket, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT name, created_at, batch_id, sse, head_root, commit_seq FROM buckets WHERE name = ?`, name)
+		`SELECT name, created_at, batch_id, sse, head_root, commit_seq, cors FROM buckets WHERE name = ?`, name)
 	var b Bucket
 	var created string
-	if err := row.Scan(&b.Name, &created, &b.BatchID, &b.Encryption, &b.HeadRoot, &b.CommitSeq); err != nil {
+	if err := row.Scan(&b.Name, &created, &b.BatchID, &b.Encryption, &b.HeadRoot, &b.CommitSeq, &b.CORS); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrBucketNotFound
 		}
@@ -147,7 +149,7 @@ func (s *SQLite) GetBucket(ctx context.Context, name string) (*Bucket, error) {
 
 func (s *SQLite) ListBuckets(ctx context.Context) ([]Bucket, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT name, created_at, batch_id, sse, head_root, commit_seq FROM buckets ORDER BY name`)
+		`SELECT name, created_at, batch_id, sse, head_root, commit_seq, cors FROM buckets ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -156,7 +158,7 @@ func (s *SQLite) ListBuckets(ctx context.Context) ([]Bucket, error) {
 	for rows.Next() {
 		var b Bucket
 		var created string
-		if err := rows.Scan(&b.Name, &created, &b.BatchID, &b.Encryption, &b.HeadRoot, &b.CommitSeq); err != nil {
+		if err := rows.Scan(&b.Name, &created, &b.BatchID, &b.Encryption, &b.HeadRoot, &b.CommitSeq, &b.CORS); err != nil {
 			return nil, err
 		}
 		b.CreatedAt, _ = time.Parse(timeLayout, created)
@@ -196,6 +198,18 @@ func (s *SQLite) DeleteBucket(ctx context.Context, name string) error {
 // SetBucketEncryption sets the bucket-default SSE algorithm.
 func (s *SQLite) SetBucketEncryption(ctx context.Context, bucket, algorithm string) error {
 	res, err := s.db.ExecContext(ctx, `UPDATE buckets SET sse = ? WHERE name = ?`, algorithm, bucket)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return ErrBucketNotFound
+	}
+	return nil
+}
+
+// SetBucketCORS sets the bucket's CORS rules JSON.
+func (s *SQLite) SetBucketCORS(ctx context.Context, bucket, corsJSON string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE buckets SET cors = ? WHERE name = ?`, corsJSON, bucket)
 	if err != nil {
 		return err
 	}

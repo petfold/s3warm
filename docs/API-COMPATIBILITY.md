@@ -26,7 +26,7 @@ Design rationale: [`DESIGN.md`](DESIGN.md).
 | ListObjectVersions | ✅ / 🎯 P3 | Unversioned (null-version) semantics served now, as S3 does for never-versioned buckets; real version history is P3 |
 | GetBucketAcl / PutBucketAcl | 🎯 P3 | Grants map to the bucket's ACT grantee list (grantee = Ethereum public key, design §8); canned `private` until then |
 | GetBucketPolicy / PutBucketPolicy | 🎯 P3 | Grant-subset only, not full IAM policy language |
-| GetBucketCors / PutBucketCors | 🎯 P2 | Gateway-level CORS |
+| Get/Put/DeleteBucketCors | ✅ | Per-bucket rules with S3 wildcard-origin matching; preflights and response decoration handled before auth |
 | Get/Put/DeleteBucketEncryption | ✅ | SSE-S3 (AES256) default-encryption config; KMS rejected |
 | GetBucketLifecycleConfiguration | 🎯 P2 | Read-only synthetic rule derived from postage batch TTL |
 | PutBucketLifecycleConfiguration | ❌ | Expiry is postage TTL; extend by topping up the batch |
@@ -53,7 +53,7 @@ Design rationale: [`DESIGN.md`](DESIGN.md).
 | ListParts | ✅ | With part-number-marker/max-parts pagination |
 | GetObject/HeadObject `?partNumber` | ✅ | Part-ranged reads with `x-amz-mp-parts-count`; non-multipart objects are one part |
 | GetObject `response-*` overrides | ✅ | content-type/-disposition/-encoding/-language, cache-control, expires — signature-covered, as used by presigned links |
-| GetObjectAttributes | 🎯 P2 | |
+| GetObjectAttributes | ✅ | ETag, Checksum, ObjectParts (with pagination), StorageClass, ObjectSize |
 | GetObjectTagging / PutObjectTagging / DeleteObjectTagging | 🎯 P3 | |
 | GetObjectAcl / PutObjectAcl | 🪧 P2 | Canned `private` |
 | RestoreObject / SelectObjectContent / GetObjectTorrent | ❌ | |
@@ -82,5 +82,5 @@ Design rationale: [`DESIGN.md`](DESIGN.md).
 | `x-swarm-commit-seq` | response | ✅ Bucket commit sequence number (HeadBucket) |
 | Snapshot / rollback | extension op | ✅ `PUT ?x-swarm-snapshot=<label>` (forces a commit, pins the root), `GET ?x-swarm-snapshot` (list), `POST ?x-swarm-restore=<label\|root>` — atomic whole-bucket rollback (design §5) |
 | Feed checkpoint anchor | config | ✅ With `-feed-key`, every commit publishes to the bucket's sequence feed (`owner` = key, topic = keccak256("s3warm/1/"+bucket)) — resolvable at any Bee via `GET /feeds/{owner}/{topic}` |
-| `x-swarm-redundancy-strategy` | request | 🎯 P2 — erasure-coding fetch strategy/fallback override on GET |
+| `x-swarm-redundancy-strategy` / `x-swarm-redundancy-fallback-mode` | request | ✅ Erasure-coding fetch strategy/fallback on GET (deployment default via `-fetch-strategy`) |
 | Grants API | extension op | 🎯 P3 — per-bucket ACT grantee management; grants readable off-gateway (design §8) |

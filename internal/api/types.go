@@ -210,6 +210,39 @@ type listMultipartUploadsResult struct {
 	Uploads            []xmlUpload `xml:"Upload"`
 }
 
+type attrChecksum struct {
+	ChecksumCRC32     string `xml:"ChecksumCRC32,omitempty"`
+	ChecksumCRC32C    string `xml:"ChecksumCRC32C,omitempty"`
+	ChecksumCRC64NVME string `xml:"ChecksumCRC64NVME,omitempty"`
+	ChecksumSHA1      string `xml:"ChecksumSHA1,omitempty"`
+	ChecksumSHA256    string `xml:"ChecksumSHA256,omitempty"`
+	ChecksumType      string `xml:"ChecksumType,omitempty"`
+}
+
+type attrPart struct {
+	PartNumber int   `xml:"PartNumber"`
+	Size       int64 `xml:"Size"`
+}
+
+type attrObjectParts struct {
+	IsTruncated          bool       `xml:"IsTruncated"`
+	MaxParts             int        `xml:"MaxParts"`
+	NextPartNumberMarker int        `xml:"NextPartNumberMarker,omitempty"`
+	PartNumberMarker     int        `xml:"PartNumberMarker"`
+	TotalPartsCount      int        `xml:"TotalPartsCount"`
+	Parts                []attrPart `xml:"Part"`
+}
+
+type objectAttributesResponse struct {
+	XMLName      xml.Name         `xml:"GetObjectAttributesResponse"`
+	Xmlns        string           `xml:"xmlns,attr"`
+	ETag         string           `xml:"ETag,omitempty"`
+	Checksum     *attrChecksum    `xml:"Checksum,omitempty"`
+	ObjectParts  *attrObjectParts `xml:"ObjectParts,omitempty"`
+	StorageClass string           `xml:"StorageClass,omitempty"`
+	ObjectSize   *int64           `xml:"ObjectSize,omitempty"`
+}
+
 type sseDefault struct {
 	SSEAlgorithm   string `xml:"SSEAlgorithm"`
 	KMSMasterKeyID string `xml:"KMSMasterKeyID,omitempty"`

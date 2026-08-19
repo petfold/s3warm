@@ -97,6 +97,17 @@ func (m *Memory) SetBucketEncryption(_ context.Context, bucket, algorithm string
 	return nil
 }
 
+func (m *Memory) SetBucketCORS(_ context.Context, bucket, corsJSON string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.buckets[bucket]
+	if !ok {
+		return ErrBucketNotFound
+	}
+	b.meta.CORS = corsJSON
+	return nil
+}
+
 func (m *Memory) SetBucketHead(_ context.Context, bucket, root string, seq int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

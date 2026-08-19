@@ -280,6 +280,21 @@ func (s *Server) uploadBody(r *http.Request, batch, storageClass string, encrypt
 	return res, nil
 }
 
+// downloadOptions builds read options: erasure-coding fetch strategy from
+// the per-request x-swarm-redundancy-strategy override or the configured
+// default (design §17).
+func (s *Server) downloadOptions(r *http.Request, rangeSpec string) bee.DownloadOptions {
+	strategy := r.Header.Get("x-swarm-redundancy-strategy")
+	if strategy == "" {
+		strategy = s.cfg.FetchStrategy
+	}
+	return bee.DownloadOptions{
+		Range:        rangeSpec,
+		Strategy:     strategy,
+		FallbackMode: r.Header.Get("x-swarm-redundancy-fallback-mode"),
+	}
+}
+
 // storedContentEncoding strips the aws-chunked transport token from a
 // Content-Encoding list, preserving the rest — S3 stores only the content's
 // own encodings.
@@ -404,7 +419,7 @@ func (s *Server) handleGetObject(w http.ResponseWriter, r *http.Request, bucket,
 		return
 	}
 
-	resp, err := s.bee.DownloadBytes(ctx, obj.SwarmRef, r.Header.Get("Range"))
+	resp, err := s.bee.DownloadBytes(ctx, obj.SwarmRef, s.downloadOptions(r, r.Header.Get("Range")))
 	if err != nil {
 		s.writeError(w, r, beeError(err))
 		return
@@ -557,6 +572,99 @@ func checkConditionals(r *http.Request, obj *store.Object) (int, bool) {
 	return 0, true
 }
 
+// handleGetObjectAttributes serves GET ?attributes: the metadata-only view
+// selected by x-amz-object-attributes. ETag is unquoted here, per AWS.
+func (s *Server) handleGetObjectAttributes(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	ctx := r.Context()
+	if _, err := s.store.GetBucket(ctx, bucket); err != nil {
+		s.writeError(w, r, storeError(err))
+		return
+	}
+	obj, err := s.store.GetObject(ctx, bucket, key)
+	if err != nil {
+		s.writeError(w, r, storeError(err))
+		return
+	}
+
+	requested := map[string]bool{}
+	for _, header := range r.Header.Values("x-amz-object-attributes") {
+		for _, a := range strings.Split(header, ",") {
+			requested[strings.TrimSpace(a)] = true
+		}
+	}
+	if len(requested) == 0 {
+		s.writeError(w, r, errInvalidRequest.withMessage(
+			"the x-amz-object-attributes header specifying the attributes to be retrieved is required"))
+		return
+	}
+
+	resp := objectAttributesResponse{Xmlns: s3Xmlns}
+	if requested["ETag"] {
+		resp.ETag = obj.ETag
+	}
+	if requested["StorageClass"] {
+		resp.StorageClass = obj.StorageClass
+	}
+	if requested["ObjectSize"] {
+		size := obj.Size
+		resp.ObjectSize = &size
+	}
+	if requested["Checksum"] && obj.Checksum != "" {
+		ck := &attrChecksum{ChecksumType: "FULL_OBJECT"}
+		switch obj.ChecksumAlgorithm {
+		case "CRC32":
+			ck.ChecksumCRC32 = obj.Checksum
+		case "CRC32C":
+			ck.ChecksumCRC32C = obj.Checksum
+		case "CRC64NVME":
+			ck.ChecksumCRC64NVME = obj.Checksum
+		case "SHA1":
+			ck.ChecksumSHA1 = obj.Checksum
+		case "SHA256":
+			ck.ChecksumSHA256 = obj.Checksum
+		}
+		resp.Checksum = ck
+	}
+	if requested["ObjectParts"] && len(obj.Parts) > 0 {
+		marker := 0
+		if m := r.Header.Get("x-amz-part-number-marker"); m != "" {
+			if marker, err = strconv.Atoi(m); err != nil || marker < 0 {
+				s.writeError(w, r, errInvalidArgument.withMessage("invalid x-amz-part-number-marker"))
+				return
+			}
+		}
+		maxParts := 1000
+		if m := r.Header.Get("x-amz-max-parts"); m != "" {
+			n, err := strconv.Atoi(m)
+			if err != nil || n < 0 {
+				s.writeError(w, r, errInvalidArgument.withMessage("invalid x-amz-max-parts"))
+				return
+			}
+			maxParts = min(n, 1000)
+		}
+		op := &attrObjectParts{
+			MaxParts:         maxParts,
+			PartNumberMarker: marker,
+			TotalPartsCount:  len(obj.Parts),
+		}
+		for _, p := range obj.Parts {
+			if p.PartNumber <= marker {
+				continue
+			}
+			if len(op.Parts) == maxParts {
+				op.IsTruncated = true
+				op.NextPartNumberMarker = op.Parts[len(op.Parts)-1].PartNumber
+				break
+			}
+			op.Parts = append(op.Parts, attrPart{PartNumber: p.PartNumber, Size: p.Size})
+		}
+		resp.ObjectParts = op
+	}
+
+	w.Header().Set("Last-Modified", obj.LastModified.UTC().Format(http.TimeFormat))
+	writeXML(w, http.StatusOK, resp)
+}
+
 // serveComposite streams a multipart (composite) object by mapping the
 // requested byte range onto the ordered part list and issuing consecutive
 // sub-range reads against Bee — the join happens here, fully streaming
@@ -595,7 +703,7 @@ func (s *Server) serveComposite(w http.ResponseWriter, r *http.Request, obj *sto
 		}
 		lo := max(start-partStart, 0)
 		hi := min(p.Size-1, lo+remaining-1)
-		resp, err := s.bee.DownloadBytes(ctx, p.SwarmRef, fmt.Sprintf("bytes=%d-%d", lo, hi))
+		resp, err := s.bee.DownloadBytes(ctx, p.SwarmRef, s.downloadOptions(r, fmt.Sprintf("bytes=%d-%d", lo, hi)))
 		if err != nil {
 			// Headers are already written; the truncated body is all we can
 			// signal with. Log loudly.

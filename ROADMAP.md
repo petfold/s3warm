@@ -41,8 +41,9 @@ Exit: restic + Java SDK v2 work; buckets browsable via `bzz://`; snapshot → ro
 - [x] SSE via `swarm-encrypt` (§12): per-request AES256, bucket default-encryption config, gateway-wide flag; key-bearing references stay private; verified against a live Bee node (encrypt on PUT, transparent decrypt on GET)
 - [x] Commit-chain manifests + feed checkpoints (§5): debounced mantaray commits (Bee's own mantaray package over /bytes), commit document with parent links, `-feed-key` sequence-feed anchors; verified live — bucket browsable via `GET /bzz/{root}/{key}` on the node, feed resolves to the commit root. Still open: interval/manual checkpoint policies (currently every-commit), incremental manifest builds
 - [x] Snapshots & rollback (§5): `?x-swarm-snapshot` create/list (pinned roots), `?x-swarm-restore` atomic whole-bucket rollback by label or raw root; HeadBucket exposes `x-swarm-bucket-root`/`x-swarm-commit-seq`
-- [ ] Read-side erasure-coding fetch strategies (§17)
-- [ ] GetObjectAttributes, CORS
+- [x] Read-side erasure-coding fetch strategies (§17): `-fetch-strategy` default + per-request `x-swarm-redundancy-strategy`/`-fallback-mode`
+- [x] GetObjectAttributes: ETag/Checksum/ObjectParts/StorageClass/ObjectSize with part pagination
+- [x] CORS: per-bucket config (Get/Put/Delete ?cors), S3 wildcard-origin matching, pre-auth preflights and response decoration (full s3-tests CORS family remains gated on anonymous/ACL reads)
 
 ## Phase 3 — production
 

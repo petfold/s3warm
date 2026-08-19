@@ -95,13 +95,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// CORS preflights are unsigned, so they are answered before auth. With
-	// no CORS configuration (planned, design roadmap) AWS returns 400.
+	// CORS preflights are unsigned, so they are answered before auth.
 	if r.Method == http.MethodOptions {
-		s.writeError(sw, r, apiError{"BadRequest", http.StatusBadRequest,
-			"Insufficient information. Origin request header needed."})
+		s.handlePreflight(sw, r)
 		return
 	}
+
+	bucket, key := s.resolveTarget(r)
+	// CORS decoration precedes auth so browsers can read even error
+	// responses; a non-match adds nothing and never blocks.
+	s.decorateCORS(sw, r, bucket)
 
 	identity, err := s.verifier.Verify(r)
 	if err != nil {
@@ -109,8 +112,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r = r.WithContext(context.WithValue(r.Context(), identityCtxKey{}, identity))
-
-	bucket, key := s.resolveTarget(r)
 	switch {
 	case bucket == "":
 		if r.Method == http.MethodGet {
@@ -156,7 +157,9 @@ func (s *Server) dispatchBucket(w http.ResponseWriter, r *http.Request, bucket s
 			s.handleGetBucketEncryption(w, r, bucket)
 		case q.Has("x-swarm-snapshot"):
 			s.handleListSnapshots(w, r, bucket)
-		case anySubresource(q, "acl", "policy", "cors", "tagging",
+		case q.Has("cors"):
+			s.handleGetBucketCors(w, r, bucket)
+		case anySubresource(q, "acl", "policy", "tagging",
 			"lifecycle", "website", "object-lock", "replication",
 			"logging", "notification", "requestPayment", "accelerate",
 			"intelligent-tiering", "inventory", "metrics", "analytics", "ownershipControls",
@@ -174,6 +177,10 @@ func (s *Server) dispatchBucket(w http.ResponseWriter, r *http.Request, bucket s
 			s.handlePutBucketEncryption(w, r, bucket)
 			return
 		}
+		if q.Has("cors") {
+			s.handlePutBucketCors(w, r, bucket)
+			return
+		}
 		if q.Has("x-swarm-snapshot") {
 			s.handleCreateSnapshot(w, r, bucket)
 			return
@@ -188,6 +195,10 @@ func (s *Server) dispatchBucket(w http.ResponseWriter, r *http.Request, bucket s
 	case http.MethodDelete:
 		if q.Has("encryption") {
 			s.handleDeleteBucketEncryption(w, r, bucket)
+			return
+		}
+		if q.Has("cors") {
+			s.handleDeleteBucketCors(w, r, bucket)
 			return
 		}
 		if len(q) > 0 {
@@ -218,7 +229,11 @@ func (s *Server) dispatchObject(w http.ResponseWriter, r *http.Request, bucket, 
 			s.handleListParts(w, r, bucket, key)
 			return
 		}
-		if anySubresource(q, "acl", "tagging", "attributes", "legal-hold", "retention", "torrent") {
+		if q.Has("attributes") {
+			s.handleGetObjectAttributes(w, r, bucket, key)
+			return
+		}
+		if anySubresource(q, "acl", "tagging", "legal-hold", "retention", "torrent") {
 			s.notImplemented(w, r, "object subresource")
 			return
 		}

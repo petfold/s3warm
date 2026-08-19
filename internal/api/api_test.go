@@ -336,6 +336,102 @@ func TestConditionalPut(t *testing.T) {
 	}, http.StatusPreconditionFailed).Body.Close()
 }
 
+func TestGetObjectAttributes(t *testing.T) {
+	base := newGateway(t)
+	do(t, http.MethodPut, base+"/attrs", nil, nil, http.StatusOK).Body.Close()
+	content := "attribute me"
+	crc := crc32.ChecksumIEEE([]byte(content))
+	sum := make([]byte, 4)
+	binary.BigEndian.PutUint32(sum, crc)
+	cksum := base64.StdEncoding.EncodeToString(sum)
+	do(t, http.MethodPut, base+"/attrs/k", strings.NewReader(content),
+		map[string]string{"x-amz-checksum-crc32": cksum}, http.StatusOK).Body.Close()
+
+	resp := do(t, http.MethodGet, base+"/attrs/k?attributes", nil,
+		map[string]string{"x-amz-object-attributes": "ETag,ObjectSize,StorageClass,Checksum"}, http.StatusOK)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	out := string(body)
+	for _, want := range []string{
+		"<ETag>" + md5hex(content) + "</ETag>",
+		fmt.Sprintf("<ObjectSize>%d</ObjectSize>", len(content)),
+		"<StorageClass>STANDARD</StorageClass>",
+		"<ChecksumCRC32>" + cksum + "</ChecksumCRC32>",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %s in %s", want, out)
+		}
+	}
+	// Unselected attributes are omitted.
+	resp = do(t, http.MethodGet, base+"/attrs/k?attributes", nil,
+		map[string]string{"x-amz-object-attributes": "ObjectSize"}, http.StatusOK)
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if strings.Contains(string(body), "ETag") {
+		t.Fatalf("unrequested ETag present: %s", body)
+	}
+	// Missing selection header is an error.
+	do(t, http.MethodGet, base+"/attrs/k?attributes", nil, nil, http.StatusBadRequest).Body.Close()
+}
+
+func TestCORS(t *testing.T) {
+	base := newGateway(t)
+	do(t, http.MethodPut, base+"/corsy", nil, nil, http.StatusOK).Body.Close()
+
+	// No config yet.
+	do(t, http.MethodGet, base+"/corsy?cors", nil, nil, http.StatusNotFound).Body.Close()
+
+	cfg := `<CORSConfiguration>
+		<CORSRule><AllowedOrigin>prefix*</AllowedOrigin><AllowedMethod>GET</AllowedMethod><ExposeHeader>x-amz-meta-x</ExposeHeader></CORSRule>
+		<CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>PUT</AllowedMethod></CORSRule>
+	</CORSConfiguration>`
+	do(t, http.MethodPut, base+"/corsy?cors", strings.NewReader(cfg), nil, http.StatusOK).Body.Close()
+
+	// Actual request with a matching origin gets decorated.
+	resp := do(t, http.MethodGet, base+"/corsy?list-type=2", nil,
+		map[string]string{"Origin": "prefix.example"}, http.StatusOK)
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "prefix.example" {
+		t.Fatalf("allow-origin = %q", got)
+	}
+	if got := resp.Header.Get("Access-Control-Expose-Headers"); got != "x-amz-meta-x" {
+		t.Fatalf("expose-headers = %q", got)
+	}
+	// Wildcard rule answers with a literal *.
+	resp = do(t, http.MethodPut, base+"/corsy/obj", strings.NewReader("x"),
+		map[string]string{"Origin": "anything.example"}, http.StatusOK)
+	resp.Body.Close()
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("wildcard allow-origin = %q", got)
+	}
+	// Non-matching origin: no headers, request unharmed.
+	resp = do(t, http.MethodGet, base+"/corsy?list-type=2", nil,
+		map[string]string{"Origin": "elsewhere"}, http.StatusOK)
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.Header.Get("Access-Control-Allow-Origin") != "" {
+		t.Fatal("unexpected CORS headers for non-matching origin")
+	}
+
+	// Preflights: match → 200, mismatch → 403, no origin/method → 400.
+	resp = do(t, http.MethodOptions, base+"/corsy/obj", nil,
+		map[string]string{"Origin": "prefix.app", "Access-Control-Request-Method": "GET"}, http.StatusOK)
+	resp.Body.Close()
+	if got := resp.Header.Get("Access-Control-Allow-Methods"); got != "GET" {
+		t.Fatalf("preflight allow-methods = %q", got)
+	}
+	do(t, http.MethodOptions, base+"/corsy/obj", nil,
+		map[string]string{"Origin": "elsewhere", "Access-Control-Request-Method": "DELETE"}, http.StatusForbidden).Body.Close()
+	do(t, http.MethodOptions, base+"/corsy/obj", nil,
+		map[string]string{"Origin": "prefix.app"}, http.StatusBadRequest).Body.Close()
+
+	// Delete config: preflights forbidden again.
+	do(t, http.MethodDelete, base+"/corsy?cors", nil, nil, http.StatusNoContent).Body.Close()
+	do(t, http.MethodOptions, base+"/corsy/obj", nil,
+		map[string]string{"Origin": "prefix.app", "Access-Control-Request-Method": "GET"}, http.StatusForbidden).Body.Close()
+}
+
 func TestSnapshotAndRestore(t *testing.T) {
 	base := newGateway(t)
 	do(t, http.MethodPut, base+"/chain", nil, nil, http.StatusOK).Body.Close()

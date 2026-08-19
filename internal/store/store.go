@@ -62,6 +62,8 @@ type Bucket struct {
 	// Swarm manifest root of the latest commit and its sequence number.
 	HeadRoot  string
 	CommitSeq int64
+	// CORS holds the bucket's CORS rules as JSON ("" = not configured).
+	CORS string
 }
 
 // Snapshot is a labeled commit root (design §5): restoring one is an atomic
@@ -136,6 +138,8 @@ type Store interface {
 	SetBucketEncryption(ctx context.Context, bucket, algorithm string) error
 	// SetBucketHead records the bucket's latest commit root and sequence.
 	SetBucketHead(ctx context.Context, bucket, root string, seq int64) error
+	// SetBucketCORS sets the bucket's CORS rules JSON ("" clears).
+	SetBucketCORS(ctx context.Context, bucket, corsJSON string) error
 
 	PutSnapshot(ctx context.Context, s Snapshot) error
 	GetSnapshot(ctx context.Context, bucket, label string) (*Snapshot, error)

@@ -50,6 +50,10 @@ type Config struct {
 	// anchored under a sequence feed (owner = this key,
 	// topic = keccak256("s3warm/1/"+bucket)) as its checkpoint (design §5).
 	FeedKey string
+	// FetchStrategy is the default erasure-coding fetch strategy for reads
+	// (0-4; empty = node default). Per-request override:
+	// x-swarm-redundancy-strategy (design §17).
+	FetchStrategy string
 }
 
 func Load(args []string) (*Config, error) {
@@ -68,6 +72,7 @@ func Load(args []string) (*Config, error) {
 		DB:              envStr("S3WARM_DB", "s3warm.db"),
 		Commit:          envStr("S3WARM_COMMIT", "async"),
 		FeedKey:         envStr("S3WARM_FEED_KEY", ""),
+		FetchStrategy:   envStr("S3WARM_FETCH_STRATEGY", ""),
 	}
 
 	fs := flag.NewFlagSet("s3warm", flag.ContinueOnError)
@@ -85,6 +90,7 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar(&cfg.DB, "db", cfg.DB, "SQLite metadata index path (empty = in-memory, dev only)")
 	fs.StringVar(&cfg.Commit, "commit", cfg.Commit, "bucket commit-chain mode: async (default) or off")
 	fs.StringVar(&cfg.FeedKey, "feed-key", cfg.FeedKey, "hex secp256k1 key for feed checkpoint anchors (empty = no feed publishing)")
+	fs.StringVar(&cfg.FetchStrategy, "fetch-strategy", cfg.FetchStrategy, "default erasure-coding fetch strategy for reads (0-4, empty = node default)")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}

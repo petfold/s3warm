@@ -61,7 +61,7 @@ func (l *LoadSaver) Save(ctx context.Context, data []byte) ([]byte, error) {
 }
 
 func (l *LoadSaver) Load(ctx context.Context, ref []byte) ([]byte, error) {
-	resp, err := l.bee.DownloadBytes(ctx, hex.EncodeToString(ref), "")
+	resp, err := l.bee.DownloadBytes(ctx, hex.EncodeToString(ref), bee.DownloadOptions{})
 	if err != nil {
 		return nil, err
 	}

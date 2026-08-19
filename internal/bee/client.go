@@ -102,15 +102,29 @@ func (c *Client) UploadBytes(ctx context.Context, body io.Reader, opts UploadOpt
 	return out.Reference, nil
 }
 
-// DownloadBytes issues GET /bytes/{ref}, passing through an optional Range
-// header. The caller owns resp.Body. Status is 200 or 206.
-func (c *Client) DownloadBytes(ctx context.Context, ref, rangeHeader string) (*http.Response, error) {
+// DownloadOptions tune a read: an optional Range and the erasure-coding
+// fetch strategy/fallback (design §17).
+type DownloadOptions struct {
+	Range        string
+	Strategy     string // swarm-redundancy-strategy (0-4); empty = node default
+	FallbackMode string // swarm-redundancy-fallback-mode (true/false)
+}
+
+// DownloadBytes issues GET /bytes/{ref}. The caller owns resp.Body.
+// Status is 200 or 206.
+func (c *Client) DownloadBytes(ctx context.Context, ref string, o DownloadOptions) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/bytes/"+ref, nil)
 	if err != nil {
 		return nil, err
 	}
-	if rangeHeader != "" {
-		req.Header.Set("Range", rangeHeader)
+	if o.Range != "" {
+		req.Header.Set("Range", o.Range)
+	}
+	if o.Strategy != "" {
+		req.Header.Set("swarm-redundancy-strategy", o.Strategy)
+	}
+	if o.FallbackMode != "" {
+		req.Header.Set("swarm-redundancy-fallback-mode", o.FallbackMode)
 	}
 	resp, err := c.do("bytes_download", req)
 	if err != nil {

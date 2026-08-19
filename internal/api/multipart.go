@@ -167,7 +167,8 @@ func (s *Server) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, bu
 			s.writeError(w, r, errInvalidRange)
 			return
 		}
-		resp, err := s.bee.DownloadBytes(ctx, srcObj.SwarmRef, fmt.Sprintf("bytes=%d-%d", st, en))
+		resp, err := s.bee.DownloadBytes(ctx, srcObj.SwarmRef,
+			bee.DownloadOptions{Range: fmt.Sprintf("bytes=%d-%d", st, en), Strategy: s.cfg.FetchStrategy})
 		if err != nil {
 			s.writeError(w, r, beeError(err))
 			return
