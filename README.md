@@ -29,8 +29,11 @@ multipart, conditional writes, presigned URLs, streaming signatures,
 checksums, SSE-S3, CORS, versioning, tagging and multi-tenant credentials —
 plus Swarm-native commit chains with atomic whole-bucket snapshot/rollback,
 and private buckets whose grants are enforced by Swarm itself (ACT): a
-grantee reads them from their own Bee node with no gateway in the path. See
-the [compatibility matrix](docs/API-COMPATIBILITY.md) and
+grantee reads them from their own Bee node with no gateway in the path.
+Scales to multiple gateways over a shared Postgres index, and keeps the
+money running by itself — automatic chequebook top-ups plus an opt-in
+stamp autopilot that extends and grows postage batches before they expire
+or fill. See the [compatibility matrix](docs/API-COMPATIBILITY.md) and
 [roadmap](ROADMAP.md).
 
 ## Try it in ten minutes
@@ -85,8 +88,8 @@ internal/api/      S3 REST routing, XML, handlers, CORS, snapshots, grants
 internal/auth/     SigV4: header, presigned, streaming (aws-chunked)
 internal/bee/      Bee HTTP API client
 internal/manifest/ commit chain: mantaray manifests, feeds, committer
-internal/stamp/    postage batch manager
-internal/store/    metadata index (SQLite + in-memory)
+internal/stamp/    postage batch manager, chequebook keeper, stamp autopilot
+internal/store/    metadata index (SQLite, Postgres for HA, in-memory)
 demos/             runnable walkthroughs
 docs/              user guide, reference, design, matrix
 test/s3tests/      Ceph s3-tests conformance harness + passing manifest
