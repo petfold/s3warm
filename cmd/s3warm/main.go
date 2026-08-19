@@ -88,6 +88,7 @@ func main() {
 	defer stop()
 	go stamps.Run(ctx)
 	go commits.Run(ctx)
+	go stamp.NewChequebook(beeClient, cfg.ChequebookMin, cfg.ChequebookTarget, logger).Run(ctx)
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

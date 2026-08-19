@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"strconv"
 	"strings"
@@ -171,6 +172,87 @@ func (c *Client) Stamp(ctx context.Context, batchID string) (*Stamp, error) {
 		return nil, fmt.Errorf("bee: decoding stamp response: %w", err)
 	}
 	return &out, nil
+}
+
+// bigIntJSON tolerates Bee's big integers arriving as strings or numbers.
+type bigIntJSON big.Int
+
+func (b *bigIntJSON) UnmarshalJSON(data []byte) error {
+	s := strings.Trim(string(data), `"`)
+	if _, ok := (*big.Int)(b).SetString(s, 10); !ok {
+		return fmt.Errorf("bee: malformed big integer %q", s)
+	}
+	return nil
+}
+
+// ChequebookBalance returns the chequebook's total and available balances
+// in PLUR (1 xBZZ = 1e16 PLUR).
+func (c *Client) ChequebookBalance(ctx context.Context) (total, available *big.Int, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/chequebook/balance", nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	resp, err := c.do("chequebook_balance", req)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil, newStatusError(resp)
+	}
+	var out struct {
+		TotalBalance     bigIntJSON `json:"totalBalance"`
+		AvailableBalance bigIntJSON `json:"availableBalance"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, nil, fmt.Errorf("bee: decoding chequebook balance: %w", err)
+	}
+	return (*big.Int)(&out.TotalBalance), (*big.Int)(&out.AvailableBalance), nil
+}
+
+// WalletBalance returns the node wallet's xBZZ (PLUR) and native xDAI (wei)
+// balances.
+func (c *Client) WalletBalance(ctx context.Context) (bzz, native *big.Int, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/wallet", nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	resp, err := c.do("wallet", req)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil, newStatusError(resp)
+	}
+	var out struct {
+		BZZBalance         bigIntJSON `json:"bzzBalance"`
+		NativeTokenBalance bigIntJSON `json:"nativeTokenBalance"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, nil, fmt.Errorf("bee: decoding wallet balance: %w", err)
+	}
+	return (*big.Int)(&out.BZZBalance), (*big.Int)(&out.NativeTokenBalance), nil
+}
+
+// ChequebookDeposit moves amount PLUR of xBZZ from the node wallet into the
+// chequebook (an on-chain transaction; the wallet pays gas in xDAI).
+func (c *Client) ChequebookDeposit(ctx context.Context, amount *big.Int) error {
+	url := c.base + "/chequebook/deposit?amount=" + amount.String()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.do("chequebook_deposit", req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return newStatusError(resp)
+	}
+	io.Copy(io.Discard, resp.Body) //nolint:errcheck // draining for connection reuse
+	return nil
 }
 
 // UploadSOC uploads a signed single-owner chunk (feed checkpoint updates,

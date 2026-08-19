@@ -15,8 +15,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net/http"
 	"sync"
 	"time"
@@ -76,6 +78,34 @@ func main() {
 			"batchTTL": 86400 * 365, "immutableFlag": false,
 		})
 	})
+	// Chequebook/wallet: the auto top-up keeper's surface. Starts low so a
+	// dev stack exercises the deposit path.
+	var moneyMu sync.Mutex
+	chequebook := big.NewInt(5e15)   // 0.5 xBZZ
+	wallet := big.NewInt(100 * 1e16) // 100 xBZZ
+	mux.HandleFunc("GET /chequebook/balance", func(w http.ResponseWriter, _ *http.Request) {
+		moneyMu.Lock()
+		defer moneyMu.Unlock()
+		fmt.Fprintf(w, `{"totalBalance":"%s","availableBalance":"%s"}`, chequebook, chequebook)
+	})
+	mux.HandleFunc("GET /wallet", func(w http.ResponseWriter, _ *http.Request) {
+		moneyMu.Lock()
+		defer moneyMu.Unlock()
+		fmt.Fprintf(w, `{"bzzBalance":"%s","nativeTokenBalance":"1000000000000000000"}`, wallet)
+	})
+	mux.HandleFunc("POST /chequebook/deposit", func(w http.ResponseWriter, r *http.Request) {
+		amt, ok := new(big.Int).SetString(r.URL.Query().Get("amount"), 10)
+		if !ok || amt.Sign() <= 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		moneyMu.Lock()
+		wallet.Sub(wallet, amt)
+		chequebook.Add(chequebook, amt)
+		moneyMu.Unlock()
+		io.WriteString(w, `{"transactionHash":"0xfa4ebee"}`) //nolint:errcheck
+	})
+
 	mux.HandleFunc("POST /stamps/{amount}/{depth}", func(w http.ResponseWriter, _ *http.Request) {
 		var id [32]byte
 		rand.Read(id[:]) //nolint:errcheck

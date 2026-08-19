@@ -52,6 +52,21 @@ var (
 		Name: "s3warm_stamp_utilization_ratio",
 		Help: "Fill ratio (0-1) of a tracked postage batch.",
 	}, []string{"batch"})
+
+	ChequebookAvailableBZZ = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "s3warm_chequebook_available_bzz",
+		Help: "Available chequebook balance in xBZZ, from the daily check.",
+	})
+
+	WalletBZZ = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "s3warm_wallet_bzz",
+		Help: "Node wallet xBZZ balance, observed when a top-up is considered.",
+	})
+
+	ChequebookDepositsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "s3warm_chequebook_deposits_total",
+		Help: "Automatic chequebook top-ups performed.",
+	})
 )
 
 // Handler serves the Prometheus exposition endpoint.

@@ -54,25 +54,33 @@ type Config struct {
 	// (0-4; empty = node default). Per-request override:
 	// x-swarm-redundancy-strategy (design §17).
 	FetchStrategy string
+	// ChequebookMin/ChequebookTarget (xBZZ) drive automatic chequebook
+	// top-ups: when the daily check finds the available balance below Min,
+	// the gateway deposits from the node wallet up to Target. Min 0
+	// disables.
+	ChequebookMin    float64
+	ChequebookTarget float64
 }
 
 func Load(args []string) (*Config, error) {
 	cfg := &Config{
-		ListenAddr:      envStr("S3WARM_LISTEN", ":8333"),
-		BeeAPI:          envStr("S3WARM_BEE_API", "http://127.0.0.1:1633"),
-		BatchID:         envStr("S3WARM_BATCH_ID", ""),
-		BatchIDFile:     envStr("S3WARM_BATCH_ID_FILE", ""),
-		Region:          envStr("S3WARM_REGION", "us-east-1"),
-		AccessKey:       envStr("S3WARM_ACCESS_KEY", ""),
-		SecretKey:       envStr("S3WARM_SECRET_KEY", ""),
-		RedundancyLevel: envInt("S3WARM_REDUNDANCY", 0),
-		Encrypt:         envBool("S3WARM_ENCRYPT", false),
-		Ack:             envStr("S3WARM_ACK", "node"),
-		Domain:          envStr("S3WARM_DOMAIN", ""),
-		DB:              envStr("S3WARM_DB", "s3warm.db"),
-		Commit:          envStr("S3WARM_COMMIT", "async"),
-		FeedKey:         envStr("S3WARM_FEED_KEY", ""),
-		FetchStrategy:   envStr("S3WARM_FETCH_STRATEGY", ""),
+		ListenAddr:       envStr("S3WARM_LISTEN", ":8333"),
+		BeeAPI:           envStr("S3WARM_BEE_API", "http://127.0.0.1:1633"),
+		BatchID:          envStr("S3WARM_BATCH_ID", ""),
+		BatchIDFile:      envStr("S3WARM_BATCH_ID_FILE", ""),
+		Region:           envStr("S3WARM_REGION", "us-east-1"),
+		AccessKey:        envStr("S3WARM_ACCESS_KEY", ""),
+		SecretKey:        envStr("S3WARM_SECRET_KEY", ""),
+		RedundancyLevel:  envInt("S3WARM_REDUNDANCY", 0),
+		Encrypt:          envBool("S3WARM_ENCRYPT", false),
+		Ack:              envStr("S3WARM_ACK", "node"),
+		Domain:           envStr("S3WARM_DOMAIN", ""),
+		DB:               envStr("S3WARM_DB", "s3warm.db"),
+		Commit:           envStr("S3WARM_COMMIT", "async"),
+		FeedKey:          envStr("S3WARM_FEED_KEY", ""),
+		FetchStrategy:    envStr("S3WARM_FETCH_STRATEGY", ""),
+		ChequebookMin:    envFloat("S3WARM_CHEQUEBOOK_MIN", 1),
+		ChequebookTarget: envFloat("S3WARM_CHEQUEBOOK_TARGET", 5),
 	}
 
 	fs := flag.NewFlagSet("s3warm", flag.ContinueOnError)
@@ -91,6 +99,8 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar(&cfg.Commit, "commit", cfg.Commit, "bucket commit-chain mode: async (default) or off")
 	fs.StringVar(&cfg.FeedKey, "feed-key", cfg.FeedKey, "hex secp256k1 key for feed checkpoint anchors (empty = no feed publishing)")
 	fs.StringVar(&cfg.FetchStrategy, "fetch-strategy", cfg.FetchStrategy, "default erasure-coding fetch strategy for reads (0-4, empty = node default)")
+	fs.Float64Var(&cfg.ChequebookMin, "chequebook-min", cfg.ChequebookMin, "auto top-up the chequebook when its available balance falls below this many xBZZ (0 disables)")
+	fs.Float64Var(&cfg.ChequebookTarget, "chequebook-target", cfg.ChequebookTarget, "top the chequebook up to this many xBZZ")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -101,6 +111,9 @@ func Load(args []string) (*Config, error) {
 			return nil, fmt.Errorf("reading batch-id-file: %w", err)
 		}
 		cfg.BatchID = strings.TrimSpace(string(b))
+	}
+	if cfg.ChequebookMin > 0 && cfg.ChequebookTarget < cfg.ChequebookMin {
+		return nil, fmt.Errorf("chequebook-target (%g) must be at least chequebook-min (%g)", cfg.ChequebookTarget, cfg.ChequebookMin)
 	}
 	if cfg.Commit != "async" && cfg.Commit != "off" {
 		return nil, fmt.Errorf("commit mode must be async or off, got %q", cfg.Commit)
@@ -128,6 +141,15 @@ func envInt(key string, def int) int {
 	if v, ok := os.LookupEnv(key); ok {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
+		}
+	}
+	return def
+}
+
+func envFloat(key string, def float64) float64 {
+	if v, ok := os.LookupEnv(key); ok {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
 		}
 	}
 	return def

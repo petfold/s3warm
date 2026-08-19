@@ -53,5 +53,6 @@ Exit: multi-gateway behind LB; a grantee reads a private bucket off-gateway.
 - [ ] ACT-backed grants + key-based multi-tenancy (§8)
 - [ ] Object/bucket tagging
 - [ ] Postgres index for HA (§10)
+- [x] Chequebook auto top-up: daily check, deposits wallet→chequebook below `-chequebook-min` (first slice of the money autopilot)
 - [ ] Stamp autopilot (§9)
 - [ ] PSS/GSOC notification research (§21)

@@ -115,14 +115,17 @@ bootstrapped: on its next start the node automatically deploys its
 with an initial xBZZ deposit from that wallet, and the same wallet pays
 for the postage batch below.
 
-One caveat to know: that chequebook seeding is a **one-time** event — Bee
-does not top the chequebook up from the wallet later, however full the
-wallet is. Light and moderate traffic rarely exhausts the initial deposit,
-but if your gateway serves heavy download traffic, glance at
-`curl localhost:1633/chequebook/balance` occasionally and refill with
-`curl -X POST "localhost:1633/chequebook/deposit?amount=…"` if the
-available balance runs low. (Postage batches and top-ups keep drawing from
-the wallet directly, so those are unaffected.)
+One caveat that s3warm handles for you: Bee's chequebook seeding is a
+**one-time** event — Bee itself never tops the chequebook up from the
+wallet later, however full the wallet is, and a drained chequebook means
+peers stop serving the node. The gateway therefore checks the chequebook
+daily and, whenever the available balance falls below **1 xBZZ**,
+automatically refills it to **5 xBZZ** from the wallet (thresholds:
+`-chequebook-min` / `-chequebook-target`; set `-chequebook-min 0` to manage
+it manually). So the standing rule is simply: **keep some xBZZ and a
+little xDAI in the node wallet**, and gas, chequebook, and postage top-ups
+all keep working. Balances are visible as Prometheus gauges at
+`/_s3warm/metrics`, and every automatic deposit is logged.
 
 ### Buying a postage batch
 
