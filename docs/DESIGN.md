@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft v0.3 — v0.2 added ACT tenancy, commit-chain buckets, snapshots; v0.3 adds explicit PUT ack-policy tiers |
+| **Status** | Draft v0.4 — v0.3 added explicit PUT ack-policy tiers; v0.4 records §8 layer 2 as built and live-verified (tenant credentials, node-key publisher, per-object ACT epochs) |
 | **Date** | 2026-08-19 |
 | **Scope** | Design of an Amazon S3–compatible HTTP API layer on top of [Swarm](https://www.ethswarm.org/), served by a gateway that talks to a [Bee](https://github.com/ethersphere/bee) node |
 
@@ -65,7 +65,7 @@ S3 clients (aws cli, boto3, rclone, mc, restic, SDKs)
 | **Local pinning (`/pins`)** | Pin chunks on a node so they survive local GC | Bucket head roots and labeled snapshots stay pinned on the gateway's Bee node (§5) |
 | **`/stewardship`** | Check/repair retrievability of a reference | Ops tooling: periodic health sweep of indexed refs |
 
-Bee endpoints consumed by the gateway: `POST/GET /bytes` (including GET-side redundancy fetch strategy/fallback parameters, §17), `GET /health`, `GET /stamps`, `GET /stamps/{id}`, `POST /stamps/{amount}/{depth}`, `PATCH /stamps/topup|dilute/...`; phase 2 adds `/chunks` (mantaray node upload), `/soc` (feed checkpoints), `/bzz` (manifest reads), `/pins`, `/tags`; phase 3 adds `/grantees` (ACT grants).
+Bee endpoints consumed by the gateway: `POST/GET /bytes` (including GET-side redundancy fetch strategy/fallback parameters, §17), `GET /health`, `GET /stamps`, `GET /stamps/{id}`, `POST /stamps/{amount}/{depth}`, `PATCH /stamps/topup|dilute/...`; phase 2 adds `/chunks` (mantaray node upload), `/soc` (feed checkpoints), `/bzz` (manifest reads), `/pins`, `/tags`; phase 3 adds `/grantee` (ACT grants) and `/addresses` (publisher key).
 
 ---
 
@@ -87,7 +87,7 @@ Bee endpoints consumed by the gateway: `POST/GET /bytes` (including GET-side red
 | Bucket snapshot / rollback (extension) | Labeled manifest root from the bucket's commit chain | Atomic O(1) whole-bucket rollback — no S3 equivalent (§5) |
 | Lifecycle / expiry | Postage batch TTL | Read-only mapping: expiry surfaced via headers; extending = topping up the batch |
 | Region | Single configurable label (default `us-east-1` for client compatibility) | SigV4 scope accepted for any region string |
-| Account / credentials | Access-key/secret pairs linked to a tenant Ethereum key pair (feed owner + ACT publisher) | Key-based multi-tenancy in phase 3 (§8) |
+| Account / credentials | Access-key/secret pairs bound to a tenant label (`-credentials` file); tenant Ethereum key pairs (feed ownership handoff) later | Key-based multi-tenancy (§8) |
 | Durability / replication config | Inherent (network-level redundancy + optional erasure coding) | Replication APIs intentionally unsupported |
 
 **The killer property:** because every object is content-addressed, any object written through s3warm is *also* retrievable from any public Swarm gateway via its reference — and a phase-2 bucket is a browsable `bzz://` manifest. S3 compatibility without S3 lock-in.
@@ -237,13 +237,14 @@ Two complementary layers: SigV4 authenticates S3 clients at the gateway; ACT mak
 - **Credentials**: provider interface; static pair via env/flags now, file/DB-backed multi-key store later. SigV4 requires the *actual* secret to derive signing keys, so secrets are stored recoverable — encrypted at rest with a gateway master key, never hashed.
 - **Anonymous/dev mode**: explicit opt-in flag for local development; loud warning at startup.
 
-### Layer 2 — key-based tenancy and ACT authorization (phase 3)
+### Layer 2 — key-based tenancy and ACT authorization (phase 3 — implemented)
 
-- **A tenant is an Ethereum key pair**, held by the gateway; the credentials table links S3 access keys to it. The same key owns the bucket's feed and acts as ACT publisher — so bucket ownership handoff is a key handoff.
-- **Private buckets are uploaded with `swarm-act: true`** under the bucket owner's publisher key, with **one grantee list and ACT history per bucket**. Per-object ACT would multiply history lookups and stamp costs for no S3-semantic gain — S3 access patterns are overwhelmingly bucket-granular.
-- **Grants map onto Bee's grantee endpoints** (`POST`/`PATCH /grantees`): grantee ID = Ethereum public key. The S3-facing surface is the `PutBucketAcl`-adjacent grants API; the gateway still checks grants on the fast path, ACT makes the same grants independently true on Swarm.
-- **The payoff:** a grantee reads a private bucket directly from any Bee node with their own key — no s3warm in the path, no trust in the gateway after the grant. This extends the no-lock-in property (§3) from public objects to private data.
-- **Caveats, stated plainly:** revocation is forward-only (ciphertext already readable stays readable — you cannot un-share); reads pay an ACT history lookup; ACT content has 64-byte encrypted references, so `x-swarm-reference` stays suppressed and native access needs the publisher/history headers rather than a bare URL.
+- **Tenancy is a credential property**: the `-credentials` file binds each access-key pair to a tenant label; a tenant key only sees buckets its tenant owns (scoped listings, `403` everywhere else — copy sources included), while the flag pair stays a root key. *Eventually* a tenant grows into an Ethereum key pair held by the gateway (feed owner, so bucket ownership handoff is a key handoff) — but Bee signs ACT uploads with **the node's own key**, so the ACT publisher is the gateway's Bee node regardless; tenant key pairs add feed ownership, not ACT identity.
+- **Private buckets are created with `x-swarm-act: true`** and every object is uploaded with `swarm-act` under the node's publisher key, with **one grantee list and ACT history per bucket**. Per-object ACT would multiply history lookups and stamp costs for no S3-semantic gain — S3 access patterns are overwhelmingly bucket-granular. The history is started at bucket creation, so concurrent first writes cannot race two histories into existence.
+- **Grants map onto Bee's grantee endpoints** (`POST`/`PATCH /grantee`): grantee ID = compressed secp256k1 public key. The S3-facing surface is `GET/PUT /{bucket}?x-swarm-grants` — an explicit Swarm-native extension rather than a lossy ACL mapping. The first grant is created *on* the bucket's existing history, so earlier objects become readable by the grantees too.
+- **Epochs (found by live verification):** a grant mutation — revocation especially — re-keys into a **new** history that cannot decrypt every older epoch. The gateway therefore pins each object's (history address, write timestamp) pair in the index and presents exactly that pair on reads; copies carry the source's epoch, because the reused reference is the source's ciphertext. Object responses expose their own epoch's `x-swarm-act-history`, which may differ from the bucket's current head.
+- **The payoff:** a grantee reads a private bucket directly from any Bee node with their own key — no s3warm in the path, no trust in the gateway after the grant. This extends the no-lock-in property (§3) from public objects to private data. Each object response carries the full native-read triple: `x-swarm-reference`, `x-swarm-act-history`, `x-swarm-act-publisher`.
+- **Caveats, stated plainly:** revocation is forward-only (ciphertext already readable stays readable — you cannot un-share); reads pay an ACT history lookup; an ACT reference alone grants nothing (decryption needs a granted key plus the history/publisher pair), so `x-swarm-reference` stays exposed — but a bare `bzz://` URL will not work. The public commit chain (§5) is **off** for ACT buckets — it would publish key names and structure — so snapshots/rollback are unavailable there, and reference-reusing copies cannot cross an ACT bucket boundary.
 
 ---
 

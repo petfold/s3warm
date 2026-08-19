@@ -23,12 +23,15 @@ S3 clients (aws cli, boto3, rclone, mc, restic, SDKs)
    Bee node ──► Swarm network
 ```
 
-**Status:** 259 tests of Ceph's s3-tests conformance suite green in CI
+**Status:** 307 tests of Ceph's s3-tests conformance suite green in CI
 ([the executable claim](test/s3tests/passing.txt)); objects, listings,
 multipart, conditional writes, presigned URLs, streaming signatures,
-checksums, SSE-S3, CORS — plus Swarm-native commit chains with atomic
-whole-bucket snapshot/rollback. See the
-[compatibility matrix](docs/API-COMPATIBILITY.md) and [roadmap](ROADMAP.md).
+checksums, SSE-S3, CORS, versioning, tagging and multi-tenant credentials —
+plus Swarm-native commit chains with atomic whole-bucket snapshot/rollback,
+and private buckets whose grants are enforced by Swarm itself (ACT): a
+grantee reads them from their own Bee node with no gateway in the path. See
+the [compatibility matrix](docs/API-COMPATIBILITY.md) and
+[roadmap](ROADMAP.md).
 
 ## Try it in ten minutes
 
@@ -70,7 +73,7 @@ Runnable walkthroughs in [`demos/`](demos/):
 ```bash
 make build   # go build ./...
 make test    # unit tests: AWS SigV4 vectors, store conformance, API round-trips
-test/s3tests/run.sh   # the 259-test conformance manifest (needs the compose stack)
+test/s3tests/run.sh   # the 307-test conformance manifest (needs the compose stack)
 ```
 
 Repository layout:
@@ -78,7 +81,7 @@ Repository layout:
 ```
 cmd/s3warm/        the gateway
 cmd/fakebee/       in-memory Bee-API stand-in for dev/CI
-internal/api/      S3 REST routing, XML, handlers, CORS, snapshots
+internal/api/      S3 REST routing, XML, handlers, CORS, snapshots, grants
 internal/auth/     SigV4: header, presigned, streaming (aws-chunked)
 internal/bee/      Bee HTTP API client
 internal/manifest/ commit chain: mantaray manifests, feeds, committer
