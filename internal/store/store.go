@@ -165,8 +165,9 @@ type MultipartUpload struct {
 }
 
 // Store is the metadata index. Implementations must be safe for concurrent
-// use. The in-memory implementation is for development and tests; SQLite and
-// Postgres implementations are planned (design §5).
+// use. In-memory (development and tests), SQLite (single gateway) and
+// Postgres (shared, multi-gateway — design §10) implementations exist; the
+// conformance suite in store_test.go runs against all of them.
 type Store interface {
 	CreateBucket(ctx context.Context, b Bucket) error
 	GetBucket(ctx context.Context, name string) (*Bucket, error)

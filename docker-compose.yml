@@ -53,6 +53,39 @@ services:
       - batch:/shared
       - data:/data
 
+  # HA shape (design §10): several gateways sharing one Postgres index.
+  # Start with:  docker compose --profile ha up -d --build
+  # (the default s3warm service keeps its private SQLite index; point your
+  # client at :8334 to use the postgres-backed gateway)
+  postgres:
+    profiles: [ha]
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: s3warm
+      POSTGRES_DB: s3warm
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  s3warm-ha:
+    profiles: [ha]
+    build: .
+    depends_on:
+      batch-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_started
+    environment:
+      S3WARM_BEE_API: http://bee:1633
+      S3WARM_BATCH_ID_FILE: /shared/batch-id
+      S3WARM_ACCESS_KEY: ${S3WARM_ACCESS_KEY:-s3warmdev}
+      S3WARM_SECRET_KEY: ${S3WARM_SECRET_KEY:-s3warmdevsecret}
+      S3WARM_DB: postgres://postgres:s3warm@postgres:5432/s3warm
+    ports:
+      - "8334:8333"
+    volumes:
+      - batch:/shared
+
 volumes:
   batch:
   data:
+  pgdata:

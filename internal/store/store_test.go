@@ -2,8 +2,14 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -21,7 +27,47 @@ func forEachStore(t *testing.T, fn func(t *testing.T, s Store)) {
 		t.Cleanup(func() { s.Close() })
 		fn(t, s)
 	})
+	t.Run("postgres", func(t *testing.T) {
+		fn(t, openTestPostgres(t))
+	})
 }
+
+// openTestPostgres connects to the server named by S3WARM_TEST_POSTGRES
+// (a postgres:// DSN) and isolates the test in a throwaway schema. Skipped
+// when the variable is unset — CI provides a server, `make test-postgres`
+// runs one locally.
+func openTestPostgres(t *testing.T) *Postgres {
+	t.Helper()
+	dsn := os.Getenv("S3WARM_TEST_POSTGRES")
+	if dsn == "" {
+		t.Skip("S3WARM_TEST_POSTGRES not set")
+	}
+	schema := fmt.Sprintf("s3warm_test_%d", atomic.AddInt64(&testSchemaSeq, 1))
+	admin, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open postgres: %v", err)
+	}
+	if _, err := admin.Exec("CREATE SCHEMA " + schema); err != nil {
+		admin.Close()
+		t.Fatalf("create schema: %v", err)
+	}
+	t.Cleanup(func() {
+		admin.Exec("DROP SCHEMA " + schema + " CASCADE") //nolint:errcheck
+		admin.Close()
+	})
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	s, err := OpenPostgres(dsn + sep + "search_path=" + schema)
+	if err != nil {
+		t.Fatalf("OpenPostgres: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s
+}
+
+var testSchemaSeq int64
 
 func obj(bucket, key string) Object {
 	return Object{
@@ -331,4 +377,41 @@ func TestSQLitePersistsAcrossReopen(t *testing.T) {
 	if err != nil || b.BatchID != "batch" {
 		t.Fatalf("after reopen: %+v, %v", b, err)
 	}
+}
+
+// TestConcurrentConditionalCreate races create-only writers of one key:
+// exactly one may win. SQLite serializes via its single writer; Postgres
+// must do it with the per-key advisory lock (multi-gateway, design §10).
+func TestConcurrentConditionalCreate(t *testing.T) {
+	forEachStore(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		if err := s.CreateBucket(ctx, Bucket{Name: "race"}); err != nil {
+			t.Fatal(err)
+		}
+		const writers = 16
+		var wins int64
+		var wg sync.WaitGroup
+		for i := 0; i < writers; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				o := obj("race", "the-key")
+				o.ETag = fmt.Sprintf("etag-%d", i)
+				o.VersionID = fmt.Sprintf("v%d", i)
+				o.VSeq = int64(i)
+				err := s.PutObject(ctx, o, &PutCondition{IfNoneMatch: "*"})
+				switch {
+				case err == nil:
+					atomic.AddInt64(&wins, 1)
+				case errors.Is(err, ErrPreconditionFailed):
+				default:
+					t.Errorf("writer %d: %v", i, err)
+				}
+			}(i)
+		}
+		wg.Wait()
+		if wins != 1 {
+			t.Fatalf("create-only race: %d writers succeeded, want exactly 1", wins)
+		}
+	})
 }

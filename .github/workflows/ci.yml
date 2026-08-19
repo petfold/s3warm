@@ -8,6 +8,22 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: s3warm
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # The store conformance suite runs against Postgres too (design §10).
+      S3WARM_TEST_POSTGRES: postgres://postgres:ci@localhost:5432/s3warm
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

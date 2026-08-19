@@ -23,7 +23,7 @@ One static binary, configured by flags with environment-variable defaults
 | `-secret-key` | `S3WARM_SECRET_KEY` | — | Secret access key (must be set together with `-access-key`) |
 | `-credentials` | `S3WARM_CREDENTIALS` | — | JSON credentials file for multi-tenancy: `[{"accessKey": "...", "secretKey": "...", "tenant": "alice"}, ...]`. Tenant-labeled keys only see buckets their tenant owns; tenant `""` or `"root"` is unrestricted. The `-access-key` pair is always a root key |
 | `-region` | `S3WARM_REGION` | `us-east-1` | Region label reported by GetBucketLocation (`us-east-1` renders as the empty LocationConstraint, as on AWS) |
-| `-db` | `S3WARM_DB` | `s3warm.db` | SQLite metadata index path. Empty = in-memory index (dev only; metadata lost on restart). Schema migrates automatically on open |
+| `-db` | `S3WARM_DB` | `s3warm.db` | Metadata index: a SQLite file path, or a `postgres://` URL for the shared multi-gateway index (see Deployment). Empty = in-memory index (dev only; metadata lost on restart). Schema migrates automatically on open |
 | `-redundancy` | `S3WARM_REDUNDANCY` | `0` | Erasure-coding level (0–4) applied to `STANDARD`-class writes |
 | `-encrypt` | `S3WARM_ENCRYPT` | `false` | Encrypt **all** uploads (gateway-wide SSE default) |
 | `-ack` | `S3WARM_ACK` | `node` | PUT ack policy: `node` or `network` (see below) |
@@ -378,6 +378,17 @@ in-memory Bee-API stand-in). Production: run the binary as a sidecar next
 to a Bee node; terminate TLS in front of it (SigV4 does not encrypt
 payloads); persist `-db`; monitor the stamp gauges. The gateway only ever
 dials its configured `-bee-api` — no user-influenced upstream URLs.
+
+**HA / multi-gateway** (design §10): point every instance's `-db` at one
+Postgres database (`postgres://user:pass@host/db`) and put them behind any
+load balancer — the shared index preserves single-gateway consistency
+(read-after-write and list-after-write) across instances, with per-key
+advisory locks serializing concurrent writers of the same key. Instances
+are otherwise stateless; simultaneous cold starts are safe (schema
+creation is serialized too). Listings order keys bytewise regardless of
+the database locale (key columns are `COLLATE "C"`).
+`docker compose --profile ha up -d --build` runs the shape locally: a
+second gateway on `:8334` sharing a Postgres index.
 
 ### Conformance harness
 

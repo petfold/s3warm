@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -47,10 +48,22 @@ func main() {
 	}
 
 	var st store.Store
-	if cfg.DB == "" {
+	switch {
+	case cfg.DB == "":
 		logger.Warn("using in-memory index — metadata is lost on restart")
 		st = store.NewMemory()
-	} else {
+	case strings.HasPrefix(cfg.DB, "postgres://") || strings.HasPrefix(cfg.DB, "postgresql://"):
+		// Shared index: multiple gateways behind a load balancer point at
+		// the same database (design §10).
+		pg, err := store.OpenPostgres(cfg.DB)
+		if err != nil {
+			logger.Error("opening index", "db", "postgres", "err", err)
+			os.Exit(1)
+		}
+		defer pg.Close()
+		logger.Info("metadata index", "db", "postgres (shared)")
+		st = pg
+	default:
 		sq, err := store.OpenSQLite(cfg.DB)
 		if err != nil {
 			logger.Error("opening index", "db", cfg.DB, "err", err)

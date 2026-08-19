@@ -96,7 +96,12 @@ CREATE TABLE IF NOT EXISTS multipart_parts (
 
 // OpenSQLite opens (creating if needed) the index database at path.
 func OpenSQLite(path string) (*SQLite, error) {
-	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)", path)
+	// _txlock=immediate: transactions take the write lock up front, so
+	// concurrent writers queue on busy_timeout instead of failing with
+	// SQLITE_BUSY snapshot conflicts on lock upgrade (deferred transactions
+	// that read before writing — PutObject's condition check — are exposed
+	// to that in WAL mode, and busy_timeout does not cover it).
+	dsn := fmt.Sprintf("file:%s?_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
