@@ -17,7 +17,7 @@ Exit: `aws s3 cp/ls/rm` round-trips against `bee dev`.
 - [x] Object ops: Put/Get(+Range)/Head/Delete/DeleteObjects/Copy, conditional GET headers
 - [x] ListObjectsV2/V1 with delimiter roll-up and pagination
 - [x] CI (fmt, vet, test, build)
-- [ ] Verified round-trip against a real `bee dev` node
+- [x] Verified round-trip against a live Bee node (2.8.1, rclone: mkdir/copy/ls/cat/delete; object also fetched directly from Bee via its `x-swarm-reference`)
 
 ## Phase 1 — MVP
 
