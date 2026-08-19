@@ -79,8 +79,31 @@ network — for that, keep reading.
 
 ## 3. Running against a real Swarm node
 
-You need a running [Bee node](https://docs.ethswarm.org/) with some xBZZ,
-and a postage batch:
+### Getting a Bee node
+
+If you don't have a node yet, two good paths:
+
+- **Easiest:** [Swarm Desktop](https://github.com/ethersphere/swarm-desktop)
+  wraps a Bee node in a point-and-click app — install, click, you have a
+  node with its API on `localhost:1633`.
+- **For servers** (where a gateway usually lives): the official
+  [Bee quick-start](https://docs.ethswarm.org/docs/bee/installation/quick-start/)
+  — a one-line installer plus a short config walkthrough.
+
+**Fund it before it can store anything.** A fresh node has a Gnosis Chain
+wallet; send it a small amount of **xDAI** (for transaction gas) and
+**xBZZ** (Swarm's token, for storage and bandwidth) — one transfer of each,
+to the wallet address the node prints on first start (also at
+`curl localhost:1633/addresses`). That single funding step covers
+everything downstream: on its next start the node automatically deploys and
+funds its *chequebook* (the payment contract it settles bandwidth with)
+from that wallet, and the same wallet pays for the postage batch below.
+The quick-start guide walks through where to get xDAI/xBZZ.
+
+### Buying a postage batch
+
+With a funded node running, buy the batch your uploads will be stamped
+from:
 
 ```bash
 # Buy a batch on your node (size/lifetime tradeoffs: see the Bee docs).
@@ -88,7 +111,9 @@ curl -X POST "http://localhost:1633/stamps/100000000000/24"
 # → {"batchID":"<64 hex chars>"}
 ```
 
-Then run the gateway next to it:
+### Starting the gateway
+
+Then run s3warm next to the node:
 
 ```bash
 s3warm \
