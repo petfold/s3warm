@@ -97,6 +97,8 @@ func storeError(err error) apiError {
 		return errBucketAlreadyOwned
 	case errors.Is(err, store.ErrBucketNotEmpty):
 		return errBucketNotEmpty
+	case errors.Is(err, store.ErrPreconditionFailed):
+		return errPreconditionFailed
 	default:
 		return errInternal.withMessage(err.Error())
 	}

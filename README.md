@@ -56,8 +56,12 @@ With rclone: `rclone config` → type `s3`, provider `Other`, endpoint `http://l
 | `-region` | `S3WARM_REGION` | `us-east-1` | Region label reported to clients |
 | `-redundancy` | `S3WARM_REDUNDANCY` | `0` | Default erasure-coding level 0–4 (`STANDARD` storage class) |
 | `-encrypt` | `S3WARM_ENCRYPT` | `false` | Encrypt uploads on Swarm (SSE) |
-| `-deferred` | `S3WARM_DEFERRED` | `true` | Deferred (async) upload to the network — lower PUT latency |
+| `-ack` | `S3WARM_ACK` | `node` | PUT ack policy (design §6): `node` (Bee local store, network push follows) or `network` (pushed before ack) |
 | `-domain` | `S3WARM_DOMAIN` | — | Base domain for virtual-host-style addressing (`bucket.domain`) |
+
+Operational endpoints (never shadowed by buckets): `/_s3warm/health`, `/_s3warm/ready`,
+and Prometheus metrics at `/_s3warm/metrics` (requests, Bee upstream latencies,
+object bytes in/out, postage batch TTL and utilization gauges).
 
 ## Docker / compose
 

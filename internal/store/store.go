@@ -11,11 +11,41 @@ import (
 )
 
 var (
-	ErrBucketNotFound = errors.New("bucket not found")
-	ErrBucketExists   = errors.New("bucket already exists")
-	ErrBucketNotEmpty = errors.New("bucket not empty")
-	ErrObjectNotFound = errors.New("object not found")
+	ErrBucketNotFound     = errors.New("bucket not found")
+	ErrBucketExists       = errors.New("bucket already exists")
+	ErrBucketNotEmpty     = errors.New("bucket not empty")
+	ErrObjectNotFound     = errors.New("object not found")
+	ErrPreconditionFailed = errors.New("precondition failed")
 )
+
+// PutCondition constrains an object write; it is evaluated atomically with
+// the write (design §10: conditional writes are trivial index constraints).
+type PutCondition struct {
+	// IfMatch requires the key to exist with this ETag ("*" = any existing).
+	IfMatch string
+	// IfNoneMatch "*" requires the key to not exist; a specific ETag
+	// requires the current object to not have it.
+	IfNoneMatch string
+}
+
+// Ok reports whether the condition holds against the current state of the
+// key: exists and, when it does, its ETag.
+func (c *PutCondition) Ok(exists bool, etag string) bool {
+	if c == nil {
+		return true
+	}
+	if c.IfMatch != "" {
+		if !exists || (c.IfMatch != "*" && c.IfMatch != etag) {
+			return false
+		}
+	}
+	if c.IfNoneMatch != "" {
+		if exists && (c.IfNoneMatch == "*" || c.IfNoneMatch == etag) {
+			return false
+		}
+	}
+	return true
+}
 
 type Bucket struct {
 	Name      string
@@ -49,7 +79,9 @@ type Store interface {
 	DeleteBucket(ctx context.Context, name string) error
 
 	// PutObject upserts; overwriting a key is last-writer-wins, as in S3.
-	PutObject(ctx context.Context, o Object) error
+	// A non-nil cond is checked atomically with the write and fails with
+	// ErrPreconditionFailed.
+	PutObject(ctx context.Context, o Object, cond *PutCondition) error
 	GetObject(ctx context.Context, bucket, key string) (*Object, error)
 	// DeleteObject is idempotent: deleting an absent key returns nil.
 	DeleteObject(ctx context.Context, bucket, key string) error

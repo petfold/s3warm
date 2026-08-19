@@ -85,10 +85,10 @@ func newGateway(t *testing.T) string {
 	t.Helper()
 	fakeBee := newFakeBee(t)
 	cfg := &config.Config{
-		BeeAPI:   fakeBee.URL,
-		BatchID:  testBatch,
-		Region:   "us-east-1",
-		Deferred: true,
+		BeeAPI:  fakeBee.URL,
+		BatchID: testBatch,
+		Region:  "us-east-1",
+		Ack:     "node",
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := httptest.NewServer(api.New(cfg, store.NewMemory(), bee.New(fakeBee.URL), nil, logger))
@@ -296,6 +296,33 @@ func TestDeleteObjectsBatch(t *testing.T) {
 		}
 	}
 	do(t, http.MethodDelete, base+"/batch", nil, nil, http.StatusNoContent).Body.Close()
+}
+
+func TestConditionalPut(t *testing.T) {
+	base := newGateway(t)
+	do(t, http.MethodPut, base+"/cond", nil, nil, http.StatusOK).Body.Close()
+
+	// Create-only succeeds, then fails on the existing key.
+	do(t, http.MethodPut, base+"/cond/k", strings.NewReader("v1"),
+		map[string]string{"If-None-Match": "*"}, http.StatusOK).Body.Close()
+	do(t, http.MethodPut, base+"/cond/k", strings.NewReader("v2"),
+		map[string]string{"If-None-Match": "*"}, http.StatusPreconditionFailed).Body.Close()
+
+	// If-Match with the current ETag succeeds; a stale one fails.
+	do(t, http.MethodPut, base+"/cond/k", strings.NewReader("v2"),
+		map[string]string{"If-Match": `"` + md5hex("v1") + `"`}, http.StatusOK).Body.Close()
+	do(t, http.MethodPut, base+"/cond/k", strings.NewReader("v3"),
+		map[string]string{"If-Match": `"` + md5hex("v1") + `"`}, http.StatusPreconditionFailed).Body.Close()
+
+	// Copy-source conditionals.
+	do(t, http.MethodPut, base+"/cond/copy", nil, map[string]string{
+		"x-amz-copy-source":          "/cond/k",
+		"x-amz-copy-source-if-match": `"` + md5hex("v2") + `"`,
+	}, http.StatusOK).Body.Close()
+	do(t, http.MethodPut, base+"/cond/copy2", nil, map[string]string{
+		"x-amz-copy-source":          "/cond/k",
+		"x-amz-copy-source-if-match": `"` + md5hex("stale") + `"`,
+	}, http.StatusPreconditionFailed).Body.Close()
 }
 
 func TestPutRejectsBadBatch(t *testing.T) {

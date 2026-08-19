@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/petfold/s3warm/internal/bee"
+	"github.com/petfold/s3warm/internal/metrics"
 	"github.com/petfold/s3warm/internal/store"
 )
 
@@ -27,6 +28,28 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 	if err != nil {
 		s.writeError(w, r, storeError(err))
 		return
+	}
+
+	// Conditional PUT (design §10): the authoritative check runs atomically
+	// with the index write; this early check just fails fast before bytes move.
+	var cond *store.PutCondition
+	if im, inm := r.Header.Get("If-Match"), r.Header.Get("If-None-Match"); im != "" || inm != "" {
+		cond = &store.PutCondition{IfMatch: trimETag(im), IfNoneMatch: trimETag(inm)}
+		cur, err := s.store.GetObject(ctx, bucket, key)
+		exists := err == nil
+		var curETag string
+		if exists {
+			curETag = cur.ETag
+		}
+		if !exists && cond.IfMatch != "" {
+			// If-Match against a nonexistent key is NoSuchKey, not 412.
+			s.writeError(w, r, errNoSuchKey)
+			return
+		}
+		if !cond.Ok(exists, curETag) {
+			s.writeError(w, r, errPreconditionFailed)
+			return
+		}
 	}
 
 	// Stream the body to Bee while hashing: MD5 for the S3 ETag, SHA-256 to
@@ -63,7 +86,7 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 			BatchID:         batch,
 			Encrypt:         s.cfg.Encrypt,
 			RedundancyLevel: s.redundancyFor(r.Header.Get("x-amz-storage-class")),
-			Deferred:        s.cfg.Deferred,
+			Deferred:        s.cfg.Ack != "network",
 			ContentLength:   r.ContentLength,
 		})
 		if err != nil {
@@ -104,7 +127,9 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 		UserMetadata: userMetadata(r.Header),
 		LastModified: time.Now().UTC(),
 	}
-	if err := s.store.PutObject(ctx, obj); err != nil {
+	// On a precondition race the object is not indexed; the stray stamped
+	// bytes simply expire (design §6).
+	if err := s.store.PutObject(ctx, obj, cond); err != nil {
 		s.writeError(w, r, storeError(err))
 		return
 	}
@@ -117,6 +142,7 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 	s.setBatchHeaders(ctx, w.Header(), batch)
 	w.Header().Set("ETag", `"`+etag+`"`)
 	w.WriteHeader(http.StatusOK)
+	metrics.ObjectBytesIn.Add(float64(body.n))
 }
 
 // setBatchHeaders surfaces batch identity and estimated remaining life
@@ -191,7 +217,8 @@ func (s *Server) handleGetObject(w http.ResponseWriter, r *http.Request, bucket,
 		h.Set("Content-Range", cr)
 	}
 	w.WriteHeader(resp.StatusCode) // 200, or 206 for ranges
-	io.Copy(w, resp.Body)          //nolint:errcheck // client may hang up mid-stream
+	n, _ := io.Copy(w, resp.Body)  // client may hang up mid-stream
+	metrics.ObjectBytesOut.Add(float64(n))
 }
 
 func (s *Server) handleDeleteObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
@@ -269,6 +296,10 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, bucket
 		s.writeError(w, r, storeError(err))
 		return
 	}
+	if !copySourceConditionals(r, srcObj) {
+		s.writeError(w, r, errPreconditionFailed)
+		return
+	}
 
 	directive := strings.ToUpper(r.Header.Get("x-amz-metadata-directive"))
 	if directive == "" {
@@ -292,7 +323,7 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, bucket
 			obj.StorageClass = storageClassOf(sc)
 		}
 	}
-	if err := s.store.PutObject(ctx, obj); err != nil {
+	if err := s.store.PutObject(ctx, obj, nil); err != nil {
 		s.writeError(w, r, storeError(err))
 		return
 	}
@@ -327,6 +358,36 @@ func checkConditionals(r *http.Request, obj *store.Object) (int, bool) {
 		}
 	}
 	return 0, true
+}
+
+// copySourceConditionals evaluates x-amz-copy-source-if-* against the
+// source object; false means 412 PreconditionFailed.
+func copySourceConditionals(r *http.Request, src *store.Object) bool {
+	etag := `"` + src.ETag + `"`
+	modified := src.LastModified.Truncate(time.Second)
+	if v := r.Header.Get("x-amz-copy-source-if-match"); v != "" && !etagMatch(v, etag) {
+		return false
+	}
+	if v := r.Header.Get("x-amz-copy-source-if-none-match"); v != "" && etagMatch(v, etag) {
+		return false
+	}
+	if v := r.Header.Get("x-amz-copy-source-if-modified-since"); v != "" {
+		if t, err := http.ParseTime(v); err == nil && !modified.After(t) {
+			return false
+		}
+	}
+	if v := r.Header.Get("x-amz-copy-source-if-unmodified-since"); v != "" {
+		if t, err := http.ParseTime(v); err == nil && modified.After(t) {
+			return false
+		}
+	}
+	return true
+}
+
+// trimETag normalizes a conditional-header ETag value: quotes stripped,
+// "*" preserved.
+func trimETag(v string) string {
+	return strings.Trim(strings.TrimSpace(v), `"`)
 }
 
 func etagMatch(headerValue, etag string) bool {

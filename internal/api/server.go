@@ -11,12 +11,14 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/petfold/s3warm/internal/auth"
 	"github.com/petfold/s3warm/internal/bee"
 	"github.com/petfold/s3warm/internal/config"
+	"github.com/petfold/s3warm/internal/metrics"
 	"github.com/petfold/s3warm/internal/stamp"
 	"github.com/petfold/s3warm/internal/store"
 )
@@ -59,11 +61,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	sw.Header().Set("x-amz-request-id", newRequestID())
 	start := time.Now()
 	defer func() {
+		elapsed := time.Since(start)
+		metrics.RequestsTotal.WithLabelValues(r.Method, strconv.Itoa(sw.status)).Inc()
+		metrics.RequestDuration.WithLabelValues(r.Method).Observe(elapsed.Seconds())
 		s.log.Info("s3",
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", sw.status,
-			"dur", time.Since(start).Round(time.Millisecond).String())
+			"dur", elapsed.Round(time.Millisecond).String())
 	}()
 
 	// Operational endpoints live under an underscore prefix, which is not a
@@ -80,6 +85,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		sw.WriteHeader(http.StatusOK)
 		io.WriteString(sw, "ready\n") //nolint:errcheck
+		return
+	case "/_s3warm/metrics":
+		metrics.Handler().ServeHTTP(sw, r)
 		return
 	}
 

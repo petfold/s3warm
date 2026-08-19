@@ -43,7 +43,7 @@ Design rationale: [`DESIGN.md`](DESIGN.md).
 | HeadObject | ✅ | |
 | DeleteObject | ✅ | Index removal; bytes expire with the postage batch |
 | DeleteObjects (batch) | ✅ | Quiet mode supported |
-| CopyObject | ✅ | O(1) — same Swarm reference; `x-amz-metadata-directive` COPY/REPLACE; `?versionId` source 🎯 P3 |
+| CopyObject | ✅ | O(1) — same Swarm reference; `x-amz-metadata-directive` COPY/REPLACE; `x-amz-copy-source-if-*` conditionals; `?versionId` source 🎯 P3 |
 | CreateMultipartUpload | 🎯 P2 | |
 | UploadPart | 🎯 P2 | Parts stream straight to `/bytes`, no staging |
 | UploadPartCopy | 🎯 P2 | Whole-object O(1); byte-range re-streams |
@@ -54,7 +54,7 @@ Design rationale: [`DESIGN.md`](DESIGN.md).
 | GetObjectTagging / PutObjectTagging / DeleteObjectTagging | 🎯 P3 | |
 | GetObjectAcl / PutObjectAcl | 🪧 P2 | Canned `private` |
 | RestoreObject / SelectObjectContent / GetObjectTorrent | ❌ | |
-| Conditional PUT (`If-None-Match: *` / `If-Match`) | 🎯 P2 | Trivial via index constraint |
+| Conditional PUT (`If-None-Match` / `If-Match`) | ✅ | Checked atomically with the index write; `If-Match` on a missing key is 404, as on AWS |
 
 ## Authentication
 

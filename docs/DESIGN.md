@@ -188,7 +188,7 @@ S3's contract on a successful PUT is that the object is **durable**, immediately
 | Policy | 200 means | Notes |
 |---|---|---|
 | `ack=network` | Chunks pushed to the network (direct upload) | Strongest; slowest |
-| `ack=node` (default) | In the Bee node's local store (`swarm-deferred-upload: true`); network push follows | The One Zone-IA of Swarm; today's `-deferred` flag |
+| `ack=node` (default) | In the Bee node's local store (`swarm-deferred-upload: true`); network push follows | The One Zone-IA of Swarm; the `-ack` flag |
 | `ack=spool` (opt-in, future) | fsynced to a gateway write-ahead spool; a background uploader drains to Bee | Disk-speed PUTs; `x-swarm-reference` moves to later HEAD/GET responses |
 
 `ack=spool` (a local-first byte path, à la recordstore) is sound only under three rules: the spool is fsynced and replayed on restart, so a crash never loses an acked PUT; postage batch validity/capacity is checked synchronously against cached stamp state *before* the ack, so the only failures left async are availability failures (Bee/network down — retried until drained), never semantic ones S3 would have reported as a 4xx; and GETs are served from the spool until it drains. Whether it earns that complexity is an open question (§21) — the metadata layer, where S3 makes no promises, is already fully local-first (§5).

@@ -25,11 +25,11 @@ Exit: rclone syncs a real tree; s3-tests subset green.
 
 - [x] SQLite index (§5) — cgo-free (modernc.org/sqlite), WAL mode, conformance suite shared with the in-memory store; persistence verified across a gateway restart against a live Bee node
 - [x] Stamp manager v1 (§9): cached batch state, synchronous pre-upload validation (402 `SwarmPostageError` per the §6 ack rule), `x-swarm-postage-batch-id`/`x-swarm-batch-ttl` on PUT/GET/HEAD, background capacity/TTL warnings — Prometheus gauges land with the metrics item
-- [ ] Conditional-request hardening (§10)
-- [ ] Explicit ack-policy surface, `network`/`node` tiers (§6)
+- [x] Conditional-request hardening (§10): conditional PUT (`If-Match`/`If-None-Match`, atomic at the index) and `x-amz-copy-source-if-*`; +6 s3-tests in the manifest (208 total)
+- [x] Explicit ack-policy surface, `network`/`node` tiers (§6): `-ack` flag replaces `-deferred`
 - [x] docker-compose harness (§15) — fakebee (in-memory Bee-API stand-in; Bee ≥2.x removed `dev` mode) + batch-init + gateway
 - [x] s3-tests subset in CI with pass manifest (§15) — 202 Ceph s3-tests green in `test/s3tests/passing.txt`, curated against a live Bee node, run in CI against fakebee; required implementing ListObjectVersions with unversioned (null-version) semantics
-- [ ] Prometheus metrics + structured logging polish (§16)
+- [x] Prometheus metrics (§16): `/_s3warm/metrics` — request rates/latencies, Bee upstream ops, object bytes in/out, stamp TTL + utilization gauges
 
 ## Phase 2 — compatibility
 

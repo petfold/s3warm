@@ -64,7 +64,7 @@ func TestBucketLifecycle(t *testing.T) {
 			t.Fatalf("ListBuckets = %+v, %v", bs, err)
 		}
 
-		if err := s.PutObject(ctx, obj("b1", "k")); err != nil {
+		if err := s.PutObject(ctx, obj("b1", "k"), nil); err != nil {
 			t.Fatal(err)
 		}
 		if err := s.DeleteBucket(ctx, "b1"); !errors.Is(err, ErrBucketNotEmpty) {
@@ -86,7 +86,7 @@ func TestObjectLifecycle(t *testing.T) {
 	forEachStore(t, func(t *testing.T, s Store) {
 		ctx := context.Background()
 
-		if err := s.PutObject(ctx, obj("nope", "k")); !errors.Is(err, ErrBucketNotFound) {
+		if err := s.PutObject(ctx, obj("nope", "k"), nil); !errors.Is(err, ErrBucketNotFound) {
 			t.Fatalf("PutObject(missing bucket) = %v", err)
 		}
 		if err := s.CreateBucket(ctx, Bucket{Name: "b"}); err != nil {
@@ -100,7 +100,7 @@ func TestObjectLifecycle(t *testing.T) {
 		}
 
 		want := obj("b", "k")
-		if err := s.PutObject(ctx, want); err != nil {
+		if err := s.PutObject(ctx, want, nil); err != nil {
 			t.Fatal(err)
 		}
 		got, err := s.GetObject(ctx, "b", "k")
@@ -115,7 +115,7 @@ func TestObjectLifecycle(t *testing.T) {
 
 		// Overwrite is last-writer-wins.
 		want.SwarmRef = "ref-2"
-		if err := s.PutObject(ctx, want); err != nil {
+		if err := s.PutObject(ctx, want, nil); err != nil {
 			t.Fatal(err)
 		}
 		if got, _ := s.GetObject(ctx, "b", "k"); got.SwarmRef != "ref-2" {
@@ -135,6 +135,37 @@ func TestObjectLifecycle(t *testing.T) {
 	})
 }
 
+func TestPutObjectConditional(t *testing.T) {
+	forEachStore(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		if err := s.CreateBucket(ctx, Bucket{Name: "b"}); err != nil {
+			t.Fatal(err)
+		}
+
+		// If-None-Match "*": create-only.
+		if err := s.PutObject(ctx, obj("b", "k"), &PutCondition{IfNoneMatch: "*"}); err != nil {
+			t.Fatalf("create-only on absent key: %v", err)
+		}
+		if err := s.PutObject(ctx, obj("b", "k"), &PutCondition{IfNoneMatch: "*"}); !errors.Is(err, ErrPreconditionFailed) {
+			t.Fatalf("create-only on existing key = %v, want ErrPreconditionFailed", err)
+		}
+
+		// If-Match: overwrite only the expected state.
+		if err := s.PutObject(ctx, obj("b", "k"), &PutCondition{IfMatch: "etag-k"}); err != nil {
+			t.Fatalf("if-match with current etag: %v", err)
+		}
+		if err := s.PutObject(ctx, obj("b", "k"), &PutCondition{IfMatch: "stale-etag"}); !errors.Is(err, ErrPreconditionFailed) {
+			t.Fatalf("if-match with stale etag = %v, want ErrPreconditionFailed", err)
+		}
+		if err := s.PutObject(ctx, obj("b", "k"), &PutCondition{IfMatch: "*"}); err != nil {
+			t.Fatalf("if-match any-existing: %v", err)
+		}
+		if err := s.PutObject(ctx, obj("b", "absent"), &PutCondition{IfMatch: "*"}); !errors.Is(err, ErrPreconditionFailed) {
+			t.Fatalf("if-match on absent key = %v, want ErrPreconditionFailed", err)
+		}
+	})
+}
+
 func TestListObjects(t *testing.T) {
 	forEachStore(t, func(t *testing.T, s Store) {
 		ctx := context.Background()
@@ -142,7 +173,7 @@ func TestListObjects(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, k := range []string{"a/1", "a/2", "ab", "b", "c/1"} {
-			if err := s.PutObject(ctx, obj("b", k)); err != nil {
+			if err := s.PutObject(ctx, obj("b", k), nil); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -197,7 +228,7 @@ func TestSQLitePersistsAcrossReopen(t *testing.T) {
 	if err := s.CreateBucket(ctx, Bucket{Name: "b", BatchID: "batch"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.PutObject(ctx, obj("b", "k")); err != nil {
+	if err := s.PutObject(ctx, obj("b", "k"), nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {

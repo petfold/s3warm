@@ -142,8 +142,10 @@ s3tests/functional/test_s3.py::test_copy_enc[unencrypted-unencrypted-STANDARD-ST
 s3tests/functional/test_s3.py::test_copy_enc[unencrypted-unencrypted-STANDARD-STANDARD-1024]
 s3tests/functional/test_s3.py::test_copy_enc[unencrypted-unencrypted-STANDARD-STANDARD-1048576]
 s3tests/functional/test_s3.py::test_copy_enc[unencrypted-unencrypted-STANDARD-STANDARD-8388608]
+s3tests/functional/test_s3.py::test_copy_object_ifmatch_failed
 s3tests/functional/test_s3.py::test_copy_object_ifmatch_good
 s3tests/functional/test_s3.py::test_copy_object_ifnonematch_failed
+s3tests/functional/test_s3.py::test_copy_object_ifnonematch_good
 s3tests/functional/test_s3.py::test_encrypted_transfer_13b
 s3tests/functional/test_s3.py::test_encrypted_transfer_1b
 s3tests/functional/test_s3.py::test_encrypted_transfer_1kb
@@ -189,10 +191,14 @@ s3tests/functional/test_s3.py::test_post_object_invalid_access_key
 s3tests/functional/test_s3.py::test_post_object_invalid_request_field_value
 s3tests/functional/test_s3.py::test_post_object_invalid_signature
 s3tests/functional/test_s3.py::test_post_object_wrong_bucket
+s3tests/functional/test_s3.py::test_put_object_ifmatch_failed
 s3tests/functional/test_s3.py::test_put_object_ifmatch_good
+s3tests/functional/test_s3.py::test_put_object_ifmatch_nonexisted_failed
 s3tests/functional/test_s3.py::test_put_object_ifmatch_overwrite_existed_good
+s3tests/functional/test_s3.py::test_put_object_ifnonmatch_failed
 s3tests/functional/test_s3.py::test_put_object_ifnonmatch_good
 s3tests/functional/test_s3.py::test_put_object_ifnonmatch_nonexisted_good
+s3tests/functional/test_s3.py::test_put_object_ifnonmatch_overwrite_existed_failed
 s3tests/functional/test_s3.py::test_ranged_big_request_response_code
 s3tests/functional/test_s3.py::test_ranged_request_invalid_range
 s3tests/functional/test_s3.py::test_ranged_request_response_code

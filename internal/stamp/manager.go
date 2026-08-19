@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/petfold/s3warm/internal/bee"
+	"github.com/petfold/s3warm/internal/metrics"
 )
 
 const (
@@ -177,5 +178,7 @@ func (m *Manager) fetch(ctx context.Context, batchID string) (*Info, error) {
 	m.mu.Lock()
 	m.cache[batchID] = info
 	m.mu.Unlock()
+	metrics.StampTTLSeconds.WithLabelValues(batchID).Set(info.TTLRemaining().Seconds())
+	metrics.StampUtilizationRatio.WithLabelValues(batchID).Set(info.Ratio())
 	return info, nil
 }

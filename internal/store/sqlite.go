@@ -145,25 +145,46 @@ func (s *SQLite) DeleteBucket(ctx context.Context, name string) error {
 	return tx.Commit()
 }
 
-func (s *SQLite) PutObject(ctx context.Context, o Object) error {
+func (s *SQLite) PutObject(ctx context.Context, o Object, cond *PutCondition) error {
 	meta, err := json.Marshal(o.UserMetadata)
 	if err != nil {
 		return err
 	}
-	res, err := s.db.ExecContext(ctx,
-		`INSERT OR REPLACE INTO objects
-		 (bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified)
-		 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-		 WHERE EXISTS (SELECT 1 FROM buckets WHERE name = ?1)`,
-		o.Bucket, o.Key, o.SwarmRef, o.BatchID, o.Size, o.ETag, o.ContentType,
-		o.StorageClass, string(meta), o.LastModified.UTC().Format(timeLayout))
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	if n, err := res.RowsAffected(); err == nil && n == 0 {
+	defer tx.Rollback() //nolint:errcheck // no-op after commit
+
+	var one int
+	err = tx.QueryRowContext(ctx, `SELECT 1 FROM buckets WHERE name = ?`, o.Bucket).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
 		return ErrBucketNotFound
 	}
-	return nil
+	if err != nil {
+		return err
+	}
+	if cond != nil {
+		var etag string
+		err := tx.QueryRowContext(ctx,
+			`SELECT etag FROM objects WHERE bucket = ? AND key = ?`, o.Bucket, o.Key).Scan(&etag)
+		exists := err == nil
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if !cond.Ok(exists, etag) {
+			return ErrPreconditionFailed
+		}
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT OR REPLACE INTO objects
+		 (bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		o.Bucket, o.Key, o.SwarmRef, o.BatchID, o.Size, o.ETag, o.ContentType,
+		o.StorageClass, string(meta), o.LastModified.UTC().Format(timeLayout)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 const objectColumns = `bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified`

@@ -72,12 +72,16 @@ func (m *Memory) DeleteBucket(_ context.Context, name string) error {
 	return nil
 }
 
-func (m *Memory) PutObject(_ context.Context, o Object) error {
+func (m *Memory) PutObject(_ context.Context, o Object, cond *PutCondition) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	b, ok := m.buckets[o.Bucket]
 	if !ok {
 		return ErrBucketNotFound
+	}
+	cur, exists := b.objects[o.Key]
+	if !cond.Ok(exists, cur.ETag) {
+		return ErrPreconditionFailed
 	}
 	b.objects[o.Key] = o
 	return nil

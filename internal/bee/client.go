@@ -10,7 +10,23 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/petfold/s3warm/internal/metrics"
 )
+
+// do executes a request with per-operation metrics (code 0 = transport error).
+func (c *Client) do(op string, req *http.Request) (*http.Response, error) {
+	start := time.Now()
+	resp, err := c.hc.Do(req)
+	code := 0
+	if resp != nil {
+		code = resp.StatusCode
+	}
+	metrics.BeeRequestsTotal.WithLabelValues(op, strconv.Itoa(code)).Inc()
+	metrics.BeeRequestDuration.WithLabelValues(op).Observe(time.Since(start).Seconds())
+	return resp, err
+}
 
 type Client struct {
 	base string
@@ -66,7 +82,7 @@ func (c *Client) UploadBytes(ctx context.Context, body io.Reader, opts UploadOpt
 		req.Header.Set("swarm-redundancy-level", strconv.Itoa(opts.RedundancyLevel))
 	}
 
-	resp, err := c.hc.Do(req)
+	resp, err := c.do("bytes_upload", req)
 	if err != nil {
 		return "", err
 	}
@@ -96,7 +112,7 @@ func (c *Client) DownloadBytes(ctx context.Context, ref, rangeHeader string) (*h
 	if rangeHeader != "" {
 		req.Header.Set("Range", rangeHeader)
 	}
-	resp, err := c.hc.Do(req)
+	resp, err := c.do("bytes_download", req)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +144,7 @@ func (c *Client) Stamp(ctx context.Context, batchID string) (*Stamp, error) {
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.hc.Do(req)
+	resp, err := c.do("stamp", req)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +164,7 @@ func (c *Client) Health(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	resp, err := c.hc.Do(req)
+	resp, err := c.do("health", req)
 	if err != nil {
 		return err
 	}

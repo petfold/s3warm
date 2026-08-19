@@ -31,9 +31,12 @@ type Config struct {
 	RedundancyLevel int
 	// Encrypt uploads on Swarm (maps to SSE; the 64-byte reference stays private).
 	Encrypt bool
-	// Deferred selects deferred (asynchronous) upload to the network:
-	// lower PUT latency, durability follows.
-	Deferred bool
+	// Ack is the PUT ack policy (design §6): what a 200 means.
+	//   "node"    — object is in the Bee node's local store, network push
+	//               follows asynchronously (default)
+	//   "network" — chunks pushed to the network before the ack (direct
+	//               upload): strongest, slowest
+	Ack string
 	// Domain enables virtual-host-style addressing (bucket.<Domain>) when set.
 	Domain string
 	// DB is the SQLite metadata index path. Empty selects the in-memory
@@ -52,7 +55,7 @@ func Load(args []string) (*Config, error) {
 		SecretKey:       envStr("S3WARM_SECRET_KEY", ""),
 		RedundancyLevel: envInt("S3WARM_REDUNDANCY", 0),
 		Encrypt:         envBool("S3WARM_ENCRYPT", false),
-		Deferred:        envBool("S3WARM_DEFERRED", true),
+		Ack:             envStr("S3WARM_ACK", "node"),
 		Domain:          envStr("S3WARM_DOMAIN", ""),
 		DB:              envStr("S3WARM_DB", "s3warm.db"),
 	}
@@ -67,7 +70,7 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar(&cfg.SecretKey, "secret-key", cfg.SecretKey, "secret access key")
 	fs.IntVar(&cfg.RedundancyLevel, "redundancy", cfg.RedundancyLevel, "default erasure-coding redundancy level (0-4)")
 	fs.BoolVar(&cfg.Encrypt, "encrypt", cfg.Encrypt, "encrypt uploads on Swarm")
-	fs.BoolVar(&cfg.Deferred, "deferred", cfg.Deferred, "use deferred (asynchronous) uploads to the network")
+	fs.StringVar(&cfg.Ack, "ack", cfg.Ack, "PUT ack policy: node (Bee local store, default) or network (pushed before ack)")
 	fs.StringVar(&cfg.Domain, "domain", cfg.Domain, "base domain for virtual-host-style bucket addressing")
 	fs.StringVar(&cfg.DB, "db", cfg.DB, "SQLite metadata index path (empty = in-memory, dev only)")
 	if err := fs.Parse(args); err != nil {
@@ -80,6 +83,9 @@ func Load(args []string) (*Config, error) {
 			return nil, fmt.Errorf("reading batch-id-file: %w", err)
 		}
 		cfg.BatchID = strings.TrimSpace(string(b))
+	}
+	if cfg.Ack != "node" && cfg.Ack != "network" {
+		return nil, fmt.Errorf("ack policy must be node or network, got %q", cfg.Ack)
 	}
 	if cfg.RedundancyLevel < 0 || cfg.RedundancyLevel > 4 {
 		return nil, fmt.Errorf("redundancy level must be between 0 and 4, got %d", cfg.RedundancyLevel)
