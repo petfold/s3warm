@@ -90,15 +90,29 @@ If you don't have a node yet, two good paths:
   [Bee quick-start](https://docs.ethswarm.org/docs/bee/installation/quick-start/)
   — a one-line installer plus a short config walkthrough.
 
-**Fund it before it can store anything.** A fresh node has a Gnosis Chain
-wallet; send it a small amount of **xDAI** (for transaction gas) and
-**xBZZ** (Swarm's token, for storage and bandwidth) — one transfer of each,
-to the wallet address the node prints on first start (also at
-`curl localhost:1633/addresses`). That single funding step covers
-everything downstream: on its next start the node automatically deploys and
-funds its *chequebook* (the payment contract it settles bandwidth with)
-from that wallet, and the same wallet pays for the postage batch below.
-The quick-start guide walks through where to get xDAI/xBZZ.
+**Fund it before it can store anything.** A fresh node has its own wallet
+on [Gnosis Chain](https://www.gnosis.io/) (an Ethereum sidechain — that's
+where Swarm's payments happen, because fees there cost fractions of a
+cent). It needs two things in that wallet:
+
+- **xDAI** — DAI is a USD-pegged stablecoin; xDAI is its Gnosis Chain
+  form, used there as the native coin that pays transaction gas. A few
+  dollars' worth is plenty.
+- **xBZZ** — BZZ is the Swarm network's own token (issued on Ethereum);
+  xBZZ is the same token bridged to Gnosis Chain. It's what actually buys
+  storage (postage batches) and settles bandwidth.
+
+The easiest way to get both: the official
+[Swarm funding tool](https://fund.ethswarm.org/) takes ETH, DAI, or most
+any Ethereum-side coin or token and delivers xDAI + xBZZ straight to your
+node's wallet in one go. (Manual route: acquire them on an exchange or
+bridge and send them yourself.)
+
+One transfer of each, to the wallet address the node prints on first start
+(also at `curl localhost:1633/addresses`), and the money part is done: on
+its next start the node automatically deploys and funds its *chequebook*
+(the payment contract it settles bandwidth with) from that wallet, and the
+same wallet pays for the postage batch below.
 
 ### Buying a postage batch
 
