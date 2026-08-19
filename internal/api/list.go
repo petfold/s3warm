@@ -7,8 +7,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Solar-Punk-Ltd/s3warm/internal/auth"
-	"github.com/Solar-Punk-Ltd/s3warm/internal/store"
+	"github.com/petfold/s3warm/internal/auth"
+	"github.com/petfold/s3warm/internal/store"
 )
 
 // scanPage is the index page size used while assembling one list response.

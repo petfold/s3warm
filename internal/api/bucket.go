@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Solar-Punk-Ltd/s3warm/internal/store"
+	"github.com/petfold/s3warm/internal/store"
 )
 
 var bucketNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`)

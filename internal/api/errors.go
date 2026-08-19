@@ -6,9 +6,9 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/Solar-Punk-Ltd/s3warm/internal/auth"
-	"github.com/Solar-Punk-Ltd/s3warm/internal/bee"
-	"github.com/Solar-Punk-Ltd/s3warm/internal/store"
+	"github.com/petfold/s3warm/internal/auth"
+	"github.com/petfold/s3warm/internal/bee"
+	"github.com/petfold/s3warm/internal/store"
 )
 
 // apiError is an S3 error: a code string, an HTTP status and a default

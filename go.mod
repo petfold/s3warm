@@ -1,3 +1,3 @@
-module github.com/Solar-Punk-Ltd/s3warm
+module github.com/petfold/s3warm
 
 go 1.22

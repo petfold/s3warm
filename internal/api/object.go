@@ -16,8 +16,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Solar-Punk-Ltd/s3warm/internal/bee"
-	"github.com/Solar-Punk-Ltd/s3warm/internal/store"
+	"github.com/petfold/s3warm/internal/bee"
+	"github.com/petfold/s3warm/internal/store"
 )
 
 func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket, key string) {

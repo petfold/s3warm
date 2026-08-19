@@ -17,10 +17,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Solar-Punk-Ltd/s3warm/internal/api"
-	"github.com/Solar-Punk-Ltd/s3warm/internal/bee"
-	"github.com/Solar-Punk-Ltd/s3warm/internal/config"
-	"github.com/Solar-Punk-Ltd/s3warm/internal/store"
+	"github.com/petfold/s3warm/internal/api"
+	"github.com/petfold/s3warm/internal/bee"
+	"github.com/petfold/s3warm/internal/config"
+	"github.com/petfold/s3warm/internal/store"
 )
 
 // newFakeBee is an in-memory stand-in for a Bee node: POST /bytes stores a
