@@ -80,7 +80,8 @@ docs/              design document + compatibility matrix
 
 ## Documents
 
-- [Design](docs/DESIGN.md) — architecture, S3↔Swarm concept mapping, multipart strategy, postage stamp management, consistency model, roadmap.
+- [Design](docs/DESIGN.md) — architecture, S3↔Swarm concept mapping, multipart strategy, postage stamp management, consistency model, roadmap rationale.
+- [Roadmap](ROADMAP.md) — phase-by-phase progress with tickmarks.
 - [API compatibility matrix](docs/API-COMPATIBILITY.md) — per-operation status.
 
 ## License

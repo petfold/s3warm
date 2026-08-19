@@ -360,6 +360,8 @@ Full per-operation matrix: [`docs/API-COMPATIBILITY.md`](API-COMPATIBILITY.md). 
 
 ## 19. Roadmap
 
+Rationale and exit criteria only; current progress is tracked with checkboxes in [`ROADMAP.md`](../ROADMAP.md).
+
 | Phase | Contents | Exit criterion |
 |---|---|---|
 | **0 — skeleton** (this repo) | Design; compiling gateway: routing, SigV4, errors, in-memory index, Bee client, MVP object/bucket ops | `aws s3 cp/ls/rm` round-trips against `bee dev` |
