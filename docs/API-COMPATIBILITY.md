@@ -23,7 +23,7 @@ Design rationale: [`DESIGN.md`](DESIGN.md).
 | ListObjects (V1) | ✅ | marker/NextMarker semantics |
 | Get/PutBucketVersioning | ✅ | Enabled/Suspended; never-versioned buckets return the empty config |
 | ListObjectVersions | ✅ | Real version history: `Version` + `DeleteMarker` entries, newest-first per key, key/version-id-marker pagination, delimiter roll-up |
-| GetBucketAcl / PutBucketAcl | 🎯 P3 | Grants map to the bucket's ACT grantee list (grantee = Ethereum public key, design §8); canned `private` until then |
+| GetBucketAcl / PutBucketAcl | 🪧 | Canned `private`. The real sharing mechanism is Swarm-native: per-bucket **ACT grants** (`GET/PUT ?x-swarm-grants`, grantee = secp256k1 public key) — enforceable by Swarm itself, off-gateway (design §8, REFERENCE) |
 | GetBucketPolicy / PutBucketPolicy | 🎯 P3 | Grant-subset only, not full IAM policy language |
 | Get/Put/DeleteBucketCors | ✅ | Per-bucket rules with S3 wildcard-origin matching; preflights and response decoration handled before auth |
 | Get/Put/DeleteBucketEncryption | ✅ | SSE-S3 (AES256) default-encryption config; KMS rejected |
@@ -69,6 +69,7 @@ Design rationale: [`DESIGN.md`](DESIGN.md).
 | Flexible checksums (`x-amz-checksum-*`) | ✅ | CRC32/CRC32C/CRC64NVME/SHA-1/SHA-256 via header or trailer; stored, echoed on PUT and on GET/HEAD with checksum mode (full responses only); multipart composite/FULL_OBJECT checksums 🎯 |
 | SigV2 | ❌ | Legacy |
 | Anonymous mode | ✅ | Explicit opt-in, dev only |
+| Multiple credentials / tenancy | ✅ | `-credentials` JSON file; tenant-scoped keys only see their tenant's buckets (403 elsewhere, scoped ListBuckets); root keys unrestricted (design §8) |
 
 ## Semantics extensions (`x-swarm-*`)
 

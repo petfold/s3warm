@@ -30,6 +30,18 @@ func main() {
 
 	var mu sync.RWMutex
 	blobs := map[string][]byte{}
+	// ACT emulation: refs uploaded with swarm-act require the matching
+	// history + the publisher key on download; grantee lists are stored by
+	// reference and each mutation mints a new history (like Bee).
+	const publisherKey = "02fa4ebeefa4ebeefa4ebeefa4ebeefa4ebeefa4ebeefa4ebeefa4ebeefa4eb"
+	actRefs := map[string]string{}    // act-protected ref → history at upload
+	histories := map[string]bool{}    // known histories
+	grantees := map[string][]string{} // grantee-list ref → pubkeys
+	newHex := func(n int) string {
+		b := make([]byte, n)
+		rand.Read(b[:]) //nolint:errcheck
+		return hex.EncodeToString(b)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /bytes", func(w http.ResponseWriter, r *http.Request) {
@@ -50,6 +62,23 @@ func main() {
 			ref += hex.EncodeToString(sum[:])
 		}
 		mu.Lock()
+		if r.Header.Get("swarm-act") == "true" {
+			history := r.Header.Get("swarm-act-history-address")
+			if history == "" {
+				history = newHex(32)
+			} else if !histories[history] {
+				mu.Unlock()
+				w.WriteHeader(http.StatusBadRequest)
+				io.WriteString(w, `{"code":400,"message":"unknown act history"}`) //nolint:errcheck
+				return
+			}
+			histories[history] = true
+			// ACT references are encrypted references (64 bytes) distinct
+			// from the plain content address.
+			ref = newHex(64)
+			actRefs[ref] = history
+			w.Header().Set("Swarm-Act-History-Address", history)
+		}
 		blobs[ref] = data
 		mu.Unlock()
 		w.WriteHeader(http.StatusCreated)
@@ -58,13 +87,100 @@ func main() {
 	mux.HandleFunc("GET /bytes/{ref}", func(w http.ResponseWriter, r *http.Request) {
 		mu.RLock()
 		data, ok := blobs[r.PathValue("ref")]
+		actHistory, isAct := actRefs[r.PathValue("ref")]
 		mu.RUnlock()
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			io.WriteString(w, `{"code":404,"message":"not found"}`) //nolint:errcheck
 			return
 		}
+		if isAct {
+			_ = actHistory // any known history may unlock it after patches
+			if r.Header.Get("swarm-act-history-address") == "" ||
+				r.Header.Get("swarm-act-publisher") != publisherKey {
+				w.WriteHeader(http.StatusNotFound)
+				io.WriteString(w, `{"code":404,"message":"act credentials required"}`) //nolint:errcheck
+				return
+			}
+		}
 		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(data))
+	})
+	mux.HandleFunc("GET /addresses", func(w http.ResponseWriter, _ *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+			"overlay": "fa4ebee0", "publicKey": publisherKey,
+		})
+	})
+	mux.HandleFunc("POST /grantee", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("swarm-postage-batch-id") == "" {
+			w.WriteHeader(http.StatusPaymentRequired)
+			io.WriteString(w, `{"code":402,"message":"batch not found"}`) //nolint:errcheck
+			return
+		}
+		var req struct {
+			Grantees []string `json:"grantees"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Grantees) == 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		ref, history := newHex(64), newHex(32)
+		grantees[ref] = req.Grantees
+		histories[history] = true
+		mu.Unlock()
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]string{"ref": ref, "historyref": history}) //nolint:errcheck
+	})
+	mux.HandleFunc("GET /grantee/{ref}", func(w http.ResponseWriter, r *http.Request) {
+		mu.RLock()
+		list, ok := grantees[r.PathValue("ref")]
+		mu.RUnlock()
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		json.NewEncoder(w).Encode(list) //nolint:errcheck
+	})
+	mux.HandleFunc("PATCH /grantee/{ref}", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("swarm-act-history-address") == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var req struct {
+			Add    []string `json:"add"`
+			Revoke []string `json:"revoke"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		old, ok := grantees[r.PathValue("ref")]
+		if !ok {
+			mu.Unlock()
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		revoked := map[string]bool{}
+		for _, k := range req.Revoke {
+			revoked[k] = true
+		}
+		var next []string
+		for _, k := range old {
+			if !revoked[k] {
+				next = append(next, k)
+			}
+		}
+		for _, k := range req.Add {
+			if !revoked[k] {
+				next = append(next, k)
+			}
+		}
+		ref, history := newHex(64), newHex(32)
+		grantees[ref] = next
+		histories[history] = true
+		mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]string{"ref": ref, "historyref": history}) //nolint:errcheck
 	})
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

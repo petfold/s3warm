@@ -22,7 +22,7 @@ const (
 
 func newTestVerifier() *Verifier {
 	return &Verifier{
-		Creds: StaticCredentials{testAccessKey: testSecretKey},
+		Creds: StaticCredentials{testAccessKey: {Secret: testSecretKey}},
 		Now:   func() time.Time { return time.Date(2013, 5, 24, 0, 0, 0, 0, time.UTC) },
 	}
 }

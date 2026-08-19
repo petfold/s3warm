@@ -69,7 +69,7 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 		return
 	}
 
-	res, apiErr := s.uploadBody(r, batch, r.Header.Get("x-amz-storage-class"), encrypt)
+	res, apiErr := s.uploadBody(r, b, batch, r.Header.Get("x-amz-storage-class"), encrypt)
 	if apiErr != nil {
 		s.writeError(w, r, *apiErr)
 		return
@@ -178,7 +178,7 @@ type uploadResult struct {
 // chunks and trailers) on the way. Zero-byte bodies are not uploaded. On
 // error nothing is indexed by the caller; stray stamped bytes expire with
 // their batch (design §6).
-func (s *Server) uploadBody(r *http.Request, batch, storageClass string, encrypt bool) (*uploadResult, *apiError) {
+func (s *Server) uploadBody(r *http.Request, b *store.Bucket, batch, storageClass string, encrypt bool) (*uploadResult, *apiError) {
 	md5h := md5.New()
 	writers := []io.Writer{md5h}
 	rawSHA := r.Header.Get("X-Amz-Content-Sha256")
@@ -233,22 +233,36 @@ func (s *Server) uploadBody(r *http.Request, batch, storageClass string, encrypt
 		return &e
 	}
 
+	act := b != nil && b.ACT
 	var ref string
 	if length != 0 {
-		var err error
-		ref, err = s.bee.UploadBytes(r.Context(), counted, bee.UploadOptions{
+		opts := bee.UploadOptions{
 			BatchID:         batch,
 			Encrypt:         encrypt,
 			RedundancyLevel: s.redundancyFor(storageClass),
 			Deferred:        s.cfg.Ack != "network",
 			ContentLength:   length,
-		})
+		}
+		if act {
+			opts.Act = true
+			opts.ActHistory = b.ActHistory
+		}
+		var history string
+		var err error
+		ref, history, err = s.bee.UploadBytes(r.Context(), counted, opts)
 		if err != nil {
 			if e := chunkedErr(); e != nil {
 				return nil, e
 			}
 			e := beeError(err)
 			return nil, &e
+		}
+		if act && history != "" && history != b.ActHistory {
+			// The history normally stays fixed (created at bucket creation);
+			// track it anyway in case the node started a fresh one.
+			if serr := s.store.SetBucketACT(r.Context(), b.Name, history, b.ActGrantees); serr == nil {
+				b.ActHistory = history
+			}
 		}
 	} else if chunked != nil {
 		// Zero-byte chunked body: still drain the framing so signatures and
@@ -297,16 +311,22 @@ func (s *Server) uploadBody(r *http.Request, batch, storageClass string, encrypt
 // downloadOptions builds read options: erasure-coding fetch strategy from
 // the per-request x-swarm-redundancy-strategy override or the configured
 // default (design §17).
-func (s *Server) downloadOptions(r *http.Request, rangeSpec string) bee.DownloadOptions {
+func (s *Server) downloadOptions(r *http.Request, rangeSpec string, b *store.Bucket) bee.DownloadOptions {
 	strategy := r.Header.Get("x-swarm-redundancy-strategy")
 	if strategy == "" {
 		strategy = s.cfg.FetchStrategy
 	}
-	return bee.DownloadOptions{
+	o := bee.DownloadOptions{
 		Range:        rangeSpec,
 		Strategy:     strategy,
 		FallbackMode: r.Header.Get("x-swarm-redundancy-fallback-mode"),
 	}
+	if b != nil && b.ACT {
+		// The gateway reads its own ACT content as publisher (design §8).
+		o.ActHistory = b.ActHistory
+		o.ActPublisher, _ = s.publisherKey(r)
+	}
+	return o
 }
 
 // storedContentEncoding strips the aws-chunked transport token from a
@@ -347,13 +367,13 @@ func (s *Server) setBatchHeaders(ctx context.Context, h http.Header, batch strin
 // handleGetObject serves GetObject (withBody) and HeadObject.
 func (s *Server) handleGetObject(w http.ResponseWriter, r *http.Request, bucket, key string, withBody bool) {
 	ctx := r.Context()
-	if _, err := s.store.GetBucket(ctx, bucket); err != nil {
+	b, err := s.store.GetBucket(ctx, bucket)
+	if err != nil {
 		s.writeError(w, r, storeError(err))
 		return
 	}
 	h := w.Header()
 	var obj *store.Object
-	var err error
 	if vid := r.URL.Query().Get("versionId"); vid != "" {
 		obj, err = s.store.GetObjectVersion(ctx, bucket, key, vid)
 		if err != nil {
@@ -437,7 +457,16 @@ func (s *Server) handleGetObject(w http.ResponseWriter, r *http.Request, bucket,
 		h["x-amz-meta-"+k] = []string{v}
 	}
 	if obj.SwarmRef != "" && !obj.Encrypted {
+		// ACT references are safe to expose: possession grants nothing —
+		// decryption needs a granted key plus the publisher/history pair
+		// surfaced below (design §8).
 		h.Set("x-swarm-reference", obj.SwarmRef)
+	}
+	if b.ACT {
+		h.Set("x-swarm-act-history", b.ActHistory)
+		if pub, perr := s.publisherKey(r); perr == nil {
+			h.Set("x-swarm-act-publisher", pub)
+		}
 	}
 	if obj.Encrypted {
 		h.Set("x-amz-server-side-encryption", "AES256")
@@ -463,7 +492,7 @@ func (s *Server) handleGetObject(w http.ResponseWriter, r *http.Request, bucket,
 	}
 
 	if withBody && len(obj.Parts) > 0 {
-		s.serveComposite(w, r, obj)
+		s.serveComposite(w, r, obj, b)
 		return
 	}
 	if !withBody || obj.SwarmRef == "" {
@@ -472,7 +501,7 @@ func (s *Server) handleGetObject(w http.ResponseWriter, r *http.Request, bucket,
 		return
 	}
 
-	resp, err := s.bee.DownloadBytes(ctx, obj.SwarmRef, s.downloadOptions(r, r.Header.Get("Range")))
+	resp, err := s.bee.DownloadBytes(ctx, obj.SwarmRef, s.downloadOptions(r, r.Header.Get("Range"), b))
 	if err != nil {
 		s.writeError(w, r, beeError(err))
 		return
@@ -599,8 +628,12 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, bucket
 		s.writeError(w, r, storeError(err))
 		return
 	}
-	srcObj, apiErr := s.getCopySource(r)
+	srcObj, srcB, apiErr := s.getCopySource(r)
 	if apiErr != nil {
+		s.writeError(w, r, *apiErr)
+		return
+	}
+	if apiErr := actCopyBoundary(srcB, b); apiErr != nil {
 		s.writeError(w, r, *apiErr)
 		return
 	}
@@ -802,7 +835,7 @@ func (s *Server) handleGetObjectAttributes(w http.ResponseWriter, r *http.Reques
 // requested byte range onto the ordered part list and issuing consecutive
 // sub-range reads against Bee — the join happens here, fully streaming
 // (design §7).
-func (s *Server) serveComposite(w http.ResponseWriter, r *http.Request, obj *store.Object) {
+func (s *Server) serveComposite(w http.ResponseWriter, r *http.Request, obj *store.Object, b *store.Bucket) {
 	ctx := r.Context()
 	h := w.Header()
 
@@ -836,7 +869,7 @@ func (s *Server) serveComposite(w http.ResponseWriter, r *http.Request, obj *sto
 		}
 		lo := max(start-partStart, 0)
 		hi := min(p.Size-1, lo+remaining-1)
-		resp, err := s.bee.DownloadBytes(ctx, p.SwarmRef, s.downloadOptions(r, fmt.Sprintf("bytes=%d-%d", lo, hi)))
+		resp, err := s.bee.DownloadBytes(ctx, p.SwarmRef, s.downloadOptions(r, fmt.Sprintf("bytes=%d-%d", lo, hi), b))
 		if err != nil {
 			// Headers are already written; the truncated body is all we can
 			// signal with. Log loudly.

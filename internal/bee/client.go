@@ -60,13 +60,21 @@ type UploadOptions struct {
 	Deferred        bool
 	// ContentLength of the body when known, -1 otherwise (chunked upload).
 	ContentLength int64
+	// Act uploads under Swarm's Access Control Trie (design §8): the node's
+	// key is the publisher, only granted keys can decrypt. ActHistory is the
+	// existing ACT history address to extend; empty starts a new history
+	// (returned by UploadBytes).
+	Act        bool
+	ActHistory string
 }
 
 // UploadBytes streams body to POST /bytes and returns the Swarm reference.
-func (c *Client) UploadBytes(ctx context.Context, body io.Reader, opts UploadOptions) (string, error) {
+// For ACT uploads it also returns the (possibly newly created) ACT history
+// address; otherwise history is "".
+func (c *Client) UploadBytes(ctx context.Context, body io.Reader, opts UploadOptions) (ref, history string, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/bytes", body)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if opts.ContentLength >= 0 {
 		req.ContentLength = opts.ContentLength
@@ -82,25 +90,31 @@ func (c *Client) UploadBytes(ctx context.Context, body io.Reader, opts UploadOpt
 	if opts.RedundancyLevel > 0 {
 		req.Header.Set("swarm-redundancy-level", strconv.Itoa(opts.RedundancyLevel))
 	}
+	if opts.Act {
+		req.Header.Set("swarm-act", "true")
+		if opts.ActHistory != "" {
+			req.Header.Set("swarm-act-history-address", opts.ActHistory)
+		}
+	}
 
 	resp, err := c.do("bytes_upload", req)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		return "", newStatusError(resp)
+		return "", "", newStatusError(resp)
 	}
 	var out struct {
 		Reference string `json:"reference"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", fmt.Errorf("bee: decoding upload response: %w", err)
+		return "", "", fmt.Errorf("bee: decoding upload response: %w", err)
 	}
 	if out.Reference == "" {
-		return "", fmt.Errorf("bee: upload response contained no reference")
+		return "", "", fmt.Errorf("bee: upload response contained no reference")
 	}
-	return out.Reference, nil
+	return out.Reference, resp.Header.Get("swarm-act-history-address"), nil
 }
 
 // DownloadOptions tune a read: an optional Range and the erasure-coding
@@ -109,6 +123,13 @@ type DownloadOptions struct {
 	Range        string
 	Strategy     string // swarm-redundancy-strategy (0-4); empty = node default
 	FallbackMode string // swarm-redundancy-fallback-mode (true/false)
+	// ACT credentials for reading access-controlled content (design §8):
+	// the publisher's compressed public key and the ACT history address.
+	// ActTimestamp is the unix time the grant lookup is evaluated at
+	// (0 = now).
+	ActPublisher string
+	ActHistory   string
+	ActTimestamp int64
 }
 
 // DownloadBytes issues GET /bytes/{ref}. The caller owns resp.Body.
@@ -126,6 +147,13 @@ func (c *Client) DownloadBytes(ctx context.Context, ref string, o DownloadOption
 	}
 	if o.FallbackMode != "" {
 		req.Header.Set("swarm-redundancy-fallback-mode", o.FallbackMode)
+	}
+	if o.ActHistory != "" {
+		req.Header.Set("swarm-act-history-address", o.ActHistory)
+		req.Header.Set("swarm-act-publisher", o.ActPublisher)
+		if o.ActTimestamp > 0 {
+			req.Header.Set("swarm-act-timestamp", strconv.FormatInt(o.ActTimestamp, 10))
+		}
 	}
 	resp, err := c.do("bytes_download", req)
 	if err != nil {
@@ -253,6 +281,137 @@ func (c *Client) ChequebookDeposit(ctx context.Context, amount *big.Int) error {
 	}
 	io.Copy(io.Discard, resp.Body) //nolint:errcheck // draining for connection reuse
 	return nil
+}
+
+// GranteesResult is the outcome of a grantee-list create or patch: the new
+// grantee-list reference and the new ACT history address (both encrypted
+// references).
+type GranteesResult struct {
+	Ref     string `json:"ref"`
+	History string `json:"historyref"`
+}
+
+// CreateGrantees creates an ACT grantee list (design §8): grantees are
+// compressed secp256k1 public keys (hex). history extends an existing ACT
+// history when non-empty, so content already uploaded under it becomes
+// readable by the new grantees.
+func (c *Client) CreateGrantees(ctx context.Context, batchID, history string, grantees []string) (*GranteesResult, error) {
+	body, _ := json.Marshal(map[string][]string{"grantees": grantees})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/grantee", strings.NewReader(string(body)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("swarm-postage-batch-id", batchID)
+	if history != "" {
+		req.Header.Set("swarm-act-history-address", history)
+	}
+	resp, err := c.do("grantee_create", req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return nil, newStatusError(resp)
+	}
+	var out GranteesResult
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("bee: decoding grantee response: %w", err)
+	}
+	return &out, nil
+}
+
+// PatchGrantees adds/revokes grantees on an existing list. Revocation is
+// forward-only: content already fetched stays readable (design §8).
+func (c *Client) PatchGrantees(ctx context.Context, granteesRef, history, batchID string, add, revoke []string) (*GranteesResult, error) {
+	payload := map[string][]string{}
+	if len(add) > 0 {
+		payload["add"] = add
+	}
+	if len(revoke) > 0 {
+		payload["revoke"] = revoke
+	}
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, c.base+"/grantee/"+granteesRef, strings.NewReader(string(body)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("swarm-postage-batch-id", batchID)
+	req.Header.Set("swarm-act-history-address", history)
+	resp, err := c.do("grantee_patch", req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return nil, newStatusError(resp)
+	}
+	var out GranteesResult
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("bee: decoding grantee response: %w", err)
+	}
+	return &out, nil
+}
+
+// Grantees returns the public keys on a grantee list.
+func (c *Client) Grantees(ctx context.Context, granteesRef string) ([]string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/grantee/"+granteesRef, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do("grantee_get", req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, newStatusError(resp)
+	}
+	// Bee returns either a bare array or {"grantees": [...]} depending on
+	// version; tolerate both.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	var keys []string
+	if err := json.Unmarshal(data, &keys); err == nil {
+		return keys, nil
+	}
+	var wrapped struct {
+		Grantees []string `json:"grantees"`
+	}
+	if err := json.Unmarshal(data, &wrapped); err != nil {
+		return nil, fmt.Errorf("bee: decoding grantee list: %w", err)
+	}
+	return wrapped.Grantees, nil
+}
+
+// PublisherKey returns the node's compressed public key (hex) — the ACT
+// publisher identity for everything this gateway uploads with swarm-act.
+func (c *Client) PublisherKey(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/addresses", nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.do("addresses", req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", newStatusError(resp)
+	}
+	var out struct {
+		PublicKey string `json:"publicKey"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("bee: decoding addresses: %w", err)
+	}
+	if out.PublicKey == "" {
+		return "", fmt.Errorf("bee: addresses response contained no publicKey")
+	}
+	return out.PublicKey, nil
 }
 
 // UploadSOC uploads a signed single-owner chunk (feed checkpoint updates,

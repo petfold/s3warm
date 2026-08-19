@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/petfold/s3warm/internal/auth"
@@ -33,15 +34,26 @@ type Server struct {
 	commits  *manifest.Committer // nil = commit chain disabled
 	verifier *auth.Verifier
 	log      *slog.Logger
+
+	// actMu guards actPub, the cached ACT publisher key (the Bee node's
+	// compressed public key, design §8).
+	actMu  sync.Mutex
+	actPub string
 }
 
 func New(cfg *config.Config, st store.Store, beeClient *bee.Client, stamps *stamp.Manager, commits *manifest.Committer, logger *slog.Logger) *Server {
-	creds := auth.StaticCredentials{}
-	if cfg.AccessKey != "" {
-		creds[cfg.AccessKey] = cfg.SecretKey
-	}
 	if logger == nil {
 		logger = slog.Default()
+	}
+	creds := auth.StaticCredentials{}
+	if cfg.AccessKey != "" {
+		// The flag pair is the root credential: unrestricted by tenancy.
+		creds[cfg.AccessKey] = auth.Credential{Secret: cfg.SecretKey}
+	}
+	if cfg.CredentialsFile != "" {
+		if err := auth.LoadCredentialsFile(cfg.CredentialsFile, creds); err != nil {
+			logger.Error("credentials file", "err", err)
+		}
 	}
 	if stamps == nil {
 		stamps = stamp.NewManager(beeClient, logger)
@@ -54,7 +66,7 @@ func New(cfg *config.Config, st store.Store, beeClient *bee.Client, stamps *stam
 		commits: commits,
 		verifier: &auth.Verifier{
 			Creds:          creds,
-			AllowAnonymous: cfg.AccessKey == "",
+			AllowAnonymous: len(creds) == 0,
 		},
 		log: logger,
 	}
@@ -142,6 +154,16 @@ func (s *Server) resolveTarget(r *http.Request) (bucket, key string) {
 
 func (s *Server) dispatchBucket(w http.ResponseWriter, r *http.Request, bucket string) {
 	q := r.URL.Query()
+	// Tenancy (design §8 layer 2): everything but bucket creation requires
+	// the caller's tenant to own the bucket. Creation has its own conflict
+	// semantics (BucketAlreadyExists) handled in handleCreateBucket.
+	creating := r.Method == http.MethodPut && len(q) == 0
+	if !creating {
+		if apiErr := s.authorizeBucket(r, bucket); apiErr != nil {
+			s.writeError(w, r, *apiErr)
+			return
+		}
+	}
 	switch r.Method {
 	case http.MethodGet:
 		switch {
@@ -161,6 +183,8 @@ func (s *Server) dispatchBucket(w http.ResponseWriter, r *http.Request, bucket s
 			s.handleGetBucketCors(w, r, bucket)
 		case q.Has("tagging"):
 			s.handleGetBucketTagging(w, r, bucket)
+		case q.Has("x-swarm-grants"):
+			s.handleGetGrants(w, r, bucket)
 		case anySubresource(q, "acl", "policy",
 			"lifecycle", "website", "object-lock", "replication",
 			"logging", "notification", "requestPayment", "accelerate",
@@ -193,6 +217,10 @@ func (s *Server) dispatchBucket(w http.ResponseWriter, r *http.Request, bucket s
 		}
 		if q.Has("x-swarm-snapshot") {
 			s.handleCreateSnapshot(w, r, bucket)
+			return
+		}
+		if q.Has("x-swarm-grants") {
+			s.handlePutGrants(w, r, bucket)
 			return
 		}
 		if len(q) > 0 {
@@ -237,6 +265,10 @@ func (s *Server) dispatchBucket(w http.ResponseWriter, r *http.Request, bucket s
 
 func (s *Server) dispatchObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	q := r.URL.Query()
+	if apiErr := s.authorizeBucket(r, bucket); apiErr != nil {
+		s.writeError(w, r, *apiErr)
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		if q.Has("uploadId") {

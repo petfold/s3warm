@@ -131,6 +131,19 @@ func (m *Memory) SetBucketTagging(_ context.Context, bucket, tagsJSON string) er
 	return nil
 }
 
+func (m *Memory) SetBucketACT(_ context.Context, bucket, history, grantees string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.buckets[bucket]
+	if !ok {
+		return ErrBucketNotFound
+	}
+	b.meta.ACT = true
+	b.meta.ActHistory = history
+	b.meta.ActGrantees = grantees
+	return nil
+}
+
 func (m *Memory) SetObjectTags(_ context.Context, bucket, key, versionID, tagsJSON string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

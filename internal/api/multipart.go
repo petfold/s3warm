@@ -102,8 +102,13 @@ func (s *Server) handleUploadPart(w http.ResponseWriter, r *http.Request, bucket
 		s.writeError(w, r, storeError(err))
 		return
 	}
+	b, err := s.store.GetBucket(ctx, bucket)
+	if err != nil {
+		s.writeError(w, r, storeError(err))
+		return
+	}
 
-	res, apiErr := s.uploadBody(r, upload.BatchID, upload.StorageClass, upload.Encrypted)
+	res, apiErr := s.uploadBody(r, b, upload.BatchID, upload.StorageClass, upload.Encrypted)
 	if apiErr != nil {
 		s.writeError(w, r, *apiErr)
 		return
@@ -143,8 +148,17 @@ func (s *Server) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, bu
 		return
 	}
 
-	srcObj, apiErr := s.getCopySource(r)
+	srcObj, srcB, apiErr := s.getCopySource(r)
 	if apiErr != nil {
+		s.writeError(w, r, *apiErr)
+		return
+	}
+	dstB, err := s.store.GetBucket(ctx, bucket)
+	if err != nil {
+		s.writeError(w, r, storeError(err))
+		return
+	}
+	if apiErr := actCopyBoundary(srcB, dstB); apiErr != nil {
 		s.writeError(w, r, *apiErr)
 		return
 	}
@@ -173,16 +187,21 @@ func (s *Server) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, bu
 			s.writeError(w, r, errInvalidRange)
 			return
 		}
-		resp, err := s.bee.DownloadBytes(ctx, srcObj.SwarmRef,
-			bee.DownloadOptions{Range: fmt.Sprintf("bytes=%d-%d", st, en), Strategy: s.cfg.FetchStrategy})
+		dopts := s.downloadOptions(r, fmt.Sprintf("bytes=%d-%d", st, en), srcB)
+		dopts.FallbackMode = "" // per-request header is for the outer read, not this internal one
+		resp, err := s.bee.DownloadBytes(ctx, srcObj.SwarmRef, dopts)
 		if err != nil {
 			s.writeError(w, r, beeError(err))
 			return
 		}
 		defer resp.Body.Close()
 		md5h := md5.New()
-		ref, err := s.bee.UploadBytes(ctx, io.TeeReader(resp.Body, md5h),
-			s.uploadOptions(upload.BatchID, upload.StorageClass, upload.Encrypted, en-st+1))
+		uopts := s.uploadOptions(upload.BatchID, upload.StorageClass, upload.Encrypted, en-st+1)
+		if dstB.ACT {
+			uopts.Act = true
+			uopts.ActHistory = dstB.ActHistory
+		}
+		ref, _, err := s.bee.UploadBytes(ctx, io.TeeReader(resp.Body, md5h), uopts)
 		if err != nil {
 			s.writeError(w, r, beeError(err))
 			return
@@ -490,36 +509,58 @@ func parseCopySource(r *http.Request) (string, string, string, *apiError) {
 }
 
 // getCopySource resolves a copy source, honoring versionId and treating a
-// delete-marker latest as absent.
-func (s *Server) getCopySource(r *http.Request) (*store.Object, *apiError) {
+// delete-marker latest as absent. The source bucket is tenancy-checked
+// (design §8 layer 2) and returned so callers can enforce ACT boundaries.
+func (s *Server) getCopySource(r *http.Request) (*store.Object, *store.Bucket, *apiError) {
 	srcBucket, srcKey, versionID, apiErr := parseCopySource(r)
 	if apiErr != nil {
-		return nil, apiErr
+		return nil, nil, apiErr
+	}
+	if apiErr := s.authorizeBucket(r, srcBucket); apiErr != nil {
+		return nil, nil, apiErr
 	}
 	ctx := r.Context()
+	srcB, err := s.store.GetBucket(ctx, srcBucket)
+	if err != nil {
+		e := storeError(err)
+		return nil, nil, &e
+	}
 	if versionID != "" {
 		obj, err := s.store.GetObjectVersion(ctx, srcBucket, srcKey, versionID)
 		if err != nil {
 			if errors.Is(err, store.ErrObjectNotFound) {
-				return nil, &errNoSuchVersion
+				return nil, nil, &errNoSuchVersion
 			}
 			e := storeError(err)
-			return nil, &e
+			return nil, nil, &e
 		}
 		if obj.DeleteMarker {
-			return nil, &errNoSuchKey
+			return nil, nil, &errNoSuchKey
 		}
-		return obj, nil
+		return obj, srcB, nil
 	}
 	obj, err := s.store.GetObject(ctx, srcBucket, srcKey)
 	if err != nil {
 		e := storeError(err)
-		return nil, &e
+		return nil, nil, &e
 	}
 	if obj.DeleteMarker {
-		return nil, &errNoSuchKey
+		return nil, nil, &errNoSuchKey
 	}
-	return obj, nil
+	return obj, srcB, nil
+}
+
+// actCopyBoundary rejects reference-reusing copies that cross an ACT
+// boundary: an ACT reference is only readable under its own bucket's
+// history, and copying plain content into an ACT bucket would leave it
+// unprotected — both would silently break the bucket's promises.
+func actCopyBoundary(srcB, dstB *store.Bucket) *apiError {
+	if srcB.Name == dstB.Name || (!srcB.ACT && !dstB.ACT) {
+		return nil
+	}
+	e := errInvalidRequest.withMessage(
+		"copies across an ACT-protected bucket boundary are not supported; download and re-upload instead")
+	return &e
 }
 
 // uploadOptions builds Bee upload options for a known-length stream.

@@ -49,7 +49,7 @@ func NewLoadSaver(beeClient *bee.Client, batch string, deferred bool) *LoadSaver
 }
 
 func (l *LoadSaver) Save(ctx context.Context, data []byte) ([]byte, error) {
-	ref, err := l.bee.UploadBytes(ctx, bytes.NewReader(data), bee.UploadOptions{
+	ref, _, err := l.bee.UploadBytes(ctx, bytes.NewReader(data), bee.UploadOptions{
 		BatchID:       l.batch,
 		Deferred:      l.deferred,
 		ContentLength: int64(len(data)),

@@ -21,6 +21,7 @@ One static binary, configured by flags with environment-variable defaults
 | `-batch-id-file` | `S3WARM_BATCH_ID_FILE` | — | File to read the batch id from when `-batch-id` is empty (init-container handoff) |
 | `-access-key` | `S3WARM_ACCESS_KEY` | — | Access key id. Empty enables **anonymous mode** (dev only; loud startup warning) |
 | `-secret-key` | `S3WARM_SECRET_KEY` | — | Secret access key (must be set together with `-access-key`) |
+| `-credentials` | `S3WARM_CREDENTIALS` | — | JSON credentials file for multi-tenancy: `[{"accessKey": "...", "secretKey": "...", "tenant": "alice"}, ...]`. Tenant-labeled keys only see buckets their tenant owns; tenant `""` or `"root"` is unrestricted. The `-access-key` pair is always a root key |
 | `-region` | `S3WARM_REGION` | `us-east-1` | Region label reported by GetBucketLocation (`us-east-1` renders as the empty LocationConstraint, as on AWS) |
 | `-db` | `S3WARM_DB` | `s3warm.db` | SQLite metadata index path. Empty = in-memory index (dev only; metadata lost on restart). Schema migrates automatically on open |
 | `-redundancy` | `S3WARM_REDUNDANCY` | `0` | Erasure-coding level (0–4) applied to `STANDARD`-class writes |
@@ -81,6 +82,13 @@ erasure-coding levels; the class is echoed back on reads.
   indexed.
 - **Anonymous mode.** With no configured credentials every request is
   accepted; for development only.
+- **Key-based tenancy** (design §8 layer 2). Every credential carries a
+  tenant label (via the `-credentials` file). A tenant key only sees and
+  touches buckets its tenant created: other buckets are invisible in
+  ListBuckets and answer `403 AccessDenied` to everything — including copy
+  sources — and creating a name another tenant owns is
+  `409 BucketAlreadyExists`. Root keys (the `-access-key` pair, entries
+  with tenant `""`/`"root"`, anonymous dev mode) are unrestricted.
 
 ### Flexible checksums
 
@@ -187,6 +195,7 @@ details on top of it.
 | `x-swarm-postage-batch-id` | PUT, CreateMultipartUpload, CreateBucket | Stamp this write from a specific batch / set the bucket's default batch |
 | `x-swarm-redundancy-strategy` | GET | Erasure-coding fetch strategy override (0–4) |
 | `x-swarm-redundancy-fallback-mode` | GET | Fetch fallback (`true`/`false`) |
+| `x-swarm-act: true` | CreateBucket | Make the bucket **ACT-protected**: every object is uploaded under Swarm's Access Control Trie (see below) |
 
 ### Response headers
 
@@ -197,6 +206,8 @@ details on top of it.
 | `x-swarm-batch-ttl` | PUT/GET/HEAD object | Estimated seconds until that batch (and the object) expires |
 | `x-swarm-bucket-root` | HeadBucket, snapshot/restore | The bucket's current commit root — browse via `/bzz/{root}/{key}` |
 | `x-swarm-commit-seq` | HeadBucket | Commit sequence number |
+| `x-swarm-act-history` | HeadBucket, GET/HEAD object (ACT buckets) | The bucket's ACT history address — one of the three values a grantee needs for native reads |
+| `x-swarm-act-publisher` | HeadBucket, GET/HEAD object (ACT buckets) | The publisher's compressed public key (the gateway's Bee node) |
 
 ### The commit chain
 
@@ -243,6 +254,53 @@ Labels match `[A-Za-z0-9._-]{1,64}`. Restore accepts any commit root whose
 document names the same bucket — including roots from before a restore, so
 roll-forward works too. Snapshot lifetime is bounded by the postage batch
 that stamped the commit; pinning protects it from the local node's GC only.
+
+### ACT-protected buckets & grants
+
+Design §8 layer 2: SigV4 authenticates clients at the gateway; **ACT
+(Swarm's Access Control Trie) makes grants portable** — enforceable by
+Swarm itself, with no s3warm in the path.
+
+A bucket created with `x-swarm-act: true` uploads every object under ACT,
+with the gateway's Bee node as *publisher*. One grantee list and one ACT
+history per bucket (S3 access patterns are bucket-granular; per-object ACT
+would multiply lookups and stamp costs for no S3-semantic gain). The
+history is started at bucket creation, so concurrent first writes can't
+race two histories into existence.
+
+| Call | Effect |
+|---|---|
+| `PUT /{bucket}` + `x-swarm-act: true` | Create an ACT-protected bucket |
+| `GET /{bucket}?x-swarm-grants` | Grants state: JSON `{bucket, publisher, historyRef, granteesRef, grantees}` |
+| `PUT /{bucket}?x-swarm-grants` | Mutate grants: JSON body `{"add": [pubkey...], "revoke": [pubkey...]}`. Grantees are compressed secp256k1 public keys (66 hex chars, `02`/`03` prefix) — e.g. another Bee node's `publicKey` from its `GET /addresses` |
+
+**The payoff.** A grantee reads the bucket's objects directly from *any*
+Bee node with their own key: take `x-swarm-reference` from an object plus
+`x-swarm-act-history` and `x-swarm-act-publisher` (on object responses and
+HeadBucket), then
+
+```
+curl http://<their-bee>/bytes/<reference> \
+  -H "swarm-act-history-address: <history>" \
+  -H "swarm-act-publisher: <publisher>"
+```
+
+The first grant is created on the bucket's existing history, so objects
+uploaded *before* the grant become readable too.
+
+**Caveats, stated plainly** (design §8):
+- **Revocation is forward-only.** Content a grantee already fetched (or
+  could have fetched) stays decryptable by them — you cannot un-share.
+- Reads pay an ACT history lookup on the Bee node.
+- ACT references are 64-byte encrypted references: possession alone grants
+  nothing, so `x-swarm-reference` is still exposed — but a bare `bzz://`
+  URL will not work; native access needs the three values above.
+- **The public commit chain is off** for ACT buckets (it would leak key
+  names and structure), so snapshots/restore are unavailable there.
+- Reference-reusing copies (CopyObject, whole-object UploadPartCopy)
+  cannot cross an ACT bucket boundary in either direction —
+  `400 InvalidRequest`; download and re-upload instead. Copies *within*
+  the bucket stay O(1).
 
 ---
 

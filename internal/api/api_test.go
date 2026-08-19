@@ -2,6 +2,7 @@ package api_test
 
 import (
 	"bytes"
+	"crypto/hmac"
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/base64"
@@ -15,6 +16,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,13 +32,24 @@ import (
 	"github.com/petfold/s3warm/internal/store"
 )
 
+// fakePublisher is the fake Bee node's ACT publisher key.
+const fakePublisher = "02fa4ebeefa4ebeefa4ebeefa4ebeefa4ebeefa4ebeefa4ebeefa4ebeefa4eb"
+
 // newFakeBee is an in-memory stand-in for a Bee node: POST /bytes stores a
 // blob under its sha256 (shaped like a Swarm reference), GET /bytes/{ref}
-// serves it with Range support.
+// serves it with Range support. ACT uploads get a random 64-byte reference
+// that only serves with act credentials; /grantee mirrors Bee's endpoints.
 func newFakeBee(t *testing.T) *httptest.Server {
 	t.Helper()
 	var mu sync.Mutex
 	blobs := map[string][]byte{}
+	actRefs := map[string]bool{}
+	grantees := map[string][]string{}
+	var hexCounter int
+	newHex := func(n int) string {
+		hexCounter++
+		return fmt.Sprintf("%0*x", 2*n, hexCounter)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /bytes", func(w http.ResponseWriter, r *http.Request) {
@@ -55,6 +70,15 @@ func newFakeBee(t *testing.T) *httptest.Server {
 			ref += hex.EncodeToString(sum[:])
 		}
 		mu.Lock()
+		if r.Header.Get("swarm-act") == "true" {
+			history := r.Header.Get("swarm-act-history-address")
+			if history == "" {
+				history = newHex(32)
+			}
+			ref = newHex(64)
+			actRefs[ref] = true
+			w.Header().Set("Swarm-Act-History-Address", history)
+		}
 		blobs[ref] = data
 		mu.Unlock()
 		w.WriteHeader(http.StatusCreated)
@@ -63,13 +87,83 @@ func newFakeBee(t *testing.T) *httptest.Server {
 	mux.HandleFunc("GET /bytes/{ref}", func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		data, ok := blobs[r.PathValue("ref")]
+		isAct := actRefs[r.PathValue("ref")]
 		mu.Unlock()
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			io.WriteString(w, `{"code":404,"message":"not found"}`)
 			return
 		}
+		if isAct && (r.Header.Get("swarm-act-history-address") == "" ||
+			r.Header.Get("swarm-act-publisher") != fakePublisher) {
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{"code":404,"message":"act credentials required"}`)
+			return
+		}
 		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(data))
+	})
+	mux.HandleFunc("GET /addresses", func(w http.ResponseWriter, _ *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"publicKey": fakePublisher})
+	})
+	mux.HandleFunc("POST /grantee", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Grantees []string `json:"grantees"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Grantees) == 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		ref, history := newHex(64), newHex(32)
+		grantees[ref] = req.Grantees
+		mu.Unlock()
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]string{"ref": ref, "historyref": history})
+	})
+	mux.HandleFunc("GET /grantee/{ref}", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		list, ok := grantees[r.PathValue("ref")]
+		mu.Unlock()
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		json.NewEncoder(w).Encode(list)
+	})
+	mux.HandleFunc("PATCH /grantee/{ref}", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("swarm-act-history-address") == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var req struct {
+			Add    []string `json:"add"`
+			Revoke []string `json:"revoke"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		old, ok := grantees[r.PathValue("ref")]
+		if !ok {
+			mu.Unlock()
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		revoked := map[string]bool{}
+		for _, k := range req.Revoke {
+			revoked[k] = true
+		}
+		var next []string
+		for _, k := range append(append([]string{}, old...), req.Add...) {
+			if !revoked[k] {
+				next = append(next, k)
+			}
+		}
+		ref, history := newHex(64), newHex(32)
+		grantees[ref] = next
+		mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]string{"ref": ref, "historyref": history})
 	})
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -985,4 +1079,266 @@ func TestTagging(t *testing.T) {
 	if len(got.TagSet.Tags) != 1 || got.TagSet.Tags[0].Value != "2" {
 		t.Fatalf("latest tags after retagging v1 = %+v", got.TagSet.Tags)
 	}
+}
+
+// newTenantGateway runs a gateway with a root credential pair and two
+// tenant-scoped keys loaded from a -credentials file.
+func newTenantGateway(t *testing.T) string {
+	t.Helper()
+	fakeBee := newFakeBee(t)
+	credsPath := t.TempDir() + "/creds.json"
+	credsJSON := `[
+		{"accessKey": "AKALICE", "secretKey": "alicesecret", "tenant": "alice"},
+		{"accessKey": "AKBOB", "secretKey": "bobsecret", "tenant": "bob"}
+	]`
+	if err := os.WriteFile(credsPath, []byte(credsJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{
+		BeeAPI:          fakeBee.URL,
+		BatchID:         testBatch,
+		Region:          "us-east-1",
+		Ack:             "node",
+		AccessKey:       "AKROOT",
+		SecretKey:       "rootsecret",
+		CredentialsFile: credsPath,
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	st := store.NewMemory()
+	beeClient := bee.New(fakeBee.URL)
+	commits := manifest.NewCommitter(st, beeClient, testBatch, true, nil, logger)
+	srv := httptest.NewServer(api.New(cfg, st, beeClient, nil, commits, logger))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// signV4 header-signs a request the way the gateway verifies it: host,
+// x-amz-content-sha256 (UNSIGNED-PAYLOAD) and x-amz-date.
+func signV4(t *testing.T, req *http.Request, accessKey, secret string) {
+	t.Helper()
+	const payload = "UNSIGNED-PAYLOAD"
+	amzDate := time.Now().UTC().Format("20060102T150405Z")
+	scopeDate := amzDate[:8]
+	req.Header.Set("x-amz-content-sha256", payload)
+	req.Header.Set("x-amz-date", amzDate)
+
+	q := req.URL.Query()
+	pairs := make([]string, 0, len(q))
+	keys := make([]string, 0, len(q))
+	for k := range q {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		for _, v := range q[k] {
+			pairs = append(pairs, url.QueryEscape(k)+"="+url.QueryEscape(v))
+		}
+	}
+	canonReq := strings.Join([]string{
+		req.Method,
+		req.URL.Path,
+		strings.Join(pairs, "&"),
+		"host:" + req.Host + "\n" +
+			"x-amz-content-sha256:" + payload + "\n" +
+			"x-amz-date:" + amzDate + "\n",
+		"host;x-amz-content-sha256;x-amz-date",
+		payload,
+	}, "\n")
+	crSum := sha256.Sum256([]byte(canonReq))
+	stringToSign := strings.Join([]string{
+		"AWS4-HMAC-SHA256",
+		amzDate,
+		scopeDate + "/us-east-1/s3/aws4_request",
+		hex.EncodeToString(crSum[:]),
+	}, "\n")
+	mac := func(key []byte, data string) []byte {
+		h := hmac.New(sha256.New, key)
+		h.Write([]byte(data))
+		return h.Sum(nil)
+	}
+	key := mac([]byte("AWS4"+secret), scopeDate)
+	key = mac(key, "us-east-1")
+	key = mac(key, "s3")
+	key = mac(key, "aws4_request")
+	sig := hex.EncodeToString(mac(key, stringToSign))
+	req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential="+accessKey+"/"+scopeDate+
+		"/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature="+sig)
+}
+
+func doSigned(t *testing.T, method, rawURL string, body []byte, headers map[string]string, accessKey, secret string, wantStatus int) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(method, rawURL, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	signV4(t, req, accessKey, secret)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, rawURL, err)
+	}
+	if resp.StatusCode != wantStatus {
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("%s %s as %s: status %d, want %d\n%s", method, rawURL, accessKey, resp.StatusCode, wantStatus, b)
+	}
+	return resp
+}
+
+func TestTenancy(t *testing.T) {
+	base := newTenantGateway(t)
+	alice := func(method, path string, body []byte, want int) *http.Response {
+		return doSigned(t, method, base+path, body, nil, "AKALICE", "alicesecret", want)
+	}
+	bob := func(method, path string, body []byte, want int) *http.Response {
+		return doSigned(t, method, base+path, body, nil, "AKBOB", "bobsecret", want)
+	}
+	root := func(method, path string, body []byte, want int) *http.Response {
+		return doSigned(t, method, base+path, body, nil, "AKROOT", "rootsecret", want)
+	}
+
+	alice(http.MethodPut, "/alice-data", nil, http.StatusOK).Body.Close()
+	alice(http.MethodPut, "/alice-data/hello.txt", []byte("hi"), http.StatusOK).Body.Close()
+
+	// Bob can neither see nor touch Alice's bucket.
+	bob(http.MethodHead, "/alice-data", nil, http.StatusForbidden).Body.Close()
+	bob(http.MethodGet, "/alice-data", nil, http.StatusForbidden).Body.Close()
+	bob(http.MethodGet, "/alice-data/hello.txt", nil, http.StatusForbidden).Body.Close()
+	bob(http.MethodPut, "/alice-data/sneaky.txt", []byte("x"), http.StatusForbidden).Body.Close()
+	bob(http.MethodDelete, "/alice-data", nil, http.StatusForbidden).Body.Close()
+	// Creating a name another tenant owns is a conflict, never a silent 200.
+	bob(http.MethodPut, "/alice-data", nil, http.StatusConflict).Body.Close()
+	// Copying out of Alice's bucket is denied too.
+	bob(http.MethodPut, "/bob-data", nil, http.StatusOK).Body.Close()
+	doSigned(t, http.MethodPut, base+"/bob-data/stolen.txt", nil,
+		map[string]string{"x-amz-copy-source": "/alice-data/hello.txt"},
+		"AKBOB", "bobsecret", http.StatusForbidden).Body.Close()
+
+	// Re-creating your own bucket in us-east-1 stays a 200.
+	alice(http.MethodPut, "/alice-data", nil, http.StatusOK).Body.Close()
+
+	// Listings are scoped to the tenant; root sees everything.
+	listNames := func(resp *http.Response) []string {
+		t.Helper()
+		var parsed struct {
+			Buckets struct {
+				Bucket []struct{ Name string }
+			}
+		}
+		xml.NewDecoder(resp.Body).Decode(&parsed)
+		resp.Body.Close()
+		var names []string
+		for _, b := range parsed.Buckets.Bucket {
+			names = append(names, b.Name)
+		}
+		return names
+	}
+	got := listNames(bob(http.MethodGet, "/", nil, http.StatusOK))
+	if len(got) != 1 || got[0] != "bob-data" {
+		t.Fatalf("bob's buckets = %v, want [bob-data]", got)
+	}
+	got = listNames(root(http.MethodGet, "/", nil, http.StatusOK))
+	if len(got) != 2 {
+		t.Fatalf("root's buckets = %v, want both", got)
+	}
+
+	// Root reads any tenant's data.
+	resp := root(http.MethodGet, "/alice-data/hello.txt", nil, http.StatusOK)
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(b) != "hi" {
+		t.Fatalf("root read %q, want %q", b, "hi")
+	}
+}
+
+func TestACTGrants(t *testing.T) {
+	base := newGateway(t)
+	granteeKey := "03" + strings.Repeat("ab", 32)
+
+	// Grants on a non-ACT bucket are rejected with guidance.
+	do(t, http.MethodPut, base+"/plain", nil, nil, http.StatusOK).Body.Close()
+	do(t, http.MethodPut, base+"/plain/o.txt", strings.NewReader("x"), nil, http.StatusOK).Body.Close()
+	do(t, http.MethodPut, base+"/plain?x-swarm-grants",
+		strings.NewReader(`{"add":["`+granteeKey+`"]}`), nil, http.StatusBadRequest).Body.Close()
+
+	// An ACT bucket: created with the header, announced on HEAD.
+	do(t, http.MethodPut, base+"/vault", nil,
+		map[string]string{"x-swarm-act": "true"}, http.StatusOK).Body.Close()
+	resp := do(t, http.MethodHead, base+"/vault", nil, nil, http.StatusOK)
+	resp.Body.Close()
+	history := resp.Header.Get("x-swarm-act-history")
+	if history == "" || resp.Header.Get("x-swarm-act-publisher") != fakePublisher {
+		t.Fatalf("HEAD bucket act headers: history=%q publisher=%q", history, resp.Header.Get("x-swarm-act-publisher"))
+	}
+
+	// Objects round-trip through ACT upload/download.
+	do(t, http.MethodPut, base+"/vault/secret.txt", strings.NewReader("classified"), nil, http.StatusOK).Body.Close()
+	resp = do(t, http.MethodGet, base+"/vault/secret.txt", nil, nil, http.StatusOK)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "classified" {
+		t.Fatalf("act object read %q", body)
+	}
+	if len(resp.Header.Get("x-swarm-reference")) != 128 {
+		t.Fatalf("act reference should be 64 bytes, got %q", resp.Header.Get("x-swarm-reference"))
+	}
+	if resp.Header.Get("x-swarm-act-history") == "" || resp.Header.Get("x-swarm-act-publisher") != fakePublisher {
+		t.Fatal("act object response is missing act headers")
+	}
+
+	// Grants state before any grant.
+	resp = do(t, http.MethodGet, base+"/vault?x-swarm-grants", nil, nil, http.StatusOK)
+	var grants struct {
+		Publisher   string   `json:"publisher"`
+		HistoryRef  string   `json:"historyRef"`
+		GranteesRef string   `json:"granteesRef"`
+		Grantees    []string `json:"grantees"`
+	}
+	json.NewDecoder(resp.Body).Decode(&grants)
+	resp.Body.Close()
+	if grants.Publisher != fakePublisher || grants.HistoryRef == "" || len(grants.Grantees) != 0 {
+		t.Fatalf("initial grants = %+v", grants)
+	}
+
+	// Grant, verify, revoke.
+	do(t, http.MethodPut, base+"/vault?x-swarm-grants",
+		strings.NewReader(`{"add":["`+granteeKey+`"]}`), nil, http.StatusOK).Body.Close()
+	resp = do(t, http.MethodGet, base+"/vault?x-swarm-grants", nil, nil, http.StatusOK)
+	json.NewDecoder(resp.Body).Decode(&grants)
+	resp.Body.Close()
+	if len(grants.Grantees) != 1 || grants.Grantees[0] != granteeKey || grants.GranteesRef == "" {
+		t.Fatalf("grants after add = %+v", grants)
+	}
+	do(t, http.MethodPut, base+"/vault?x-swarm-grants",
+		strings.NewReader(`{"revoke":["`+granteeKey+`"]}`), nil, http.StatusOK).Body.Close()
+	resp = do(t, http.MethodGet, base+"/vault?x-swarm-grants", nil, nil, http.StatusOK)
+	json.NewDecoder(resp.Body).Decode(&grants)
+	resp.Body.Close()
+	if len(grants.Grantees) != 0 {
+		t.Fatalf("grants after revoke = %+v", grants)
+	}
+
+	// Malformed grantee keys are rejected.
+	do(t, http.MethodPut, base+"/vault?x-swarm-grants",
+		strings.NewReader(`{"add":["nonsense"]}`), nil, http.StatusBadRequest).Body.Close()
+
+	// Reference-reusing copies across the ACT boundary are rejected both ways.
+	do(t, http.MethodPut, base+"/plain/from-vault", nil,
+		map[string]string{"x-amz-copy-source": "/vault/secret.txt"}, http.StatusBadRequest).Body.Close()
+	do(t, http.MethodPut, base+"/vault/from-plain", nil,
+		map[string]string{"x-amz-copy-source": "/plain/o.txt"}, http.StatusBadRequest).Body.Close()
+	// Within the bucket, O(1) copies still work.
+	do(t, http.MethodPut, base+"/vault/copy.txt", nil,
+		map[string]string{"x-amz-copy-source": "/vault/secret.txt"}, http.StatusOK).Body.Close()
+	resp = do(t, http.MethodGet, base+"/vault/copy.txt", nil, nil, http.StatusOK)
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "classified" {
+		t.Fatalf("act copy read %q", body)
+	}
+
+	// The public commit chain stays off: snapshots refuse ACT buckets.
+	do(t, http.MethodPut, base+"/vault?x-swarm-snapshot=v1", nil, nil, http.StatusBadRequest).Body.Close()
 }

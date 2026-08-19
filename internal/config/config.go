@@ -22,10 +22,16 @@ type Config struct {
 	BatchIDFile string
 	// Region is the region label reported to S3 clients.
 	Region string
-	// AccessKey/SecretKey form the single static credential pair.
-	// An empty AccessKey enables anonymous mode (development only).
+	// AccessKey/SecretKey form the root credential pair (unrestricted by
+	// tenancy). An empty AccessKey with no CredentialsFile enables anonymous
+	// mode (development only).
 	AccessKey string
 	SecretKey string
+	// CredentialsFile is a JSON file of additional credentials — an array of
+	// {accessKey, secretKey, tenant} objects (design §8 layer 2). Keys with a
+	// tenant label only see buckets that tenant owns; tenant "" or "root" is
+	// unrestricted.
+	CredentialsFile string
 	// RedundancyLevel is the default erasure-coding level (0-4) applied to
 	// uploads with the STANDARD storage class.
 	RedundancyLevel int
@@ -75,6 +81,7 @@ func Load(args []string) (*Config, error) {
 		Region:            envStr("S3WARM_REGION", "us-east-1"),
 		AccessKey:         envStr("S3WARM_ACCESS_KEY", ""),
 		SecretKey:         envStr("S3WARM_SECRET_KEY", ""),
+		CredentialsFile:   envStr("S3WARM_CREDENTIALS", ""),
 		RedundancyLevel:   envInt("S3WARM_REDUNDANCY", 0),
 		Encrypt:           envBool("S3WARM_ENCRYPT", false),
 		Ack:               envStr("S3WARM_ACK", "node"),
@@ -96,6 +103,7 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar(&cfg.Region, "region", cfg.Region, "region label reported to S3 clients")
 	fs.StringVar(&cfg.AccessKey, "access-key", cfg.AccessKey, "access key id (empty enables anonymous dev mode)")
 	fs.StringVar(&cfg.SecretKey, "secret-key", cfg.SecretKey, "secret access key")
+	fs.StringVar(&cfg.CredentialsFile, "credentials", cfg.CredentialsFile, "JSON credentials file: [{accessKey, secretKey, tenant}] — tenant-scoped keys for multi-tenancy")
 	fs.IntVar(&cfg.RedundancyLevel, "redundancy", cfg.RedundancyLevel, "default erasure-coding redundancy level (0-4)")
 	fs.BoolVar(&cfg.Encrypt, "encrypt", cfg.Encrypt, "encrypt uploads on Swarm")
 	fs.StringVar(&cfg.Ack, "ack", cfg.Ack, "PUT ack policy: node (Bee local store, default) or network (pushed before ack)")
@@ -135,6 +143,11 @@ func Load(args []string) (*Config, error) {
 	}
 	if (cfg.AccessKey == "") != (cfg.SecretKey == "") {
 		return nil, fmt.Errorf("access-key and secret-key must be set together")
+	}
+	if cfg.CredentialsFile != "" {
+		if _, err := os.Stat(cfg.CredentialsFile); err != nil {
+			return nil, fmt.Errorf("credentials file: %w", err)
+		}
 	}
 	return cfg, nil
 }

@@ -68,6 +68,17 @@ type Bucket struct {
 	CORS string
 	// Tags holds the bucket tag set as JSON ("" = none).
 	Tags string
+	// Owner is the tenant that created the bucket (design §8 layer 2).
+	// Empty means root-owned: visible to root keys only, like any bucket,
+	// but never to tenant keys.
+	Owner string
+	// ACT fields (design §8): ACT marks the bucket ACT-protected — every
+	// object is uploaded with swarm-act under the node's publisher key.
+	// ActHistory is the bucket's ACT history address; ActGrantees is the
+	// grantee-list reference ("" until the first grant).
+	ACT         bool
+	ActHistory  string
+	ActGrantees string
 }
 
 // Snapshot is a labeled commit root (design §5): restoring one is an atomic
@@ -159,6 +170,9 @@ type Store interface {
 	SetBucketCORS(ctx context.Context, bucket, corsJSON string) error
 	// SetBucketTagging sets the bucket tag set JSON ("" clears).
 	SetBucketTagging(ctx context.Context, bucket, tagsJSON string) error
+	// SetBucketACT records the bucket's ACT history address and grantee-list
+	// reference (design §8).
+	SetBucketACT(ctx context.Context, bucket, history, grantees string) error
 	// SetObjectTags replaces one version's tag set in place (versionID "" =
 	// the latest version).
 	SetObjectTags(ctx context.Context, bucket, key, versionID, tagsJSON string) error

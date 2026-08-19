@@ -29,7 +29,11 @@ CREATE TABLE IF NOT EXISTS buckets (
 	commit_seq INTEGER NOT NULL DEFAULT 0,
 	cors       TEXT NOT NULL DEFAULT '',
 	versioning TEXT NOT NULL DEFAULT '',
-	tags       TEXT NOT NULL DEFAULT ''
+	tags       TEXT NOT NULL DEFAULT '',
+	owner      TEXT NOT NULL DEFAULT '',
+	act        INTEGER NOT NULL DEFAULT 0,
+	act_history  TEXT NOT NULL DEFAULT '',
+	act_grantees TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS snapshots (
 	bucket     TEXT NOT NULL,
@@ -115,6 +119,10 @@ func OpenSQLite(path string) (*SQLite, error) {
 		`ALTER TABLE buckets ADD COLUMN tags TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE objects ADD COLUMN tags TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE multipart_uploads ADD COLUMN tags TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE buckets ADD COLUMN owner TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE buckets ADD COLUMN act INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE buckets ADD COLUMN act_history TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE buckets ADD COLUMN act_grantees TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := db.Exec(mig); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			db.Close()
@@ -180,9 +188,11 @@ func (s *SQLite) CreateBucket(ctx context.Context, b Bucket) error {
 		b.CreatedAt = time.Now().UTC()
 	}
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO buckets (name, created_at, batch_id, sse, head_root, commit_seq, cors, versioning, tags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO buckets (name, created_at, batch_id, sse, head_root, commit_seq, cors, versioning, tags, owner, act, act_history, act_grantees)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT (name) DO NOTHING`,
-		b.Name, b.CreatedAt.UTC().Format(timeLayout), b.BatchID, b.Encryption, b.HeadRoot, b.CommitSeq, b.CORS, b.Versioning, b.Tags)
+		b.Name, b.CreatedAt.UTC().Format(timeLayout), b.BatchID, b.Encryption, b.HeadRoot, b.CommitSeq, b.CORS, b.Versioning, b.Tags,
+		b.Owner, b.ACT, b.ActHistory, b.ActGrantees)
 	if err != nil {
 		return err
 	}
@@ -194,10 +204,11 @@ func (s *SQLite) CreateBucket(ctx context.Context, b Bucket) error {
 
 func (s *SQLite) GetBucket(ctx context.Context, name string) (*Bucket, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT name, created_at, batch_id, sse, head_root, commit_seq, cors, versioning, tags FROM buckets WHERE name = ?`, name)
+		`SELECT name, created_at, batch_id, sse, head_root, commit_seq, cors, versioning, tags, owner, act, act_history, act_grantees FROM buckets WHERE name = ?`, name)
 	var b Bucket
 	var created string
-	if err := row.Scan(&b.Name, &created, &b.BatchID, &b.Encryption, &b.HeadRoot, &b.CommitSeq, &b.CORS, &b.Versioning, &b.Tags); err != nil {
+	if err := row.Scan(&b.Name, &created, &b.BatchID, &b.Encryption, &b.HeadRoot, &b.CommitSeq, &b.CORS, &b.Versioning, &b.Tags,
+		&b.Owner, &b.ACT, &b.ActHistory, &b.ActGrantees); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrBucketNotFound
 		}
@@ -209,7 +220,7 @@ func (s *SQLite) GetBucket(ctx context.Context, name string) (*Bucket, error) {
 
 func (s *SQLite) ListBuckets(ctx context.Context) ([]Bucket, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT name, created_at, batch_id, sse, head_root, commit_seq, cors, versioning, tags FROM buckets ORDER BY name`)
+		`SELECT name, created_at, batch_id, sse, head_root, commit_seq, cors, versioning, tags, owner, act, act_history, act_grantees FROM buckets ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -218,7 +229,8 @@ func (s *SQLite) ListBuckets(ctx context.Context) ([]Bucket, error) {
 	for rows.Next() {
 		var b Bucket
 		var created string
-		if err := rows.Scan(&b.Name, &created, &b.BatchID, &b.Encryption, &b.HeadRoot, &b.CommitSeq, &b.CORS, &b.Versioning, &b.Tags); err != nil {
+		if err := rows.Scan(&b.Name, &created, &b.BatchID, &b.Encryption, &b.HeadRoot, &b.CommitSeq, &b.CORS, &b.Versioning, &b.Tags,
+			&b.Owner, &b.ACT, &b.ActHistory, &b.ActGrantees); err != nil {
 			return nil, err
 		}
 		b.CreatedAt, _ = time.Parse(timeLayout, created)
@@ -294,6 +306,20 @@ func (s *SQLite) SetBucketCORS(ctx context.Context, bucket, corsJSON string) err
 // SetBucketTagging sets the bucket tag set JSON.
 func (s *SQLite) SetBucketTagging(ctx context.Context, bucket, tagsJSON string) error {
 	res, err := s.db.ExecContext(ctx, `UPDATE buckets SET tags = ? WHERE name = ?`, tagsJSON, bucket)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return ErrBucketNotFound
+	}
+	return nil
+}
+
+// SetBucketACT records the bucket's ACT history and grantee-list refs.
+func (s *SQLite) SetBucketACT(ctx context.Context, bucket, history, grantees string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE buckets SET act = 1, act_history = ?, act_grantees = ? WHERE name = ?`,
+		history, grantees, bucket)
 	if err != nil {
 		return err
 	}

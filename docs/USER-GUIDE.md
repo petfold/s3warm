@@ -291,7 +291,41 @@ encrypted objects). Set it per request, as a bucket default
 (`put-bucket-encryption`, exactly as on AWS), or gateway-wide (`-encrypt`).
 SSE-C and SSE-KMS are rejected rather than silently ignored.
 
-## 7. What's supported, what isn't (yet)
+## 7. Teams and private sharing
+
+**Multiple users.** Give each user their own access keys with a
+`-credentials` JSON file:
+
+```json
+[
+  {"accessKey": "AKALICE12345678901234", "secretKey": "…", "tenant": "alice"},
+  {"accessKey": "AKBOB1234567890123456", "secretKey": "…", "tenant": "bob"}
+]
+```
+
+Each tenant sees only their own buckets — exactly like separate AWS
+accounts. The `-access-key`/`-secret-key` pair stays the admin key that
+sees everything.
+
+**Private buckets, shared without the gateway.** Create a bucket with the
+`x-swarm-act: true` header and everything in it is access-controlled by
+Swarm itself (ACT). Grant read access to a friend's Bee node by its public
+key (from their node's `GET /addresses`):
+
+```bash
+curl -X PUT "http://localhost:8333/vault?x-swarm-grants" \
+  -H "Content-Type: application/json" \
+  -d '{"add": ["02b1e35b…their-public-key…"]}'
+```
+
+They can then fetch any object straight from **their own node** — no
+s3warm, no shared passwords — using the object's `x-swarm-reference`
+together with the `x-swarm-act-history` and `x-swarm-act-publisher`
+response headers. Revoking (`{"revoke": […]}`) stops future access, but —
+like handing someone a document — what they already fetched they keep.
+Details and caveats: the [Reference](REFERENCE.md#act-protected-buckets--grants).
+
+## 8. What's supported, what isn't (yet)
 
 The executable answer is [`test/s3tests/passing.txt`](../test/s3tests/passing.txt)
 — every Ceph s3-tests conformance test s3warm passes, run in CI — and the
@@ -301,7 +335,7 @@ URLs, streaming signatures, checksums, SSE-S3, CORS, versioning and
 tagging all work. The common 501s you might hit: ACL mutation and
 bucket policies (both on the [roadmap](../ROADMAP.md)).
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Cause & fix |
 |---|---|

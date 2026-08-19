@@ -2,6 +2,7 @@ package manifest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -10,6 +11,10 @@ import (
 	"github.com/petfold/s3warm/internal/bee"
 	"github.com/petfold/s3warm/internal/store"
 )
+
+// ErrACTBucket marks a commit skipped because the bucket is ACT-protected:
+// the commit chain is public by design and would leak the bucket's keys.
+var ErrACTBucket = errors.New("commit chain is disabled for ACT-protected buckets")
 
 // DefaultDebounce batches a burst of mutations into one commit (design §5:
 // a commit costs only the changed path's node chain, but building it still
@@ -82,7 +87,7 @@ func (c *Committer) Run(ctx context.Context) {
 			}
 			c.mu.Unlock()
 			for _, b := range due {
-				if _, _, err := c.CommitNow(ctx, b); err != nil {
+				if _, _, err := c.CommitNow(ctx, b); err != nil && !errors.Is(err, ErrACTBucket) {
 					c.log.Warn("commit failed", "bucket", b, "err", err)
 				}
 			}
@@ -105,6 +110,12 @@ func (c *Committer) CommitNow(ctx context.Context, bucket string) (string, int64
 	b, err := c.store.GetBucket(ctx, bucket)
 	if err != nil {
 		return "", 0, err
+	}
+	if b.ACT {
+		// The commit chain is a *public* on-Swarm representation — for an
+		// ACT-protected bucket it would leak key names and structure, so it
+		// stays off (design §8).
+		return "", 0, ErrACTBucket
 	}
 	batch := b.BatchID
 	if batch == "" {

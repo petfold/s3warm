@@ -50,7 +50,7 @@ Exit: restic + Java SDK v2 work; buckets browsable via `bzz://`; snapshot → ro
 Exit: multi-gateway behind LB; a grantee reads a private bucket off-gateway.
 
 - [x] Versioning suite (§11): Enabled/Suspended modes, version rows with delete markers and latest-promotion, `?versionId` on GET/HEAD/DELETE/Copy/Attributes, real ListObjectVersions with pagination; index-only — old bytes were already retained by content addressing. Bucket restore flattens version history (noted)
-- [ ] ACT-backed grants + key-based multi-tenancy (§8)
+- [x] ACT-backed grants + key-based multi-tenancy (§8): `-credentials` file with tenant-scoped keys (owner-enforced buckets, scoped listings, 403 across tenants incl. copy sources); `x-swarm-act: true` buckets upload everything under ACT with the node as publisher; `GET/PUT ?x-swarm-grants` maps to Bee's grantee endpoints (one list + history per bucket, created at bucket creation); grantees read natively off-gateway via reference + history + publisher headers. Commit chain off for ACT buckets (would leak keys); cross-boundary reference-reusing copies rejected
 - [x] Object/bucket tagging: per-version object tag sets and bucket tag sets, `x-amz-tagging` header on PUT/initiate-multipart, copy `x-amz-tagging-directive`, `x-amz-tagging-count` on reads
 - [ ] Postgres index for HA (§10)
 - [x] Chequebook auto top-up: daily check, deposits wallet→chequebook below `-chequebook-min`, never touching the postage reserve (first slice of the money autopilot)

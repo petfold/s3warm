@@ -34,21 +34,34 @@ func (e *Error) Error() string { return e.Code + ": " + e.Message }
 
 type Identity struct {
 	AccessKey string
+	// Tenant is the identity's tenant label (design §8 layer 2). Empty means
+	// root: the gateway operator, unrestricted. Anonymous identities are root
+	// too — anonymous mode is an explicit dev opt-in.
+	Tenant    string
 	Anonymous bool
 	// Stream is set for STREAMING-AWS4-HMAC-SHA256-PAYLOAD payloads: the
 	// context a ChunkedReader needs to verify the body's signature chain.
 	Stream *StreamContext
 }
 
-type CredentialsProvider interface {
-	Lookup(accessKey string) (secret string, ok bool)
+// Root reports whether the identity is unrestricted by tenancy.
+func (id *Identity) Root() bool { return id == nil || id.Tenant == "" }
+
+// Credential is one access key's secret and tenant binding.
+type Credential struct {
+	Secret string
+	Tenant string // "" = root
 }
 
-type StaticCredentials map[string]string
+type CredentialsProvider interface {
+	Lookup(accessKey string) (Credential, bool)
+}
 
-func (s StaticCredentials) Lookup(accessKey string) (string, bool) {
-	secret, ok := s[accessKey]
-	return secret, ok
+type StaticCredentials map[string]Credential
+
+func (s StaticCredentials) Lookup(accessKey string) (Credential, bool) {
+	c, ok := s[accessKey]
+	return c, ok
 }
 
 type Verifier struct {
@@ -107,10 +120,11 @@ func (v *Verifier) Verify(r *http.Request) (*Identity, error) {
 	}
 	// Any region label is accepted; the scope's own region feeds key derivation
 	// (design §8) so clients need no special region configuration.
-	secret, ok := v.Creds.Lookup(accessKey)
+	cred, ok := v.Creds.Lookup(accessKey)
 	if !ok {
 		return nil, &Error{"InvalidAccessKeyId", "the access key id you provided does not exist in our records"}
 	}
+	secret := cred.Secret
 
 	payloadHash := r.Header.Get("X-Amz-Content-Sha256")
 	if payloadHash == "" {
@@ -145,7 +159,7 @@ func (v *Verifier) Verify(r *http.Request) (*Identity, error) {
 		return nil, &Error{"SignatureDoesNotMatch", "the request signature we calculated does not match the signature you provided"}
 	}
 
-	id := &Identity{AccessKey: accessKey}
+	id := &Identity{AccessKey: accessKey, Tenant: cred.Tenant}
 	if payloadHash == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" ||
 		payloadHash == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER" {
 		id.Stream = &StreamContext{
@@ -179,10 +193,11 @@ func (v *Verifier) verifyPresigned(r *http.Request) (*Identity, error) {
 		return nil, &Error{"AuthorizationQueryParametersError", "malformed X-Amz-Credential"}
 	}
 	accessKey, scopeDate, scopeRegion := scope[0], scope[1], scope[2]
-	secret, ok := v.Creds.Lookup(accessKey)
+	cred, ok := v.Creds.Lookup(accessKey)
 	if !ok {
 		return nil, &Error{"InvalidAccessKeyId", "the access key id you provided does not exist in our records"}
 	}
+	secret := cred.Secret
 
 	// Out-of-range or missing X-Amz-Expires is 403 on AWS, not 400.
 	expires, err := strconv.ParseInt(q.Get("X-Amz-Expires"), 10, 64)
@@ -215,7 +230,7 @@ func (v *Verifier) verifyPresigned(r *http.Request) (*Identity, error) {
 	if !signatureMatches(secret, amzDate, scopeDate, scopeRegion, canonReq, signature) {
 		return nil, &Error{"SignatureDoesNotMatch", "the request signature we calculated does not match the signature you provided"}
 	}
-	return &Identity{AccessKey: accessKey}, nil
+	return &Identity{AccessKey: accessKey, Tenant: cred.Tenant}, nil
 }
 
 func (v *Verifier) now() time.Time {

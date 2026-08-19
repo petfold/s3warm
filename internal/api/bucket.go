@@ -33,11 +33,17 @@ func (s *Server) handleListBuckets(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, storeError(err))
 		return
 	}
-	resp := listAllMyBucketsResult{
-		Xmlns: s3Xmlns,
-		Owner: xmlOwner{ID: "s3warm", DisplayName: "s3warm"},
+	id := identityFrom(r.Context())
+	owner := xmlOwner{ID: "s3warm", DisplayName: "s3warm"}
+	if !id.Root() {
+		owner = xmlOwner{ID: id.Tenant, DisplayName: id.Tenant}
 	}
+	resp := listAllMyBucketsResult{Xmlns: s3Xmlns, Owner: owner}
 	for _, b := range buckets {
+		// Tenant keys only see their tenant's buckets (design §8 layer 2).
+		if !id.Root() && b.Owner != id.Tenant {
+			continue
+		}
 		resp.Buckets.Bucket = append(resp.Buckets.Bucket, xmlBucket{
 			Name:         b.Name,
 			CreationDate: xmlTime(b.CreatedAt),
@@ -55,17 +61,56 @@ func (s *Server) handleCreateBucket(w http.ResponseWriter, r *http.Request, buck
 	// accepted and ignored: there is one "region" here.
 	io.Copy(io.Discard, io.LimitReader(r.Body, 64<<10)) //nolint:errcheck
 
-	err := s.store.CreateBucket(r.Context(), store.Bucket{
+	id := identityFrom(r.Context())
+	b := store.Bucket{
 		Name:      bucket,
 		CreatedAt: time.Now().UTC(),
 		BatchID:   r.Header.Get("x-swarm-postage-batch-id"),
-	})
-	if err != nil {
-		// In us-east-1, re-creating a bucket you own succeeds, as on AWS.
-		if !(errors.Is(err, store.ErrBucketExists) && s.cfg.Region == "us-east-1") {
-			s.writeError(w, r, storeError(err))
+	}
+	if !id.Root() {
+		b.Owner = id.Tenant
+	}
+	// x-swarm-act: true makes the bucket ACT-protected (design §8): its ACT
+	// history starts here, before any object, so every upload extends one
+	// history.
+	if strings.EqualFold(r.Header.Get("x-swarm-act"), "true") {
+		batch := s.resolveBatch(r, &b)
+		if batch == "" {
+			s.writeError(w, r, errSwarmPostage.withMessage("an ACT bucket needs a postage batch: set x-swarm-postage-batch-id or -batch-id"))
 			return
 		}
+		if err := s.stamps.Check(r.Context(), batch); err != nil {
+			s.writeError(w, r, errSwarmPostage.withMessage(err.Error()))
+			return
+		}
+		history, apiErr := s.createActHistory(r, bucket, batch)
+		if apiErr != nil {
+			s.writeError(w, r, *apiErr)
+			return
+		}
+		b.ACT = true
+		b.ActHistory = history
+	}
+
+	err := s.store.CreateBucket(r.Context(), b)
+	if errors.Is(err, store.ErrBucketExists) {
+		existing, gerr := s.store.GetBucket(r.Context(), bucket)
+		switch {
+		case gerr != nil:
+			s.writeError(w, r, storeError(gerr))
+			return
+		case existing.Owner != b.Owner:
+			// Someone else's bucket: always a conflict, never a silent 200.
+			s.writeError(w, r, storeError(err))
+			return
+		case s.cfg.Region != "us-east-1":
+			s.writeError(w, r, storeError(err))
+			return
+			// In us-east-1, re-creating a bucket you own succeeds, as on AWS.
+		}
+	} else if err != nil {
+		s.writeError(w, r, storeError(err))
+		return
 	}
 	w.Header().Set("Location", "/"+bucket)
 	w.WriteHeader(http.StatusOK)
@@ -82,6 +127,14 @@ func (s *Server) handleHeadBucket(w http.ResponseWriter, r *http.Request, bucket
 	if b.HeadRoot != "" {
 		w.Header().Set("x-swarm-bucket-root", b.HeadRoot)
 		w.Header().Set("x-swarm-commit-seq", strconv.FormatInt(b.CommitSeq, 10))
+	}
+	if b.ACT {
+		// Everything a grantee needs (plus per-object references) to read the
+		// bucket natively from any Bee node (design §8).
+		w.Header().Set("x-swarm-act-history", b.ActHistory)
+		if pub, err := s.publisherKey(r); err == nil {
+			w.Header().Set("x-swarm-act-publisher", pub)
+		}
 	}
 	w.WriteHeader(http.StatusOK)
 }

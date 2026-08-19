@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"regexp"
 	"time"
@@ -130,6 +131,9 @@ func (s *Server) handleRestoreBucket(w http.ResponseWriter, r *http.Request, buc
 // commitError maps commit failures: store errors keep their mapping,
 // everything else surfaces as a Bee/upstream problem.
 func commitError(err error) apiError {
+	if errors.Is(err, manifest.ErrACTBucket) {
+		return errInvalidRequest.withMessage(err.Error())
+	}
 	if e := storeError(err); e.Code != errInternal.Code {
 		return e
 	}
