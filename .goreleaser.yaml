@@ -1,0 +1,56 @@
+version: 2
+project_name: s3warm
+
+builds:
+  - id: s3warm
+    main: ./cmd/s3warm
+    binary: s3warm
+    env: [CGO_ENABLED=0] # pure Go throughout (modernc sqlite), so this holds
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ignore:
+      - goos: windows
+        goarch: arm64
+    flags: [-trimpath]
+    ldflags: ["-s -w -X main.version={{.Version}}"]
+  - id: fakebee
+    main: ./cmd/fakebee
+    binary: fakebee
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ignore:
+      - goos: windows
+        goarch: arm64
+    flags: [-trimpath]
+    ldflags: ["-s -w"]
+
+archives:
+  # One archive per platform carrying both binaries (fakebee lets people try
+  # the gateway with no Swarm node) plus the docs that matter offline.
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+      - docs/USER-GUIDE.md
+      - docs/REFERENCE.md
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^test:"
+      - "^ci:"
+
+release:
+  footer: |
+    ---
+    Install without a Go toolchain: download the archive for your platform
+    above. With one: `go install github.com/petfold/s3warm/cmd/s3warm@{{ .Tag }}`.
+    Start here: the [User Guide](https://github.com/petfold/s3warm/blob/{{ .Tag }}/docs/USER-GUIDE.md).

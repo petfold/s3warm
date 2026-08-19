@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -20,7 +21,14 @@ import (
 	"github.com/petfold/s3warm/internal/store"
 )
 
+// version is stamped by the release build (goreleaser ldflags).
+var version = "dev"
+
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "-version" {
+		fmt.Println("s3warm", version)
+		return
+	}
 	cfg, err := config.Load(os.Args[1:])
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -96,7 +104,7 @@ func main() {
 		srv.Shutdown(shutdownCtx) //nolint:errcheck
 	}()
 
-	logger.Info("s3warm listening", "addr", cfg.ListenAddr, "bee", cfg.BeeAPI, "region", cfg.Region)
+	logger.Info("s3warm listening", "version", version, "addr", cfg.ListenAddr, "bee", cfg.BeeAPI, "region", cfg.Region)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Error("server", "err", err)
 		os.Exit(1)
