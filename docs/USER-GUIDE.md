@@ -109,10 +109,20 @@ node's wallet in one go. (Manual route: acquire them on an exchange or
 bridge and send them yourself.)
 
 One transfer of each, to the wallet address the node prints on first start
-(also at `curl localhost:1633/addresses`), and the money part is done: on
-its next start the node automatically deploys and funds its *chequebook*
-(the payment contract it settles bandwidth with) from that wallet, and the
-same wallet pays for the postage batch below.
+(also at `curl localhost:1633/addresses`), and the money part is
+bootstrapped: on its next start the node automatically deploys its
+*chequebook* (the payment contract it settles bandwidth with) and seeds it
+with an initial xBZZ deposit from that wallet, and the same wallet pays
+for the postage batch below.
+
+One caveat to know: that chequebook seeding is a **one-time** event — Bee
+does not top the chequebook up from the wallet later, however full the
+wallet is. Light and moderate traffic rarely exhausts the initial deposit,
+but if your gateway serves heavy download traffic, glance at
+`curl localhost:1633/chequebook/balance` occasionally and refill with
+`curl -X POST "localhost:1633/chequebook/deposit?amount=…"` if the
+available balance runs low. (Postage batches and top-ups keep drawing from
+the wallet directly, so those are unaffected.)
 
 ### Buying a postage batch
 
