@@ -58,6 +58,8 @@ type Bucket struct {
 	// Encryption is the bucket-default SSE algorithm: "" or "AES256"
 	// (design §12 — mapped to swarm-encrypt).
 	Encryption string
+	// Versioning is "" (never enabled), "Enabled" or "Suspended" (design §11).
+	Versioning string
 	// HeadRoot/CommitSeq track the bucket's commit chain (design §5): the
 	// Swarm manifest root of the latest commit and its sequence number.
 	HeadRoot  string
@@ -97,6 +99,13 @@ type Object struct {
 	// Encrypted marks SSE objects: the Swarm reference embeds the
 	// decryption key and must stay private (design §12).
 	Encrypted bool
+	// Versioning fields (design §11). VersionID is "null" for writes into
+	// never-versioned or suspended buckets; VSeq orders a key's versions
+	// (write-time UnixNano); DeleteMarker rows shadow the key.
+	VersionID    string
+	VSeq         int64
+	IsLatest     bool
+	DeleteMarker bool
 	// Parts is non-empty for composite (multipart) objects: the ordered
 	// part list the gateway stitches on reads (design §7). SwarmRef is
 	// empty for composites.
@@ -136,6 +145,8 @@ type Store interface {
 	DeleteBucket(ctx context.Context, name string) error
 	// SetBucketEncryption sets the bucket-default SSE algorithm ("" clears).
 	SetBucketEncryption(ctx context.Context, bucket, algorithm string) error
+	// SetBucketVersioning sets the versioning status ("Enabled"/"Suspended").
+	SetBucketVersioning(ctx context.Context, bucket, status string) error
 	// SetBucketHead records the bucket's latest commit root and sequence.
 	SetBucketHead(ctx context.Context, bucket, root string, seq int64) error
 	// SetBucketCORS sets the bucket's CORS rules JSON ("" clears).
@@ -149,16 +160,31 @@ type Store interface {
 	// Swarm; the index swap happens here).
 	RestoreBucket(ctx context.Context, bucket string, objects []Object, root string, seq int64) error
 
-	// PutObject upserts; overwriting a key is last-writer-wins, as in S3.
-	// A non-nil cond is checked atomically with the write and fails with
-	// ErrPreconditionFailed.
+	// PutObject inserts o as its key's latest version. The caller sets
+	// o.VersionID ("null" for unversioned/suspended writes — an existing row
+	// with the same version id is replaced) and o.VSeq. A non-nil cond is
+	// checked atomically against the current latest (a delete marker counts
+	// as absent) and fails with ErrPreconditionFailed.
 	PutObject(ctx context.Context, o Object, cond *PutCondition) error
+	// GetObject returns the key's latest version — possibly a delete marker;
+	// callers decide how to surface those.
 	GetObject(ctx context.Context, bucket, key string) (*Object, error)
-	// DeleteObject is idempotent: deleting an absent key returns nil.
+	GetObjectVersion(ctx context.Context, bucket, key, versionID string) (*Object, error)
+	// DeleteObject removes every version of the key. Idempotent.
 	DeleteObject(ctx context.Context, bucket, key string) error
-	// ListObjects returns up to limit objects whose keys begin with prefix and
-	// sort strictly after `after`, in ascending key order.
+	// DeleteVersion permanently removes one version (delete markers
+	// included), promoting the next-newest to latest, and returns the
+	// removed row. ErrObjectNotFound when absent.
+	DeleteVersion(ctx context.Context, bucket, key, versionID string) (*Object, error)
+	// ListObjects returns up to limit latest, non-delete-marker objects
+	// whose keys begin with prefix and sort strictly after `after`, in
+	// ascending key order.
 	ListObjects(ctx context.Context, bucket, prefix, after string, limit int) ([]Object, error)
+	// ListVersions returns up to limit version rows (delete markers
+	// included) ordered by key ascending then newest-first, starting
+	// strictly after the (keyMarker, versionMarker) position; an empty
+	// versionMarker starts after all versions of keyMarker.
+	ListVersions(ctx context.Context, bucket, prefix, keyMarker, versionMarker string, limit int) ([]Object, error)
 
 	CreateMultipartUpload(ctx context.Context, u MultipartUpload) error
 	// GetMultipartUpload fails with ErrUploadNotFound unless bucket, key and

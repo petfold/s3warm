@@ -189,10 +189,9 @@ func (s *Server) handleListObjects(w http.ResponseWriter, r *http.Request, bucke
 	writeXML(w, http.StatusOK, resp)
 }
 
-// handleListObjectVersions serves ListObjectVersions with unversioned
-// semantics, as S3 does for never-versioned buckets: every object is one
-// Version with VersionId "null" and IsLatest true. Real versioning is
-// phase 3 (design §11).
+// handleListObjectVersions serves real version listings (design §11):
+// version rows and delete markers ordered by key ascending, newest-first
+// per key, with key/version-id marker pagination and delimiter roll-up.
 func (s *Server) handleListObjectVersions(w http.ResponseWriter, r *http.Request, bucket string) {
 	ctx := r.Context()
 	if _, err := s.store.GetBucket(ctx, bucket); err != nil {
@@ -218,13 +217,7 @@ func (s *Server) handleListObjectVersions(w http.ResponseWriter, r *http.Request
 		maxKeys = min(n, 1000)
 	}
 	keyMarker := q.Get("key-marker")
-	// version-id-marker is accepted and ignored: one version per key.
-
-	res, err := s.scanObjects(ctx, bucket, prefix, delimiter, keyMarker, maxKeys)
-	if err != nil {
-		s.writeError(w, r, storeError(err))
-		return
-	}
+	versionMarker := q.Get("version-id-marker")
 
 	enc := func(v string) string {
 		if encoding == "url" {
@@ -232,40 +225,83 @@ func (s *Server) handleListObjectVersions(w http.ResponseWriter, r *http.Request
 		}
 		return v
 	}
-	versions := make([]xmlVersion, len(res.contents))
-	for i, o := range res.contents {
-		versions[i] = xmlVersion{
-			Key:          enc(o.Key),
-			VersionID:    "null",
-			IsLatest:     true,
-			LastModified: xmlTime(o.LastModified),
-			ETag:         `"` + o.ETag + `"`,
-			Size:         o.Size,
-			StorageClass: o.StorageClass,
-			Owner:        xmlOwner{ID: "s3warm", DisplayName: "s3warm"},
-		}
-	}
-	prefixes := make([]xmlCommonPrefix, len(res.prefixes))
-	for i, p := range res.prefixes {
-		prefixes[i] = xmlCommonPrefix{Prefix: enc(p)}
-	}
-
+	owner := xmlOwner{ID: "s3warm", DisplayName: "s3warm"}
 	resp := listVersionsResult{
 		Xmlns:           s3Xmlns,
 		Name:            bucket,
 		Prefix:          enc(prefix),
 		KeyMarker:       enc(keyMarker),
-		VersionIDMarker: q.Get("version-id-marker"),
+		VersionIDMarker: versionMarker,
 		MaxKeys:         maxKeys,
 		Delimiter:       enc(delimiter),
 		EncodingType:    encoding,
-		IsTruncated:     res.truncated,
-		Versions:        versions,
-		CommonPrefixes:  prefixes,
 	}
-	if res.truncated {
-		resp.NextKeyMarker = enc(res.resumeAfter)
-		resp.NextVersionIDMarker = "null"
+
+	count := 0
+	curKey, curVersion := keyMarker, versionMarker
+	var lastKey, lastVersion string
+scan:
+	for maxKeys > 0 {
+		page, err := s.store.ListVersions(ctx, bucket, prefix, curKey, curVersion, scanPage)
+		if err != nil {
+			s.writeError(w, r, storeError(err))
+			return
+		}
+		for _, v := range page {
+			curKey, curVersion = v.Key, v.VersionID
+			if delimiter != "" {
+				if i := strings.Index(v.Key[len(prefix):], delimiter); i >= 0 {
+					cp := v.Key[:len(prefix)+i+len(delimiter)]
+					if cp <= keyMarker {
+						continue
+					}
+					if n := len(resp.CommonPrefixes); n > 0 && resp.CommonPrefixes[n-1].Prefix == enc(cp) {
+						continue
+					}
+					if count == maxKeys {
+						resp.IsTruncated = true
+						break scan
+					}
+					resp.CommonPrefixes = append(resp.CommonPrefixes, xmlCommonPrefix{Prefix: enc(cp)})
+					lastKey, lastVersion = cp, ""
+					count++
+					continue
+				}
+			}
+			if count == maxKeys {
+				resp.IsTruncated = true
+				break scan
+			}
+			if v.DeleteMarker {
+				resp.DeleteMarkers = append(resp.DeleteMarkers, xmlDeleteMarker{
+					Key:          enc(v.Key),
+					VersionID:    v.VersionID,
+					IsLatest:     v.IsLatest,
+					LastModified: xmlTime(v.LastModified),
+					Owner:        owner,
+				})
+			} else {
+				resp.Versions = append(resp.Versions, xmlVersion{
+					Key:          enc(v.Key),
+					VersionID:    v.VersionID,
+					IsLatest:     v.IsLatest,
+					LastModified: xmlTime(v.LastModified),
+					ETag:         `"` + v.ETag + `"`,
+					Size:         v.Size,
+					StorageClass: v.StorageClass,
+					Owner:        owner,
+				})
+			}
+			lastKey, lastVersion = v.Key, v.VersionID
+			count++
+		}
+		if len(page) < scanPage {
+			break
+		}
+	}
+	if resp.IsTruncated {
+		resp.NextKeyMarker = enc(lastKey)
+		resp.NextVersionIDMarker = lastVersion
 	}
 	writeXML(w, http.StatusOK, resp)
 }

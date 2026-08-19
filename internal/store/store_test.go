@@ -217,6 +217,89 @@ func TestListObjects(t *testing.T) {
 	})
 }
 
+func TestVersioning(t *testing.T) {
+	forEachStore(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		if err := s.CreateBucket(ctx, Bucket{Name: "b"}); err != nil {
+			t.Fatal(err)
+		}
+		put := func(versionID string, vseq int64, marker bool) Object {
+			o := obj("b", "k")
+			o.VersionID, o.VSeq, o.DeleteMarker = versionID, vseq, marker
+			o.SwarmRef = "ref-" + versionID
+			if err := s.PutObject(ctx, o, nil); err != nil {
+				t.Fatalf("put %s: %v", versionID, err)
+			}
+			return o
+		}
+
+		put("v1", 1, false)
+		put("v2", 2, false)
+		latest, err := s.GetObject(ctx, "b", "k")
+		if err != nil || latest.VersionID != "v2" || !latest.IsLatest {
+			t.Fatalf("latest = %+v, %v", latest, err)
+		}
+		if v, err := s.GetObjectVersion(ctx, "b", "k", "v1"); err != nil || v.SwarmRef != "ref-v1" || v.IsLatest {
+			t.Fatalf("v1 = %+v, %v", v, err)
+		}
+
+		// Delete marker shadows the key.
+		put("v3", 3, true)
+		latest, _ = s.GetObject(ctx, "b", "k")
+		if !latest.DeleteMarker {
+			t.Fatalf("latest should be a delete marker: %+v", latest)
+		}
+		if objs, _ := s.ListObjects(ctx, "b", "", "", 10); len(objs) != 0 {
+			t.Fatalf("shadowed key listed: %+v", objs)
+		}
+		// Conditional create-only succeeds through a delete marker.
+		o := obj("b", "k")
+		o.VersionID, o.VSeq = "v4", 4
+		if err := s.PutObject(ctx, o, &PutCondition{IfNoneMatch: "*"}); err != nil {
+			t.Fatalf("create-only through marker: %v", err)
+		}
+
+		// Version listing: newest first per key.
+		vs, err := s.ListVersions(ctx, "b", "", "", "", -1)
+		if err != nil || len(vs) != 4 {
+			t.Fatalf("versions = %d, %v", len(vs), err)
+		}
+		if vs[0].VersionID != "v4" || vs[3].VersionID != "v1" || !vs[0].IsLatest || vs[1].IsLatest {
+			t.Fatalf("order/latest wrong: %+v", vs)
+		}
+		// Pagination after (k, v3).
+		vs, _ = s.ListVersions(ctx, "b", "", "k", "v3", -1)
+		if len(vs) != 2 || vs[0].VersionID != "v2" {
+			t.Fatalf("after marker: %+v", vs)
+		}
+
+		// Removing the latest promotes the next-newest.
+		removed, err := s.DeleteVersion(ctx, "b", "k", "v4")
+		if err != nil || removed.VersionID != "v4" {
+			t.Fatalf("DeleteVersion = %+v, %v", removed, err)
+		}
+		latest, _ = s.GetObject(ctx, "b", "k")
+		if latest.VersionID != "v3" || !latest.IsLatest || !latest.DeleteMarker {
+			t.Fatalf("promotion failed: %+v", latest)
+		}
+		if _, err := s.DeleteVersion(ctx, "b", "k", "v4"); !errors.Is(err, ErrObjectNotFound) {
+			t.Fatalf("double delete = %v", err)
+		}
+
+		// Suspended-style write: replacing the "null" version keeps one row.
+		put("null", 5, false)
+		put("null", 6, false)
+		vs, _ = s.ListVersions(ctx, "b", "", "", "", -1)
+		if len(vs) != 4 { // v1, v2, v3, null
+			t.Fatalf("null replace: %d versions: %+v", len(vs), vs)
+		}
+		latest, _ = s.GetObject(ctx, "b", "k")
+		if latest.VersionID != "null" || latest.VSeq != 6 {
+			t.Fatalf("null latest: %+v", latest)
+		}
+	})
+}
+
 func TestSQLitePersistsAcrossReopen(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "index.db")

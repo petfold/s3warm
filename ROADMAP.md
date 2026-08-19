@@ -49,7 +49,7 @@ Exit: restic + Java SDK v2 work; buckets browsable via `bzz://`; snapshot → ro
 
 Exit: multi-gateway behind LB; a grantee reads a private bucket off-gateway.
 
-- [ ] Versioning suite (§11)
+- [x] Versioning suite (§11): Enabled/Suspended modes, version rows with delete markers and latest-promotion, `?versionId` on GET/HEAD/DELETE/Copy/Attributes, real ListObjectVersions with pagination; index-only — old bytes were already retained by content addressing. Bucket restore flattens version history (noted)
 - [ ] ACT-backed grants + key-based multi-tenancy (§8)
 - [ ] Object/bucket tagging
 - [ ] Postgres index for HA (§10)

@@ -173,6 +173,10 @@ func (s *Server) dispatchBucket(w http.ResponseWriter, r *http.Request, bucket s
 			s.handleListObjects(w, r, bucket, 1)
 		}
 	case http.MethodPut:
+		if q.Has("versioning") {
+			s.handlePutBucketVersioning(w, r, bucket)
+			return
+		}
 		if q.Has("encryption") {
 			s.handlePutBucketEncryption(w, r, bucket)
 			return

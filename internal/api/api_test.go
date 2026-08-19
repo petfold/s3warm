@@ -432,6 +432,106 @@ func TestCORS(t *testing.T) {
 		map[string]string{"Origin": "prefix.app", "Access-Control-Request-Method": "GET"}, http.StatusForbidden).Body.Close()
 }
 
+func TestVersioningLifecycle(t *testing.T) {
+	base := newGateway(t)
+	do(t, http.MethodPut, base+"/ver", nil, nil, http.StatusOK).Body.Close()
+
+	// Enable versioning.
+	cfg := `<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>`
+	do(t, http.MethodPut, base+"/ver?versioning", strings.NewReader(cfg), nil, http.StatusOK).Body.Close()
+	resp := do(t, http.MethodGet, base+"/ver?versioning", nil, nil, http.StatusOK)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), "<Status>Enabled</Status>") {
+		t.Fatalf("versioning config: %s", body)
+	}
+
+	// Two writes → two version ids.
+	resp = do(t, http.MethodPut, base+"/ver/doc", strings.NewReader("first"), nil, http.StatusOK)
+	resp.Body.Close()
+	v1 := resp.Header.Get("x-amz-version-id")
+	resp = do(t, http.MethodPut, base+"/ver/doc", strings.NewReader("second"), nil, http.StatusOK)
+	resp.Body.Close()
+	v2 := resp.Header.Get("x-amz-version-id")
+	if v1 == "" || v2 == "" || v1 == v2 {
+		t.Fatalf("version ids: %q, %q", v1, v2)
+	}
+
+	// Latest and by-version reads.
+	resp = do(t, http.MethodGet, base+"/ver/doc", nil, nil, http.StatusOK)
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "second" || resp.Header.Get("x-amz-version-id") != v2 {
+		t.Fatalf("latest = %q (%s)", body, resp.Header.Get("x-amz-version-id"))
+	}
+	resp = do(t, http.MethodGet, base+"/ver/doc?versionId="+v1, nil, nil, http.StatusOK)
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "first" {
+		t.Fatalf("v1 body = %q", body)
+	}
+
+	// Plain delete inserts a marker; the key reads as absent.
+	resp = do(t, http.MethodDelete, base+"/ver/doc", nil, nil, http.StatusNoContent)
+	resp.Body.Close()
+	markerID := resp.Header.Get("x-amz-version-id")
+	if resp.Header.Get("x-amz-delete-marker") != "true" || markerID == "" {
+		t.Fatalf("marker headers: %+v", resp.Header)
+	}
+	resp = do(t, http.MethodGet, base+"/ver/doc", nil, nil, http.StatusNotFound)
+	resp.Body.Close()
+	if resp.Header.Get("x-amz-delete-marker") != "true" {
+		t.Fatal("404 without delete-marker header")
+	}
+	// Old versions remain readable by id.
+	do(t, http.MethodGet, base+"/ver/doc?versionId="+v2, nil, nil, http.StatusOK).Body.Close()
+
+	// The version listing shows two versions and one marker.
+	resp = do(t, http.MethodGet, base+"/ver?versions", nil, nil, http.StatusOK)
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if c := strings.Count(string(body), "<Version>"); c != 2 {
+		t.Fatalf("versions = %d in %s", c, body)
+	}
+	if c := strings.Count(string(body), "<DeleteMarker>"); c != 1 {
+		t.Fatalf("markers = %d in %s", c, body)
+	}
+
+	// Removing the marker undeletes the key.
+	do(t, http.MethodDelete, base+"/ver/doc?versionId="+markerID, nil, nil, http.StatusNoContent).Body.Close()
+	resp = do(t, http.MethodGet, base+"/ver/doc", nil, nil, http.StatusOK)
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "second" {
+		t.Fatalf("after undelete: %q", body)
+	}
+
+	// Permanently removing the latest promotes the previous version.
+	do(t, http.MethodDelete, base+"/ver/doc?versionId="+v2, nil, nil, http.StatusNoContent).Body.Close()
+	resp = do(t, http.MethodGet, base+"/ver/doc", nil, nil, http.StatusOK)
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "first" {
+		t.Fatalf("after version delete: %q", body)
+	}
+
+	// Suspend: writes take the null version id.
+	cfg = `<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>`
+	do(t, http.MethodPut, base+"/ver?versioning", strings.NewReader(cfg), nil, http.StatusOK).Body.Close()
+	resp = do(t, http.MethodPut, base+"/ver/doc", strings.NewReader("suspended"), nil, http.StatusOK)
+	resp.Body.Close()
+	if got := resp.Header.Get("x-amz-version-id"); got != "" {
+		t.Fatalf("suspended PUT must not return a version id, got %q", got)
+	}
+	// But the write landed as the "null" version.
+	resp = do(t, http.MethodGet, base+"/ver/doc?versionId=null", nil, nil, http.StatusOK)
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "suspended" {
+		t.Fatalf("null version body = %q", body)
+	}
+}
+
 func TestSnapshotAndRestore(t *testing.T) {
 	base := newGateway(t)
 	do(t, http.MethodPut, base+"/chain", nil, nil, http.StatusOK).Body.Close()
@@ -634,8 +734,8 @@ func TestBucketBasics(t *testing.T) {
 	resp.Body.Close()
 
 	do(t, http.MethodPut, base+"/valid-bucket", nil, nil, http.StatusOK).Body.Close()
-	// Duplicate → 409.
-	do(t, http.MethodPut, base+"/valid-bucket", nil, nil, http.StatusConflict).Body.Close()
+	// Re-creating an owned bucket succeeds in us-east-1, as on AWS.
+	do(t, http.MethodPut, base+"/valid-bucket", nil, nil, http.StatusOK).Body.Close()
 	do(t, http.MethodHead, base+"/valid-bucket", nil, nil, http.StatusOK).Body.Close()
 	do(t, http.MethodHead, base+"/missing-bucket", nil, nil, http.StatusNotFound).Body.Close()
 

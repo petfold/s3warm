@@ -97,6 +97,14 @@ type xmlVersion struct {
 	Owner        xmlOwner `xml:"Owner"`
 }
 
+type xmlDeleteMarker struct {
+	Key          string   `xml:"Key"`
+	VersionID    string   `xml:"VersionId"`
+	IsLatest     bool     `xml:"IsLatest"`
+	LastModified string   `xml:"LastModified"`
+	Owner        xmlOwner `xml:"Owner"`
+}
+
 type listVersionsResult struct {
 	XMLName             xml.Name          `xml:"ListVersionsResult"`
 	Xmlns               string            `xml:"xmlns,attr"`
@@ -111,6 +119,7 @@ type listVersionsResult struct {
 	EncodingType        string            `xml:"EncodingType,omitempty"`
 	IsTruncated         bool              `xml:"IsTruncated"`
 	Versions            []xmlVersion      `xml:"Version"`
+	DeleteMarkers       []xmlDeleteMarker `xml:"DeleteMarker"`
 	CommonPrefixes      []xmlCommonPrefix `xml:"CommonPrefixes"`
 }
 
@@ -129,7 +138,8 @@ type locationConstraint struct {
 
 type versioningConfiguration struct {
 	XMLName xml.Name `xml:"VersioningConfiguration"`
-	Xmlns   string   `xml:"xmlns,attr"`
+	Xmlns   string   `xml:"xmlns,attr,omitempty"`
+	Status  string   `xml:"Status,omitempty"`
 }
 
 type initiateMultipartUploadResult struct {
@@ -262,7 +272,8 @@ type deleteRequest struct {
 	XMLName xml.Name `xml:"Delete"`
 	Quiet   bool     `xml:"Quiet"`
 	Objects []struct {
-		Key string `xml:"Key"`
+		Key       string `xml:"Key"`
+		VersionID string `xml:"VersionId"`
 	} `xml:"Object"`
 }
 
@@ -274,7 +285,10 @@ type deleteResult struct {
 }
 
 type deletedEntry struct {
-	Key string `xml:"Key"`
+	Key                   string `xml:"Key"`
+	VersionID             string `xml:"VersionId,omitempty"`
+	DeleteMarker          bool   `xml:"DeleteMarker,omitempty"`
+	DeleteMarkerVersionID string `xml:"DeleteMarkerVersionId,omitempty"`
 }
 
 type deleteError struct {

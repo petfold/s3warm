@@ -16,8 +16,9 @@ type Memory struct {
 }
 
 type memBucket struct {
-	meta      Bucket
-	objects   map[string]Object
+	meta Bucket
+	// objects holds each key's versions newest-first (by VSeq).
+	objects   map[string][]Object
 	snapshots map[string]Snapshot
 }
 
@@ -44,7 +45,7 @@ func (m *Memory) CreateBucket(_ context.Context, b Bucket) error {
 	}
 	m.buckets[b.Name] = &memBucket{
 		meta:      b,
-		objects:   make(map[string]Object),
+		objects:   make(map[string][]Object),
 		snapshots: make(map[string]Snapshot),
 	}
 	return nil
@@ -83,6 +84,17 @@ func (m *Memory) DeleteBucket(_ context.Context, name string) error {
 		return ErrBucketNotEmpty
 	}
 	delete(m.buckets, name)
+	return nil
+}
+
+func (m *Memory) SetBucketVersioning(_ context.Context, bucket, status string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.buckets[bucket]
+	if !ok {
+		return ErrBucketNotFound
+	}
+	b.meta.Versioning = status
 	return nil
 }
 
@@ -169,10 +181,17 @@ func (m *Memory) RestoreBucket(_ context.Context, bucket string, objects []Objec
 	if !ok {
 		return ErrBucketNotFound
 	}
-	b.objects = make(map[string]Object, len(objects))
+	b.objects = make(map[string][]Object, len(objects))
 	for _, o := range objects {
 		o.Bucket = bucket
-		b.objects[o.Key] = o
+		o.IsLatest = true
+		if o.VersionID == "" {
+			o.VersionID = "null"
+		}
+		b.objects[o.Key] = append(b.objects[o.Key], o)
+	}
+	for _, versions := range b.objects {
+		sortVersions(versions)
 	}
 	b.meta.HeadRoot, b.meta.CommitSeq = root, seq
 	return nil
@@ -185,12 +204,35 @@ func (m *Memory) PutObject(_ context.Context, o Object, cond *PutCondition) erro
 	if !ok {
 		return ErrBucketNotFound
 	}
-	cur, exists := b.objects[o.Key]
-	if !cond.Ok(exists, cur.ETag) {
+	versions := b.objects[o.Key]
+	exists := len(versions) > 0 && !versions[0].DeleteMarker
+	etag := ""
+	if exists {
+		etag = versions[0].ETag
+	}
+	if !cond.Ok(exists, etag) {
 		return ErrPreconditionFailed
 	}
-	b.objects[o.Key] = o
+	// Replace any row with the same version id, then insert as latest.
+	kept := versions[:0]
+	for _, v := range versions {
+		if v.VersionID != o.VersionID {
+			v.IsLatest = false
+			kept = append(kept, v)
+		}
+	}
+	o.IsLatest = true
+	b.objects[o.Key] = append([]Object{o}, kept...)
+	sortVersions(b.objects[o.Key])
 	return nil
+}
+
+// sortVersions keeps a key's versions newest-first and IsLatest coherent.
+func sortVersions(versions []Object) {
+	sort.SliceStable(versions, func(i, j int) bool { return versions[i].VSeq > versions[j].VSeq })
+	for i := range versions {
+		versions[i].IsLatest = i == 0
+	}
 }
 
 func (m *Memory) GetObject(_ context.Context, bucket, key string) (*Object, error) {
@@ -200,11 +242,27 @@ func (m *Memory) GetObject(_ context.Context, bucket, key string) (*Object, erro
 	if !ok {
 		return nil, ErrBucketNotFound
 	}
-	o, ok := b.objects[key]
-	if !ok {
+	versions := b.objects[key]
+	if len(versions) == 0 {
 		return nil, ErrObjectNotFound
 	}
+	o := versions[0]
 	return &o, nil
+}
+
+func (m *Memory) GetObjectVersion(_ context.Context, bucket, key, versionID string) (*Object, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	b, ok := m.buckets[bucket]
+	if !ok {
+		return nil, ErrBucketNotFound
+	}
+	for _, v := range b.objects[key] {
+		if v.VersionID == versionID {
+			return &v, nil
+		}
+	}
+	return nil, ErrObjectNotFound
 }
 
 func (m *Memory) DeleteObject(_ context.Context, bucket, key string) error {
@@ -218,6 +276,29 @@ func (m *Memory) DeleteObject(_ context.Context, bucket, key string) error {
 	return nil
 }
 
+func (m *Memory) DeleteVersion(_ context.Context, bucket, key, versionID string) (*Object, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.buckets[bucket]
+	if !ok {
+		return nil, ErrBucketNotFound
+	}
+	versions := b.objects[key]
+	for i, v := range versions {
+		if v.VersionID == versionID {
+			versions = append(versions[:i], versions[i+1:]...)
+			if len(versions) == 0 {
+				delete(b.objects, key)
+			} else {
+				sortVersions(versions)
+				b.objects[key] = versions
+			}
+			return &v, nil
+		}
+	}
+	return nil, ErrObjectNotFound
+}
+
 func (m *Memory) ListObjects(_ context.Context, bucket, prefix, after string, limit int) ([]Object, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -226,8 +307,8 @@ func (m *Memory) ListObjects(_ context.Context, bucket, prefix, after string, li
 		return nil, ErrBucketNotFound
 	}
 	keys := make([]string, 0, len(b.objects))
-	for k := range b.objects {
-		if strings.HasPrefix(k, prefix) && k > after {
+	for k, versions := range b.objects {
+		if strings.HasPrefix(k, prefix) && k > after && !versions[0].DeleteMarker {
 			keys = append(keys, k)
 		}
 	}
@@ -237,7 +318,48 @@ func (m *Memory) ListObjects(_ context.Context, bucket, prefix, after string, li
 	}
 	out := make([]Object, 0, len(keys))
 	for _, k := range keys {
-		out = append(out, b.objects[k])
+		out = append(out, b.objects[k][0])
+	}
+	return out, nil
+}
+
+func (m *Memory) ListVersions(_ context.Context, bucket, prefix, keyMarker, versionMarker string, limit int) ([]Object, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	b, ok := m.buckets[bucket]
+	if !ok {
+		return nil, ErrBucketNotFound
+	}
+	keys := make([]string, 0, len(b.objects))
+	for k := range b.objects {
+		if strings.HasPrefix(k, prefix) && k >= keyMarker {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+
+	var markerVSeq int64 = -1
+	if keyMarker != "" && versionMarker != "" {
+		for _, v := range b.objects[keyMarker] {
+			if v.VersionID == versionMarker {
+				markerVSeq = v.VSeq
+			}
+		}
+	}
+
+	var out []Object
+	for _, k := range keys {
+		for _, v := range b.objects[k] {
+			if k == keyMarker {
+				if versionMarker == "" || markerVSeq < 0 || v.VSeq >= markerVSeq {
+					continue
+				}
+			}
+			out = append(out, v)
+			if limit >= 0 && len(out) == limit {
+				return out, nil
+			}
+		}
 	}
 	return out, nil
 }

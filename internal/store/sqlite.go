@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS buckets (
 	sse        TEXT NOT NULL DEFAULT '',
 	head_root  TEXT NOT NULL DEFAULT '',
 	commit_seq INTEGER NOT NULL DEFAULT 0,
-	cors       TEXT NOT NULL DEFAULT ''
+	cors       TEXT NOT NULL DEFAULT '',
+	versioning TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS snapshots (
 	bucket     TEXT NOT NULL,
@@ -40,6 +41,10 @@ CREATE TABLE IF NOT EXISTS snapshots (
 CREATE TABLE IF NOT EXISTS objects (
 	bucket        TEXT NOT NULL,
 	key           TEXT NOT NULL,
+	version_id    TEXT NOT NULL DEFAULT 'null',
+	vseq          INTEGER NOT NULL DEFAULT 0,
+	is_latest     INTEGER NOT NULL DEFAULT 1,
+	delete_marker INTEGER NOT NULL DEFAULT 0,
 	swarm_ref     TEXT NOT NULL,
 	batch_id      TEXT NOT NULL DEFAULT '',
 	size          INTEGER NOT NULL,
@@ -53,8 +58,9 @@ CREATE TABLE IF NOT EXISTS objects (
 	checksum      TEXT NOT NULL DEFAULT '',
 	content_enc   TEXT NOT NULL DEFAULT '',
 	encrypted     INTEGER NOT NULL DEFAULT 0,
-	PRIMARY KEY (bucket, key)
+	PRIMARY KEY (bucket, key, version_id)
 );
+CREATE INDEX IF NOT EXISTS objects_latest ON objects (bucket, key) WHERE is_latest = 1;
 CREATE TABLE IF NOT EXISTS multipart_uploads (
 	upload_id     TEXT PRIMARY KEY,
 	bucket        TEXT NOT NULL,
@@ -102,13 +108,61 @@ func OpenSQLite(path string) (*SQLite, error) {
 		`ALTER TABLE buckets ADD COLUMN head_root TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE buckets ADD COLUMN commit_seq INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE buckets ADD COLUMN cors TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE buckets ADD COLUMN versioning TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := db.Exec(mig); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			db.Close()
 			return nil, fmt.Errorf("migrating schema: %w", err)
 		}
 	}
+	if err := migrateObjectsToVersioned(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrating objects to versioned schema: %w", err)
+	}
 	return &SQLite{db: db}, nil
+}
+
+// migrateObjectsToVersioned rebuilds a pre-versioning objects table (PK
+// (bucket, key)) into the versioned shape (PK (bucket, key, version_id));
+// existing rows become the "null" latest version. The primary key cannot be
+// altered in place, hence the copy.
+func migrateObjectsToVersioned(db *sql.DB) error {
+	var n int
+	err := db.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info('objects') WHERE name = 'version_id'`).Scan(&n)
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	stmts := []string{
+		`ALTER TABLE objects RENAME TO objects_v1`,
+		`CREATE TABLE objects (
+			bucket TEXT NOT NULL, key TEXT NOT NULL,
+			version_id TEXT NOT NULL DEFAULT 'null', vseq INTEGER NOT NULL DEFAULT 0,
+			is_latest INTEGER NOT NULL DEFAULT 1, delete_marker INTEGER NOT NULL DEFAULT 0,
+			swarm_ref TEXT NOT NULL, batch_id TEXT NOT NULL DEFAULT '',
+			size INTEGER NOT NULL, etag TEXT NOT NULL,
+			content_type TEXT NOT NULL DEFAULT '', storage_class TEXT NOT NULL DEFAULT '',
+			user_meta TEXT NOT NULL DEFAULT 'null', last_modified TEXT NOT NULL,
+			parts TEXT NOT NULL DEFAULT '', checksum_alg TEXT NOT NULL DEFAULT '',
+			checksum TEXT NOT NULL DEFAULT '', content_enc TEXT NOT NULL DEFAULT '',
+			encrypted INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (bucket, key, version_id))`,
+		`INSERT INTO objects
+			(bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted)
+		 SELECT bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted
+		 FROM objects_v1`,
+		`DROP TABLE objects_v1`,
+		`CREATE INDEX IF NOT EXISTS objects_latest ON objects (bucket, key) WHERE is_latest = 1`,
+	}
+	for _, stmt := range stmts {
+		if _, err := db.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *SQLite) Close() error { return s.db.Close() }
@@ -120,9 +174,9 @@ func (s *SQLite) CreateBucket(ctx context.Context, b Bucket) error {
 		b.CreatedAt = time.Now().UTC()
 	}
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO buckets (name, created_at, batch_id, sse, head_root, commit_seq, cors) VALUES (?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO buckets (name, created_at, batch_id, sse, head_root, commit_seq, cors, versioning) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT (name) DO NOTHING`,
-		b.Name, b.CreatedAt.UTC().Format(timeLayout), b.BatchID, b.Encryption, b.HeadRoot, b.CommitSeq, b.CORS)
+		b.Name, b.CreatedAt.UTC().Format(timeLayout), b.BatchID, b.Encryption, b.HeadRoot, b.CommitSeq, b.CORS, b.Versioning)
 	if err != nil {
 		return err
 	}
@@ -134,10 +188,10 @@ func (s *SQLite) CreateBucket(ctx context.Context, b Bucket) error {
 
 func (s *SQLite) GetBucket(ctx context.Context, name string) (*Bucket, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT name, created_at, batch_id, sse, head_root, commit_seq, cors FROM buckets WHERE name = ?`, name)
+		`SELECT name, created_at, batch_id, sse, head_root, commit_seq, cors, versioning FROM buckets WHERE name = ?`, name)
 	var b Bucket
 	var created string
-	if err := row.Scan(&b.Name, &created, &b.BatchID, &b.Encryption, &b.HeadRoot, &b.CommitSeq, &b.CORS); err != nil {
+	if err := row.Scan(&b.Name, &created, &b.BatchID, &b.Encryption, &b.HeadRoot, &b.CommitSeq, &b.CORS, &b.Versioning); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrBucketNotFound
 		}
@@ -149,7 +203,7 @@ func (s *SQLite) GetBucket(ctx context.Context, name string) (*Bucket, error) {
 
 func (s *SQLite) ListBuckets(ctx context.Context) ([]Bucket, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT name, created_at, batch_id, sse, head_root, commit_seq, cors FROM buckets ORDER BY name`)
+		`SELECT name, created_at, batch_id, sse, head_root, commit_seq, cors, versioning FROM buckets ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -158,7 +212,7 @@ func (s *SQLite) ListBuckets(ctx context.Context) ([]Bucket, error) {
 	for rows.Next() {
 		var b Bucket
 		var created string
-		if err := rows.Scan(&b.Name, &created, &b.BatchID, &b.Encryption, &b.HeadRoot, &b.CommitSeq, &b.CORS); err != nil {
+		if err := rows.Scan(&b.Name, &created, &b.BatchID, &b.Encryption, &b.HeadRoot, &b.CommitSeq, &b.CORS, &b.Versioning); err != nil {
 			return nil, err
 		}
 		b.CreatedAt, _ = time.Parse(timeLayout, created)
@@ -198,6 +252,18 @@ func (s *SQLite) DeleteBucket(ctx context.Context, name string) error {
 // SetBucketEncryption sets the bucket-default SSE algorithm.
 func (s *SQLite) SetBucketEncryption(ctx context.Context, bucket, algorithm string) error {
 	res, err := s.db.ExecContext(ctx, `UPDATE buckets SET sse = ? WHERE name = ?`, algorithm, bucket)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return ErrBucketNotFound
+	}
+	return nil
+}
+
+// SetBucketVersioning sets the bucket versioning status.
+func (s *SQLite) SetBucketVersioning(ctx context.Context, bucket, status string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE buckets SET versioning = ? WHERE name = ?`, status, bucket)
 	if err != nil {
 		return err
 	}
@@ -320,11 +386,15 @@ func (s *SQLite) RestoreBucket(ctx context.Context, bucket string, objects []Obj
 			}
 			parts = string(b)
 		}
+		if o.VersionID == "" {
+			o.VersionID = "null"
+		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO objects
-			 (bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			o.Bucket, o.Key, o.SwarmRef, o.BatchID, o.Size, o.ETag, o.ContentType,
+			 (bucket, key, version_id, vseq, is_latest, delete_marker, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted)
+			 VALUES (?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			o.Bucket, o.Key, o.VersionID, o.VSeq,
+			o.SwarmRef, o.BatchID, o.Size, o.ETag, o.ContentType,
 			o.StorageClass, string(meta), o.LastModified.UTC().Format(timeLayout), parts,
 			o.ChecksumAlgorithm, o.Checksum, o.ContentEncoding, o.Encrypted); err != nil {
 			return err
@@ -354,9 +424,11 @@ func (s *SQLite) PutObject(ctx context.Context, o Object, cond *PutCondition) er
 	}
 	if cond != nil {
 		var etag string
+		var marker bool
 		err := tx.QueryRowContext(ctx,
-			`SELECT etag FROM objects WHERE bucket = ? AND key = ?`, o.Bucket, o.Key).Scan(&etag)
-		exists := err == nil
+			`SELECT etag, delete_marker FROM objects WHERE bucket = ? AND key = ? AND is_latest = 1`,
+			o.Bucket, o.Key).Scan(&etag, &marker)
+		exists := err == nil && !marker
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
@@ -372,24 +444,147 @@ func (s *SQLite) PutObject(ctx context.Context, o Object, cond *PutCondition) er
 		}
 		parts = string(b)
 	}
+	if o.VersionID == "" {
+		o.VersionID = "null"
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE objects SET is_latest = 0 WHERE bucket = ? AND key = ? AND is_latest = 1`,
+		o.Bucket, o.Key); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT OR REPLACE INTO objects
-		 (bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		o.Bucket, o.Key, o.SwarmRef, o.BatchID, o.Size, o.ETag, o.ContentType,
+		 (bucket, key, version_id, vseq, is_latest, delete_marker, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted)
+		 VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		o.Bucket, o.Key, o.VersionID, o.VSeq, o.DeleteMarker,
+		o.SwarmRef, o.BatchID, o.Size, o.ETag, o.ContentType,
 		o.StorageClass, string(meta), o.LastModified.UTC().Format(timeLayout), parts,
 		o.ChecksumAlgorithm, o.Checksum, o.ContentEncoding, o.Encrypted); err != nil {
+		return err
+	}
+	// A same-version replace (suspended "null" overwrites) may have removed
+	// the previous latest row entirely; promote the newest survivor.
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE objects SET is_latest = 1 WHERE bucket = ?1 AND key = ?2 AND vseq =
+		   (SELECT MAX(vseq) FROM objects WHERE bucket = ?1 AND key = ?2)`,
+		o.Bucket, o.Key); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-const objectColumns = `bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted`
+func (s *SQLite) GetObjectVersion(ctx context.Context, bucket, key, versionID string) (*Object, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT `+objectColumns+` FROM objects WHERE bucket = ? AND key = ? AND version_id = ?`,
+		bucket, key, versionID)
+	o, err := scanObject(row)
+	if err == nil {
+		return o, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	if _, berr := s.GetBucket(ctx, bucket); berr != nil {
+		return nil, berr
+	}
+	return nil, ErrObjectNotFound
+}
+
+func (s *SQLite) DeleteVersion(ctx context.Context, bucket, key, versionID string) (*Object, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after commit
+
+	row := tx.QueryRowContext(ctx,
+		`SELECT `+objectColumns+` FROM objects WHERE bucket = ? AND key = ? AND version_id = ?`,
+		bucket, key, versionID)
+	o, err := scanObject(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			if _, berr := s.GetBucket(ctx, bucket); berr != nil {
+				return nil, berr
+			}
+			return nil, ErrObjectNotFound
+		}
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM objects WHERE bucket = ? AND key = ? AND version_id = ?`,
+		bucket, key, versionID); err != nil {
+		return nil, err
+	}
+	if o.IsLatest {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE objects SET is_latest = 1 WHERE bucket = ?1 AND key = ?2 AND vseq =
+			   (SELECT MAX(vseq) FROM objects WHERE bucket = ?1 AND key = ?2)`,
+			bucket, key); err != nil {
+			return nil, err
+		}
+	}
+	return o, tx.Commit()
+}
+
+func (s *SQLite) ListVersions(ctx context.Context, bucket, prefix, keyMarker, versionMarker string, limit int) ([]Object, error) {
+	if _, err := s.GetBucket(ctx, bucket); err != nil {
+		return nil, err
+	}
+	end := prefixEnd(prefix)
+	q := `SELECT ` + objectColumns + ` FROM objects WHERE bucket = ? AND key >= ?`
+	args := []any{bucket, prefix}
+	if end != "" {
+		q += ` AND key < ?`
+		args = append(args, end)
+	}
+	if keyMarker != "" {
+		markerVSeq := int64(-1)
+		if versionMarker != "" {
+			// Position strictly after that version of keyMarker.
+			err := s.db.QueryRowContext(ctx,
+				`SELECT vseq FROM objects WHERE bucket = ? AND key = ? AND version_id = ?`,
+				bucket, keyMarker, versionMarker).Scan(&markerVSeq)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return nil, err
+			}
+		}
+		if versionMarker != "" && markerVSeq >= 0 {
+			q += ` AND (key > ? OR (key = ? AND vseq < ?))`
+			args = append(args, keyMarker, keyMarker, markerVSeq)
+		} else {
+			q += ` AND key > ?`
+			args = append(args, keyMarker)
+		}
+	}
+	if limit < 0 {
+		limit = -1
+	}
+	q += ` ORDER BY key ASC, vseq DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Object
+	for rows.Next() {
+		o, err := scanObject(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *o)
+	}
+	return out, rows.Err()
+}
+
+const objectColumns = `bucket, key, version_id, vseq, is_latest, delete_marker, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted`
 
 func scanObject(row interface{ Scan(...any) error }) (*Object, error) {
 	var o Object
 	var meta, modified, parts string
-	if err := row.Scan(&o.Bucket, &o.Key, &o.SwarmRef, &o.BatchID, &o.Size, &o.ETag,
+	if err := row.Scan(&o.Bucket, &o.Key, &o.VersionID, &o.VSeq, &o.IsLatest, &o.DeleteMarker,
+		&o.SwarmRef, &o.BatchID, &o.Size, &o.ETag,
 		&o.ContentType, &o.StorageClass, &meta, &modified, &parts,
 		&o.ChecksumAlgorithm, &o.Checksum, &o.ContentEncoding, &o.Encrypted); err != nil {
 		return nil, err
@@ -404,7 +599,7 @@ func scanObject(row interface{ Scan(...any) error }) (*Object, error) {
 
 func (s *SQLite) GetObject(ctx context.Context, bucket, key string) (*Object, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT `+objectColumns+` FROM objects WHERE bucket = ? AND key = ?`, bucket, key)
+		`SELECT `+objectColumns+` FROM objects WHERE bucket = ? AND key = ? AND is_latest = 1`, bucket, key)
 	o, err := scanObject(row)
 	if err == nil {
 		return o, nil
@@ -436,7 +631,7 @@ func (s *SQLite) ListObjects(ctx context.Context, bucket, prefix, after string, 
 	// and the range bound compose correctly.
 	end := prefixEnd(prefix)
 	q := `SELECT ` + objectColumns + ` FROM objects
-	      WHERE bucket = ? AND key > ? AND key >= ?`
+	      WHERE bucket = ? AND is_latest = 1 AND delete_marker = 0 AND key > ? AND key >= ?`
 	args := []any{bucket, after, prefix}
 	if end != "" {
 		q += ` AND key < ?`

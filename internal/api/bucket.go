@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/xml"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -60,8 +61,11 @@ func (s *Server) handleCreateBucket(w http.ResponseWriter, r *http.Request, buck
 		BatchID:   r.Header.Get("x-swarm-postage-batch-id"),
 	})
 	if err != nil {
-		s.writeError(w, r, storeError(err))
-		return
+		// In us-east-1, re-creating a bucket you own succeeds, as on AWS.
+		if !(errors.Is(err, store.ErrBucketExists) && s.cfg.Region == "us-east-1") {
+			s.writeError(w, r, storeError(err))
+			return
+		}
 	}
 	w.Header().Set("Location", "/"+bucket)
 	w.WriteHeader(http.StatusOK)
@@ -151,11 +155,11 @@ func (s *Server) handleDeleteBucketEncryption(w http.ResponseWriter, r *http.Req
 }
 
 func (s *Server) handleGetBucketVersioning(w http.ResponseWriter, r *http.Request, bucket string) {
-	if _, err := s.store.GetBucket(r.Context(), bucket); err != nil {
+	b, err := s.store.GetBucket(r.Context(), bucket)
+	if err != nil {
 		s.writeError(w, r, storeError(err))
 		return
 	}
-	// Versioning is planned for phase 3; an empty configuration means
-	// "never enabled", which is accurate today.
-	writeXML(w, http.StatusOK, versioningConfiguration{Xmlns: s3Xmlns})
+	// Never-versioned buckets return the empty configuration, as on S3.
+	writeXML(w, http.StatusOK, versioningConfiguration{Xmlns: s3Xmlns, Status: b.Versioning})
 }

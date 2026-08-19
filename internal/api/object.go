@@ -37,7 +37,7 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 	if im, inm := r.Header.Get("If-Match"), r.Header.Get("If-None-Match"); im != "" || inm != "" {
 		cond = &store.PutCondition{IfMatch: trimETag(im), IfNoneMatch: trimETag(inm)}
 		cur, err := s.store.GetObject(ctx, bucket, key)
-		exists := err == nil
+		exists := err == nil && !cur.DeleteMarker
 		var curETag string
 		if exists {
 			curETag = cur.ETag
@@ -91,12 +91,14 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 		Checksum:          res.Checksum,
 		Encrypted:         encrypt,
 	}
+	versionHeader := stampVersion(&obj, b.Versioning)
 	// On a precondition race the object is not indexed; the stray stamped
 	// bytes simply expire (design §6).
 	if err := s.store.PutObject(ctx, obj, cond); err != nil {
 		s.writeError(w, r, storeError(err))
 		return
 	}
+	setVersionHeader(w.Header(), versionHeader)
 
 	if res.Ref != "" && !encrypt {
 		// For encrypted objects the 64-byte reference embeds the decryption
@@ -337,13 +339,49 @@ func (s *Server) handleGetObject(w http.ResponseWriter, r *http.Request, bucket,
 		s.writeError(w, r, storeError(err))
 		return
 	}
-	obj, err := s.store.GetObject(ctx, bucket, key)
-	if err != nil {
-		s.writeError(w, r, storeError(err))
-		return
+	h := w.Header()
+	var obj *store.Object
+	var err error
+	if vid := r.URL.Query().Get("versionId"); vid != "" {
+		obj, err = s.store.GetObjectVersion(ctx, bucket, key, vid)
+		if err != nil {
+			if errors.Is(err, store.ErrObjectNotFound) {
+				s.writeError(w, r, errNoSuchVersion)
+				return
+			}
+			s.writeError(w, r, storeError(err))
+			return
+		}
+		if obj.DeleteMarker {
+			// A delete marker's version can be addressed but not retrieved.
+			h.Set("x-amz-delete-marker", "true")
+			setVersionHeader(h, obj.VersionID)
+			s.writeError(w, r, errMethodNotAllowed)
+			return
+		}
+	} else {
+		obj, err = s.store.GetObject(ctx, bucket, key)
+		if err != nil {
+			if errors.Is(err, store.ErrObjectNotFound) {
+				// AWS stamps plain 404s too, distinguishing "gone" from
+				// "shadowed by a delete marker".
+				h.Set("x-amz-delete-marker", "false")
+			}
+			s.writeError(w, r, storeError(err))
+			return
+		}
+		if obj.DeleteMarker {
+			// The latest version is a delete marker: the key reads as absent.
+			h.Set("x-amz-delete-marker", "true")
+			setVersionHeader(h, obj.VersionID)
+			s.writeError(w, r, errNoSuchKey)
+			return
+		}
+	}
+	if obj.VersionID != nullVersion {
+		setVersionHeader(h, obj.VersionID)
 	}
 
-	h := w.Header()
 	h.Set("ETag", `"`+obj.ETag+`"`)
 	h.Set("Last-Modified", obj.LastModified.UTC().Format(http.TimeFormat))
 
@@ -438,23 +476,69 @@ func (s *Server) handleGetObject(w http.ResponseWriter, r *http.Request, bucket,
 
 func (s *Server) handleDeleteObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	ctx := r.Context()
-	if _, err := s.store.GetBucket(ctx, bucket); err != nil {
+	b, err := s.store.GetBucket(ctx, bucket)
+	if err != nil {
 		s.writeError(w, r, storeError(err))
 		return
 	}
-	// Deleting an absent key succeeds, as in S3. The bytes on Swarm expire
-	// with their postage batch (design §6).
-	if err := s.store.DeleteObject(ctx, bucket, key); err != nil && !errors.Is(err, store.ErrObjectNotFound) {
-		s.writeError(w, r, storeError(err))
+	marker, versionID, apiErr := s.deleteOne(ctx, b, key, r.URL.Query().Get("versionId"))
+	if apiErr != nil {
+		s.writeError(w, r, *apiErr)
 		return
 	}
+	if marker {
+		w.Header().Set("x-amz-delete-marker", "true")
+	}
+	setVersionHeader(w.Header(), versionID)
 	w.WriteHeader(http.StatusNoContent)
 	s.commits.Notify(bucket)
 }
 
+// deleteOne implements S3 delete semantics for one key (design §11):
+// a versionId permanently removes that version; otherwise versioned buckets
+// get a delete marker while never-versioned keys are simply removed.
+// Returns whether a delete marker was involved and the version id to expose.
+func (s *Server) deleteOne(ctx context.Context, b *store.Bucket, key, versionID string) (marker bool, exposed string, apiErr *apiError) {
+	if versionID != "" {
+		removed, err := s.store.DeleteVersion(ctx, b.Name, key, versionID)
+		if err != nil {
+			if errors.Is(err, store.ErrObjectNotFound) {
+				return false, versionID, nil // idempotent, as on S3
+			}
+			e := storeError(err)
+			return false, "", &e
+		}
+		return removed.DeleteMarker, versionID, nil
+	}
+	switch b.Versioning {
+	case "Enabled", "Suspended":
+		dm := store.Object{
+			Bucket:       b.Name,
+			Key:          key,
+			DeleteMarker: true,
+			LastModified: time.Now().UTC(),
+		}
+		stampVersion(&dm, b.Versioning)
+		if err := s.store.PutObject(ctx, dm, nil); err != nil {
+			e := storeError(err)
+			return false, "", &e
+		}
+		return true, dm.VersionID, nil
+	default:
+		// Deleting an absent key succeeds, as in S3. The bytes on Swarm
+		// expire with their postage batch (design §6).
+		if err := s.store.DeleteObject(ctx, b.Name, key); err != nil && !errors.Is(err, store.ErrObjectNotFound) {
+			e := storeError(err)
+			return false, "", &e
+		}
+		return false, "", nil
+	}
+}
+
 func (s *Server) handleDeleteObjects(w http.ResponseWriter, r *http.Request, bucket string) {
 	ctx := r.Context()
-	if _, err := s.store.GetBucket(ctx, bucket); err != nil {
+	b, err := s.store.GetBucket(ctx, bucket)
+	if err != nil {
 		s.writeError(w, r, storeError(err))
 		return
 	}
@@ -475,12 +559,18 @@ func (s *Server) handleDeleteObjects(w http.ResponseWriter, r *http.Request, buc
 
 	result := deleteResult{Xmlns: s3Xmlns}
 	for _, o := range req.Objects {
-		if err := s.store.DeleteObject(ctx, bucket, o.Key); err != nil && !errors.Is(err, store.ErrObjectNotFound) {
-			result.Errors = append(result.Errors, deleteError{Key: o.Key, Code: "InternalError", Message: err.Error()})
+		marker, versionID, apiErr := s.deleteOne(ctx, b, o.Key, o.VersionID)
+		if apiErr != nil {
+			result.Errors = append(result.Errors, deleteError{Key: o.Key, Code: apiErr.Code, Message: apiErr.Message})
 			continue
 		}
 		if !req.Quiet {
-			result.Deleted = append(result.Deleted, deletedEntry{Key: o.Key})
+			entry := deletedEntry{Key: o.Key, VersionID: o.VersionID}
+			if marker {
+				entry.DeleteMarker = true
+				entry.DeleteMarkerVersionID = versionID
+			}
+			result.Deleted = append(result.Deleted, entry)
 		}
 	}
 	writeXML(w, http.StatusOK, result)
@@ -489,22 +579,14 @@ func (s *Server) handleDeleteObjects(w http.ResponseWriter, r *http.Request, buc
 
 func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	ctx := r.Context()
-	if strings.Contains(r.Header.Get("x-amz-copy-source"), "?versionId=") {
-		s.notImplemented(w, r, "CopyObject with versionId")
-		return
-	}
-	srcBucket, srcKey, apiErr := parseCopySource(r)
-	if apiErr != nil {
-		s.writeError(w, r, *apiErr)
-		return
-	}
-	if _, err := s.store.GetBucket(ctx, bucket); err != nil {
-		s.writeError(w, r, storeError(err))
-		return
-	}
-	srcObj, err := s.store.GetObject(ctx, srcBucket, srcKey)
+	b, err := s.store.GetBucket(ctx, bucket)
 	if err != nil {
 		s.writeError(w, r, storeError(err))
+		return
+	}
+	srcObj, apiErr := s.getCopySource(r)
+	if apiErr != nil {
+		s.writeError(w, r, *apiErr)
 		return
 	}
 	if !copySourceConditionals(r, srcObj) {
@@ -516,7 +598,7 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, bucket
 	if directive == "" {
 		directive = "COPY"
 	}
-	if srcBucket == bucket && srcKey == key && directive != "REPLACE" {
+	if srcObj.Bucket == bucket && srcObj.Key == key && directive != "REPLACE" && b.Versioning != "Enabled" {
 		s.writeError(w, r, errInvalidRequest.withMessage(
 			"this copy request is illegal because it is trying to copy an object to itself without changing the object's metadata"))
 		return
@@ -534,10 +616,15 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, bucket
 			obj.StorageClass = storageClassOf(sc)
 		}
 	}
+	versionHeader := stampVersion(&obj, b.Versioning)
 	if err := s.store.PutObject(ctx, obj, nil); err != nil {
 		s.writeError(w, r, storeError(err))
 		return
 	}
+	if srcObj.VersionID != nullVersion {
+		w.Header().Set("x-amz-copy-source-version-id", srcObj.VersionID)
+	}
+	setVersionHeader(w.Header(), versionHeader)
 	writeXML(w, http.StatusOK, copyObjectResult{
 		Xmlns:        s3Xmlns,
 		LastModified: xmlTime(obj.LastModified),
@@ -580,10 +667,29 @@ func (s *Server) handleGetObjectAttributes(w http.ResponseWriter, r *http.Reques
 		s.writeError(w, r, storeError(err))
 		return
 	}
-	obj, err := s.store.GetObject(ctx, bucket, key)
+	var obj *store.Object
+	var err error
+	if vid := r.URL.Query().Get("versionId"); vid != "" {
+		obj, err = s.store.GetObjectVersion(ctx, bucket, key, vid)
+		if errors.Is(err, store.ErrObjectNotFound) {
+			s.writeError(w, r, errNoSuchVersion)
+			return
+		}
+	} else {
+		obj, err = s.store.GetObject(ctx, bucket, key)
+	}
 	if err != nil {
 		s.writeError(w, r, storeError(err))
 		return
+	}
+	if obj.DeleteMarker {
+		w.Header().Set("x-amz-delete-marker", "true")
+		setVersionHeader(w.Header(), obj.VersionID)
+		s.writeError(w, r, errNoSuchKey)
+		return
+	}
+	if obj.VersionID != nullVersion {
+		setVersionHeader(w.Header(), obj.VersionID)
 	}
 
 	requested := map[string]bool{}

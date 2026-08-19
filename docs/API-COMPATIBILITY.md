@@ -21,9 +21,8 @@ Design rationale: [`DESIGN.md`](DESIGN.md).
 | GetBucketLocation | ✅ | Returns configured region |
 | ListObjectsV2 | ✅ | prefix, delimiter, max-keys, continuation-token, start-after, encoding-type |
 | ListObjects (V1) | ✅ | marker/NextMarker semantics |
-| GetBucketVersioning | 🪧 | Empty config (unversioned) until P3 |
-| PutBucketVersioning | 🎯 P3 | |
-| ListObjectVersions | ✅ / 🎯 P3 | Unversioned (null-version) semantics served now, as S3 does for never-versioned buckets; real version history is P3 |
+| Get/PutBucketVersioning | ✅ | Enabled/Suspended; never-versioned buckets return the empty config |
+| ListObjectVersions | ✅ | Real version history: `Version` + `DeleteMarker` entries, newest-first per key, key/version-id-marker pagination, delimiter roll-up |
 | GetBucketAcl / PutBucketAcl | 🎯 P3 | Grants map to the bucket's ACT grantee list (grantee = Ethereum public key, design §8); canned `private` until then |
 | GetBucketPolicy / PutBucketPolicy | 🎯 P3 | Grant-subset only, not full IAM policy language |
 | Get/Put/DeleteBucketCors | ✅ | Per-bucket rules with S3 wildcard-origin matching; preflights and response decoration handled before auth |
@@ -40,11 +39,11 @@ Design rationale: [`DESIGN.md`](DESIGN.md).
 | Operation | Status | Notes |
 |---|---|---|
 | PutObject | ✅ | Streaming; MD5 ETag; `Content-MD5` + `x-amz-content-sha256` enforced; `x-amz-meta-*`; zero-byte objects; `x-swarm-reference` response header |
-| GetObject | ✅ | Range pass-through; conditional headers; composite (multipart) objects stitched from parts, including ranges across part boundaries |
+| GetObject | ✅ | Range pass-through; conditional headers; composite (multipart) objects stitched from parts, including ranges across part boundaries; `?versionId` (a delete-marker version answers 405, a marker-shadowed key 404 + `x-amz-delete-marker`) |
 | HeadObject | ✅ | |
-| DeleteObject | ✅ | Index removal; bytes expire with the postage batch |
-| DeleteObjects (batch) | ✅ | Quiet mode supported |
-| CopyObject | ✅ | O(1) — same Swarm reference; `x-amz-metadata-directive` COPY/REPLACE; `x-amz-copy-source-if-*` conditionals; `?versionId` source 🎯 P3 |
+| DeleteObject | ✅ | Versioned buckets get delete markers; `?versionId` removes one version permanently (latest promotion included); never-versioned keys are removed — bytes expire with the postage batch either way |
+| DeleteObjects (batch) | ✅ | Quiet mode; per-entry `VersionId`, marker info in results |
+| CopyObject | ✅ | O(1) — same Swarm reference; `x-amz-metadata-directive` COPY/REPLACE; `x-amz-copy-source-if-*` conditionals; `?versionId` sources with `x-amz-copy-source-version-id` |
 | CreateMultipartUpload | ✅ | Metadata/content-type/storage-class captured; batch validated at initiate |
 | UploadPart | ✅ | Parts stream straight to `/bytes`, no staging; 1–10000, integrity headers enforced |
 | UploadPartCopy | ✅ | Whole-object simple source is O(1) (same reference); byte-range re-streams; composite source 🎯 |

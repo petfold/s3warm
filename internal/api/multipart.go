@@ -132,14 +132,9 @@ func (s *Server) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, bu
 		return
 	}
 
-	srcBucket, srcKey, apiErr := parseCopySource(r)
+	srcObj, apiErr := s.getCopySource(r)
 	if apiErr != nil {
 		s.writeError(w, r, *apiErr)
-		return
-	}
-	srcObj, err := s.store.GetObject(ctx, srcBucket, srcKey)
-	if err != nil {
-		s.writeError(w, r, storeError(err))
 		return
 	}
 	if !copySourceConditionals(r, srcObj) {
@@ -199,6 +194,11 @@ func (s *Server) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, bu
 
 func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	ctx := r.Context()
+	b, err := s.store.GetBucket(ctx, bucket)
+	if err != nil {
+		s.writeError(w, r, storeError(err))
+		return
+	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
 	if err != nil {
 		s.writeError(w, r, errInternal.withMessage(err.Error()))
@@ -275,6 +275,7 @@ func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Re
 		Parts:        parts,
 		Encrypted:    upload.Encrypted,
 	}
+	versionHeader := stampVersion(&obj, b.Versioning)
 	// Conditional completion, same semantics as conditional PUT (design §10).
 	var cond *store.PutCondition
 	if im, inm := r.Header.Get("If-Match"), r.Header.Get("If-None-Match"); im != "" || inm != "" {
@@ -284,6 +285,7 @@ func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Re
 		s.writeError(w, r, storeError(err))
 		return
 	}
+	setVersionHeader(w.Header(), versionHeader)
 	// Bookkeeping only: parts not referenced by the completed object simply
 	// expire with their stamps (design §7).
 	if err := s.store.DeleteMultipartUpload(ctx, upload.UploadID); err != nil {
@@ -458,19 +460,54 @@ func parsePartNumber(r *http.Request) (int, *apiError) {
 	return n, nil
 }
 
-// parseCopySource extracts (bucket, key) from x-amz-copy-source.
-func parseCopySource(r *http.Request) (string, string, *apiError) {
-	unescaped, err := url.PathUnescape(r.Header.Get("x-amz-copy-source"))
+// parseCopySource extracts (bucket, key, versionId) from x-amz-copy-source.
+func parseCopySource(r *http.Request) (string, string, string, *apiError) {
+	src := r.Header.Get("x-amz-copy-source")
+	src, versionID, _ := strings.Cut(src, "?versionId=")
+	unescaped, err := url.PathUnescape(src)
 	if err != nil {
 		e := errInvalidArgument.withMessage("invalid x-amz-copy-source")
-		return "", "", &e
+		return "", "", "", &e
 	}
 	srcBucket, srcKey, ok := strings.Cut(strings.TrimPrefix(unescaped, "/"), "/")
 	if !ok || srcKey == "" {
 		e := errInvalidArgument.withMessage("x-amz-copy-source must be of the form bucket/key")
-		return "", "", &e
+		return "", "", "", &e
 	}
-	return srcBucket, srcKey, nil
+	return srcBucket, srcKey, versionID, nil
+}
+
+// getCopySource resolves a copy source, honoring versionId and treating a
+// delete-marker latest as absent.
+func (s *Server) getCopySource(r *http.Request) (*store.Object, *apiError) {
+	srcBucket, srcKey, versionID, apiErr := parseCopySource(r)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	ctx := r.Context()
+	if versionID != "" {
+		obj, err := s.store.GetObjectVersion(ctx, srcBucket, srcKey, versionID)
+		if err != nil {
+			if errors.Is(err, store.ErrObjectNotFound) {
+				return nil, &errNoSuchVersion
+			}
+			e := storeError(err)
+			return nil, &e
+		}
+		if obj.DeleteMarker {
+			return nil, &errNoSuchKey
+		}
+		return obj, nil
+	}
+	obj, err := s.store.GetObject(ctx, srcBucket, srcKey)
+	if err != nil {
+		e := storeError(err)
+		return nil, &e
+	}
+	if obj.DeleteMarker {
+		return nil, &errNoSuchKey
+	}
+	return obj, nil
 }
 
 // uploadOptions builds Bee upload options for a known-length stream.
