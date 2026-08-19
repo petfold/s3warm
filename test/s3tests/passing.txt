@@ -213,6 +213,12 @@ s3tests/functional/test_s3.py::test_object_put_authenticated
 s3tests/functional/test_s3.py::test_object_raw_authenticated
 s3tests/functional/test_s3.py::test_object_raw_authenticated_bucket_gone
 s3tests/functional/test_s3.py::test_object_raw_authenticated_object_gone
+s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_not_expired
+s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_out_max_range
+s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_out_positive_range
+s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_out_range_zero
+s3tests/functional/test_s3.py::test_object_raw_put_authenticated_expired
+s3tests/functional/test_s3.py::test_object_raw_response_headers
 s3tests/functional/test_s3.py::test_object_read_not_exist
 s3tests/functional/test_s3.py::test_object_requestid_matches_header_on_error
 s3tests/functional/test_s3.py::test_object_set_get_metadata_none_to_empty
