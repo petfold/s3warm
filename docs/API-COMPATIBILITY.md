@@ -64,8 +64,8 @@ Design rationale: [`DESIGN.md`](DESIGN.md).
 |---|---|---|
 | SigV4, Authorization header | ✅ | AWS doc test vectors in unit tests; any region label accepted (service must be `s3`) |
 | SigV4 presigned URLs | ✅ | Query-string auth with `UNSIGNED-PAYLOAD`; expiry enforced (out-of-range `X-Amz-Expires` is 403, as on AWS); AWS doc vector in unit tests |
-| `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` (aws-chunked) | 🎯 P2 | Required by Java SDK v2 defaults |
-| Trailing checksums (`x-amz-checksum-*`) | 🎯 P2 | |
+| `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` (aws-chunked) | ✅ | Chunk-signature chain + signed trailers verified; `STREAMING-UNSIGNED-PAYLOAD-TRAILER` too |
+| Flexible checksums (`x-amz-checksum-*`) | ✅ | CRC32/CRC32C/CRC64NVME/SHA-1/SHA-256 via header or trailer; stored, echoed on PUT and on GET/HEAD with checksum mode (full responses only); multipart composite/FULL_OBJECT checksums 🎯 |
 | SigV2 | ❌ | Legacy |
 | Anonymous mode | ✅ | Explicit opt-in, dev only |
 

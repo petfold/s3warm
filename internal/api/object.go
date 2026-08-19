@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/petfold/s3warm/internal/auth"
 	"github.com/petfold/s3warm/internal/bee"
 	"github.com/petfold/s3warm/internal/metrics"
 	"github.com/petfold/s3warm/internal/store"
@@ -69,16 +70,19 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 	}
 
 	obj := store.Object{
-		Bucket:       bucket,
-		Key:          key,
-		SwarmRef:     res.Ref,
-		BatchID:      batch,
-		Size:         res.Size,
-		ETag:         res.ETag,
-		ContentType:  r.Header.Get("Content-Type"),
-		StorageClass: storageClassOf(r.Header.Get("x-amz-storage-class")),
-		UserMetadata: userMetadata(r.Header),
-		LastModified: time.Now().UTC(),
+		Bucket:            bucket,
+		Key:               key,
+		SwarmRef:          res.Ref,
+		BatchID:           batch,
+		Size:              res.Size,
+		ETag:              res.ETag,
+		ContentType:       r.Header.Get("Content-Type"),
+		ContentEncoding:   storedContentEncoding(r.Header.Get("Content-Encoding")),
+		StorageClass:      storageClassOf(r.Header.Get("x-amz-storage-class")),
+		UserMetadata:      userMetadata(r.Header),
+		LastModified:      time.Now().UTC(),
+		ChecksumAlgorithm: res.ChecksumAlgorithm,
+		Checksum:          res.Checksum,
 	}
 	// On a precondition race the object is not indexed; the stray stamped
 	// bytes simply expire (design §6).
@@ -93,6 +97,9 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 		w.Header().Set("x-swarm-reference", res.Ref)
 	}
 	s.setBatchHeaders(ctx, w.Header(), batch)
+	if res.Checksum != "" {
+		w.Header().Set("x-amz-checksum-"+strings.ToLower(res.ChecksumAlgorithm), res.Checksum)
+	}
 	w.Header().Set("ETag", `"`+res.ETag+`"`)
 	w.WriteHeader(http.StatusOK)
 	metrics.ObjectBytesIn.Add(float64(res.Size))
@@ -112,42 +119,103 @@ func (s *Server) resolveBatch(r *http.Request, b *store.Bucket) string {
 
 // uploadResult is the outcome of streaming a request body to Swarm.
 type uploadResult struct {
-	Ref  string // empty for zero-byte bodies
-	Size int64
-	ETag string // hex MD5, unquoted
+	Ref               string // empty for zero-byte bodies
+	Size              int64
+	ETag              string // hex MD5, unquoted
+	ChecksumAlgorithm string // uppercase, when a flexible checksum was requested
+	Checksum          string // base64
 }
 
 // uploadBody streams r's body to Bee while hashing — MD5 for the S3 ETag,
-// SHA-256 to enforce the signed x-amz-content-sha256 — and verifies
-// Content-MD5. Zero-byte bodies are not uploaded (MD5 of the empty payload
-// still applies). On error nothing is indexed by the caller; stray stamped
-// bytes expire with their batch (design §6).
+// SHA-256 to enforce the signed x-amz-content-sha256, plus any requested
+// flexible checksum — decoding and verifying aws-chunked framing (signed
+// chunks and trailers) on the way. Zero-byte bodies are not uploaded. On
+// error nothing is indexed by the caller; stray stamped bytes expire with
+// their batch (design §6).
 func (s *Server) uploadBody(r *http.Request, batch, storageClass string) (*uploadResult, *apiError) {
 	md5h := md5.New()
 	writers := []io.Writer{md5h}
-	expectedSHA := strings.ToLower(r.Header.Get("X-Amz-Content-Sha256"))
+	rawSHA := r.Header.Get("X-Amz-Content-Sha256")
+	expectedSHA := strings.ToLower(rawSHA)
 	var sha hash.Hash
 	if len(expectedSHA) == 64 {
 		sha = sha256.New()
 		writers = append(writers, sha)
 	}
-	body := &countingReader{r: io.TeeReader(r.Body, io.MultiWriter(writers...))}
+
+	ck, apiErr := parseChecksumRequest(r.Header)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	var ckHash hash.Hash
+	if ck != nil {
+		ckHash = checksumAlgorithms[ck.alg]()
+		writers = append(writers, ckHash)
+	}
+
+	body := io.Reader(r.Body)
+	length := r.ContentLength
+	var chunked *auth.ChunkedReader
+	if isAwsChunked(r) {
+		var sc *auth.StreamContext
+		if id := identityFrom(r.Context()); id != nil {
+			sc = id.Stream
+		}
+		if strings.HasPrefix(rawSHA, "STREAMING-AWS4-HMAC-SHA256") && sc == nil {
+			e := errInvalidRequest.withMessage("signed streaming payload requires SigV4 authentication")
+			return nil, &e
+		}
+		chunked = auth.NewChunkedReader(r.Body, sc)
+		body = chunked
+		length = -1
+		if dcl := r.Header.Get("x-amz-decoded-content-length"); dcl != "" {
+			if n, err := strconv.ParseInt(dcl, 10, 64); err == nil {
+				length = n
+			}
+		}
+	}
+	counted := &countingReader{r: io.TeeReader(body, io.MultiWriter(writers...))}
+
+	chunkedErr := func() *apiError {
+		if chunked == nil || chunked.Err() == nil {
+			return nil
+		}
+		if errors.Is(chunked.Err(), auth.ErrChunkSignature) {
+			return &apiError{"SignatureDoesNotMatch", http.StatusForbidden, chunked.Err().Error()}
+		}
+		e := errInvalidRequest.withMessage(chunked.Err().Error())
+		return &e
+	}
 
 	var ref string
-	if r.ContentLength != 0 {
+	if length != 0 {
 		var err error
-		ref, err = s.bee.UploadBytes(r.Context(), body, bee.UploadOptions{
+		ref, err = s.bee.UploadBytes(r.Context(), counted, bee.UploadOptions{
 			BatchID:         batch,
 			Encrypt:         s.cfg.Encrypt,
 			RedundancyLevel: s.redundancyFor(storageClass),
 			Deferred:        s.cfg.Ack != "network",
-			ContentLength:   r.ContentLength,
+			ContentLength:   length,
 		})
 		if err != nil {
+			if e := chunkedErr(); e != nil {
+				return nil, e
+			}
 			e := beeError(err)
 			return nil, &e
 		}
+	} else if chunked != nil {
+		// Zero-byte chunked body: still drain the framing so signatures and
+		// trailers are verified.
+		if _, err := io.Copy(io.Discard, counted); err != nil {
+			if e := chunkedErr(); e != nil {
+				return nil, e
+			}
+			e := errInvalidRequest.withMessage(err.Error())
+			return nil, &e
+		}
 	}
+
 	md5sum := md5h.Sum(nil)
 	if sha != nil {
 		if got := hex.EncodeToString(sha.Sum(nil)); got != expectedSHA {
@@ -162,7 +230,45 @@ func (s *Server) uploadBody(r *http.Request, batch, storageClass string) (*uploa
 			return nil, &e
 		}
 	}
-	return &uploadResult{Ref: ref, Size: body.n, ETag: hex.EncodeToString(md5sum)}, nil
+
+	res := &uploadResult{Ref: ref, Size: counted.n, ETag: hex.EncodeToString(md5sum)}
+	if ck != nil {
+		digest := base64.StdEncoding.EncodeToString(ckHash.Sum(nil))
+		expected := ck.expected
+		if ck.inTrailer && chunked != nil {
+			expected = chunked.Trailer().Get("x-amz-checksum-" + ck.alg)
+		}
+		if expected != "" && expected != digest {
+			e := errBadDigest.withMessage("The " + strings.ToUpper(ck.alg) + " you specified did not match the calculated checksum.")
+			return nil, &e
+		}
+		res.ChecksumAlgorithm = strings.ToUpper(ck.alg)
+		res.Checksum = digest
+	}
+	return res, nil
+}
+
+// storedContentEncoding strips the aws-chunked transport token from a
+// Content-Encoding list, preserving the rest — S3 stores only the content's
+// own encodings.
+func storedContentEncoding(header string) string {
+	if header == "" {
+		return ""
+	}
+	var kept []string
+	for _, enc := range strings.Split(header, ",") {
+		if e := strings.TrimSpace(enc); e != "" && !strings.EqualFold(e, "aws-chunked") {
+			kept = append(kept, e)
+		}
+	}
+	return strings.Join(kept, ", ")
+}
+
+// isAwsChunked reports whether the request body uses aws-chunked framing.
+// Only the STREAMING-* payload type is authoritative: clients may send
+// Content-Encoding: aws-chunked without actually framing the body.
+func isAwsChunked(r *http.Request) bool {
+	return strings.HasPrefix(r.Header.Get("X-Amz-Content-Sha256"), "STREAMING-")
 }
 
 // setBatchHeaders surfaces batch identity and estimated remaining life
@@ -209,6 +315,9 @@ func (s *Server) handleGetObject(w http.ResponseWriter, r *http.Request, bucket,
 		ct = "application/octet-stream"
 	}
 	h.Set("Content-Type", ct)
+	if obj.ContentEncoding != "" {
+		h.Set("Content-Encoding", obj.ContentEncoding)
+	}
 	// Response header overrides — authenticated-only in S3 and covered by
 	// the signature; commonly carried by presigned URLs.
 	for param, hdr := range map[string]string{
@@ -232,6 +341,13 @@ func (s *Server) handleGetObject(w http.ResponseWriter, r *http.Request, bucket,
 	}
 	if obj.SwarmRef != "" && !s.cfg.Encrypt {
 		h.Set("x-swarm-reference", obj.SwarmRef)
+	}
+	// The stored checksum covers the full object, so it must not accompany
+	// partial (ranged or part-numbered) responses — clients validate response
+	// bodies against it.
+	if obj.Checksum != "" && strings.EqualFold(r.Header.Get("x-amz-checksum-mode"), "ENABLED") &&
+		r.Header.Get("Range") == "" && r.URL.Query().Get("partNumber") == "" {
+		h.Set("x-amz-checksum-"+strings.ToLower(obj.ChecksumAlgorithm), obj.Checksum)
 	}
 	s.setBatchHeaders(ctx, h, obj.BatchID)
 

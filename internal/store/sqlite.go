@@ -37,6 +37,9 @@ CREATE TABLE IF NOT EXISTS objects (
 	user_meta     TEXT NOT NULL DEFAULT 'null',
 	last_modified TEXT NOT NULL,
 	parts         TEXT NOT NULL DEFAULT '',
+	checksum_alg  TEXT NOT NULL DEFAULT '',
+	checksum      TEXT NOT NULL DEFAULT '',
+	content_enc   TEXT NOT NULL DEFAULT '',
 	PRIMARY KEY (bucket, key)
 );
 CREATE TABLE IF NOT EXISTS multipart_uploads (
@@ -76,6 +79,9 @@ func OpenSQLite(path string) (*SQLite, error) {
 	for _, mig := range []string{
 		`ALTER TABLE objects ADD COLUMN batch_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE objects ADD COLUMN parts TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE objects ADD COLUMN checksum_alg TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE objects ADD COLUMN checksum TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE objects ADD COLUMN content_enc TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := db.Exec(mig); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			db.Close()
@@ -210,22 +216,24 @@ func (s *SQLite) PutObject(ctx context.Context, o Object, cond *PutCondition) er
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT OR REPLACE INTO objects
-		 (bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 (bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		o.Bucket, o.Key, o.SwarmRef, o.BatchID, o.Size, o.ETag, o.ContentType,
-		o.StorageClass, string(meta), o.LastModified.UTC().Format(timeLayout), parts); err != nil {
+		o.StorageClass, string(meta), o.LastModified.UTC().Format(timeLayout), parts,
+		o.ChecksumAlgorithm, o.Checksum, o.ContentEncoding); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-const objectColumns = `bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts`
+const objectColumns = `bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc`
 
 func scanObject(row interface{ Scan(...any) error }) (*Object, error) {
 	var o Object
 	var meta, modified, parts string
 	if err := row.Scan(&o.Bucket, &o.Key, &o.SwarmRef, &o.BatchID, &o.Size, &o.ETag,
-		&o.ContentType, &o.StorageClass, &meta, &modified, &parts); err != nil {
+		&o.ContentType, &o.StorageClass, &meta, &modified, &parts,
+		&o.ChecksumAlgorithm, &o.Checksum, &o.ContentEncoding); err != nil {
 		return nil, err
 	}
 	json.Unmarshal([]byte(meta), &o.UserMetadata) //nolint:errcheck // written by us

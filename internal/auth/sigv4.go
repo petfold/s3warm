@@ -35,6 +35,9 @@ func (e *Error) Error() string { return e.Code + ": " + e.Message }
 type Identity struct {
 	AccessKey string
 	Anonymous bool
+	// Stream is set for STREAMING-AWS4-HMAC-SHA256-PAYLOAD payloads: the
+	// context a ChunkedReader needs to verify the body's signature chain.
+	Stream *StreamContext
 }
 
 type CredentialsProvider interface {
@@ -113,9 +116,6 @@ func (v *Verifier) Verify(r *http.Request) (*Identity, error) {
 	if payloadHash == "" {
 		return nil, &Error{"InvalidRequest", "missing required header: x-amz-content-sha256"}
 	}
-	if strings.HasPrefix(payloadHash, "STREAMING-") {
-		return nil, &Error{"NotImplemented", "streaming (aws-chunked) payload signing is not implemented yet"}
-	}
 
 	amzDate := r.Header.Get("X-Amz-Date")
 	if amzDate == "" {
@@ -144,7 +144,19 @@ func (v *Verifier) Verify(r *http.Request) (*Identity, error) {
 	if !signatureMatches(secret, amzDate, scopeDate, scopeRegion, canonReq, signature) {
 		return nil, &Error{"SignatureDoesNotMatch", "the request signature we calculated does not match the signature you provided"}
 	}
-	return &Identity{AccessKey: accessKey}, nil
+
+	id := &Identity{AccessKey: accessKey}
+	if payloadHash == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" ||
+		payloadHash == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER" {
+		id.Stream = &StreamContext{
+			signingKey:    signingKey(secret, scopeDate, scopeRegion, "s3"),
+			scope:         strings.Join([]string{scopeDate, scopeRegion, "s3", "aws4_request"}, "/"),
+			amzDate:       amzDate,
+			prevSig:       strings.ToLower(signature),
+			trailerSigned: strings.HasSuffix(payloadHash, "-TRAILER"),
+		}
+	}
+	return id, nil
 }
 
 // verifyPresigned authenticates a query-string-signed request — a presigned

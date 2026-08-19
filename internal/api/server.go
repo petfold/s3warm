@@ -4,6 +4,7 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"io"
@@ -99,10 +100,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := s.verifier.Verify(r); err != nil {
+	identity, err := s.verifier.Verify(r)
+	if err != nil {
 		s.writeError(sw, r, authError(err))
 		return
 	}
+	r = r.WithContext(context.WithValue(r.Context(), identityCtxKey{}, identity))
 
 	bucket, key := s.resolveTarget(r)
 	switch {
@@ -254,6 +257,14 @@ func anySubresource(q url.Values, names ...string) bool {
 		}
 	}
 	return false
+}
+
+type identityCtxKey struct{}
+
+// identityFrom returns the authenticated identity stashed by ServeHTTP.
+func identityFrom(ctx context.Context) *auth.Identity {
+	id, _ := ctx.Value(identityCtxKey{}).(*auth.Identity)
+	return id
 }
 
 func newRequestID() string {

@@ -57,16 +57,23 @@ type Bucket struct {
 }
 
 type Object struct {
-	Bucket       string
-	Key          string
-	SwarmRef     string // hex Swarm reference; empty for zero-byte objects
-	BatchID      string // postage batch that stamped this object's upload
-	Size         int64
-	ETag         string // hex MD5, unquoted
-	ContentType  string
-	StorageClass string
-	UserMetadata map[string]string
-	LastModified time.Time
+	Bucket      string
+	Key         string
+	SwarmRef    string // hex Swarm reference; empty for zero-byte objects
+	BatchID     string // postage batch that stamped this object's upload
+	Size        int64
+	ETag        string // hex MD5, unquoted
+	ContentType string
+	// ContentEncoding as stored (any aws-chunked transport token stripped).
+	ContentEncoding string
+	StorageClass    string
+	UserMetadata    map[string]string
+	LastModified    time.Time
+	// ChecksumAlgorithm/Checksum hold the flexible checksum recorded at
+	// write time (algorithm uppercase, value base64), when the client
+	// provided one.
+	ChecksumAlgorithm string
+	Checksum          string
 	// Parts is non-empty for composite (multipart) objects: the ordered
 	// part list the gateway stitches on reads (design §7). SwarmRef is
 	// empty for composites.

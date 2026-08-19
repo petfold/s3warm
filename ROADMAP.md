@@ -36,8 +36,8 @@ Exit: rclone syncs a real tree; s3-tests subset green.
 Exit: restic + Java SDK v2 work; buckets browsable via `bzz://`; snapshot → rollback round-trip.
 
 - [x] Multipart uploads (§7): full API set, composite objects with range-stitched reads, retry-idempotent + conditional complete, `?partNumber` reads; manifest at 250 s3-tests. Still open: async consolidation, UploadPartCopy from composite sources
-- [ ] Presigned URLs (§8)
-- [ ] Streaming signatures (aws-chunked) + trailing checksums (§8)
+- [x] Presigned URLs (§8): AWS doc vector in unit tests; expiry semantics match AWS
+- [x] Streaming signatures (aws-chunked) + flexible checksums (§8): all three payload variants, chunk/trailer signature chains, five checksum algorithms; multipart composite/FULL_OBJECT checksums still open
 - [ ] SSE via `swarm-encrypt` (§12)
 - [ ] Commit-chain manifests + checkpointed feeds (§5)
 - [ ] Snapshots & rollback, `x-swarm-bucket-root`/`x-swarm-commit-seq` (§5)

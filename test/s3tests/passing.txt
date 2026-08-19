@@ -196,6 +196,9 @@ s3tests/functional/test_s3.py::test_multipart_upload_small
 s3tests/functional/test_s3.py::test_non_multipart_get_part
 s3tests/functional/test_s3.py::test_non_multipart_sse_c_get_part
 s3tests/functional/test_s3.py::test_object_anon_put
+s3tests/functional/test_s3.py::test_object_checksum_crc64nvme
+s3tests/functional/test_s3.py::test_object_checksum_sha256
+s3tests/functional/test_s3.py::test_object_content_encoding_aws_chunked
 s3tests/functional/test_s3.py::test_object_copy_16m
 s3tests/functional/test_s3.py::test_object_copy_bucket_not_found
 s3tests/functional/test_s3.py::test_object_copy_diff_bucket

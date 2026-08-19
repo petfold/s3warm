@@ -17,7 +17,7 @@ import (
 const (
 	testAccessKey = "AKIAIOSFODNN7EXAMPLE"
 	testSecretKey = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-	emptySHA256   = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	// emptySHA256 (the hex SHA-256 of "") comes from the package itself.
 )
 
 func newTestVerifier() *Verifier {

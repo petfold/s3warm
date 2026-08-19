@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"crypto/md5"
 	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log/slog"
 	"net/http"
@@ -323,6 +326,50 @@ func TestConditionalPut(t *testing.T) {
 		"x-amz-copy-source":          "/cond/k",
 		"x-amz-copy-source-if-match": `"` + md5hex("stale") + `"`,
 	}, http.StatusPreconditionFailed).Body.Close()
+}
+
+func TestChecksums(t *testing.T) {
+	base := newGateway(t)
+	do(t, http.MethodPut, base+"/cksum", nil, nil, http.StatusOK).Body.Close()
+
+	content := "checksum me"
+	crc := crc32.ChecksumIEEE([]byte(content))
+	sum := make([]byte, 4)
+	binary.BigEndian.PutUint32(sum, crc)
+	good := base64.StdEncoding.EncodeToString(sum)
+
+	// Correct checksum accepted and echoed.
+	resp := do(t, http.MethodPut, base+"/cksum/k", strings.NewReader(content),
+		map[string]string{"x-amz-checksum-crc32": good}, http.StatusOK)
+	resp.Body.Close()
+	if got := resp.Header.Get("x-amz-checksum-crc32"); got != good {
+		t.Fatalf("PUT checksum echo = %q, want %q", got, good)
+	}
+
+	// Returned on GET only with checksum mode enabled.
+	resp = do(t, http.MethodGet, base+"/cksum/k", nil, nil, http.StatusOK)
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.Header.Get("x-amz-checksum-crc32") != "" {
+		t.Fatal("checksum returned without checksum mode")
+	}
+	resp = do(t, http.MethodGet, base+"/cksum/k", nil,
+		map[string]string{"x-amz-checksum-mode": "ENABLED"}, http.StatusOK)
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if got := resp.Header.Get("x-amz-checksum-crc32"); got != good {
+		t.Fatalf("GET checksum = %q, want %q", got, good)
+	}
+
+	// Wrong checksum rejected, object untouched.
+	resp = do(t, http.MethodPut, base+"/cksum/k2", strings.NewReader(content),
+		map[string]string{"x-amz-checksum-crc32": "AAAAAA=="}, http.StatusBadRequest)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), "<Code>BadDigest</Code>") {
+		t.Fatalf("bad checksum error: %s", body)
+	}
+	do(t, http.MethodGet, base+"/cksum/k2", nil, nil, http.StatusNotFound).Body.Close()
 }
 
 func TestPutRejectsBadBatch(t *testing.T) {
