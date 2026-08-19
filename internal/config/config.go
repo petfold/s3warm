@@ -32,6 +32,9 @@ type Config struct {
 	Deferred bool
 	// Domain enables virtual-host-style addressing (bucket.<Domain>) when set.
 	Domain string
+	// DB is the SQLite metadata index path. Empty selects the in-memory
+	// index (development only — metadata is lost on restart).
+	DB string
 }
 
 func Load(args []string) (*Config, error) {
@@ -46,6 +49,7 @@ func Load(args []string) (*Config, error) {
 		Encrypt:         envBool("S3WARM_ENCRYPT", false),
 		Deferred:        envBool("S3WARM_DEFERRED", true),
 		Domain:          envStr("S3WARM_DOMAIN", ""),
+		DB:              envStr("S3WARM_DB", "s3warm.db"),
 	}
 
 	fs := flag.NewFlagSet("s3warm", flag.ContinueOnError)
@@ -59,6 +63,7 @@ func Load(args []string) (*Config, error) {
 	fs.BoolVar(&cfg.Encrypt, "encrypt", cfg.Encrypt, "encrypt uploads on Swarm")
 	fs.BoolVar(&cfg.Deferred, "deferred", cfg.Deferred, "use deferred (asynchronous) uploads to the network")
 	fs.StringVar(&cfg.Domain, "domain", cfg.Domain, "base domain for virtual-host-style bucket addressing")
+	fs.StringVar(&cfg.DB, "db", cfg.DB, "SQLite metadata index path (empty = in-memory, dev only)")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}

@@ -36,7 +36,22 @@ func main() {
 		logger.Warn("no default postage batch configured; writes will fail unless a bucket or request provides one (x-swarm-postage-batch-id)")
 	}
 
-	handler := api.New(cfg, store.NewMemory(), bee.New(cfg.BeeAPI), logger)
+	var st store.Store
+	if cfg.DB == "" {
+		logger.Warn("using in-memory index — metadata is lost on restart")
+		st = store.NewMemory()
+	} else {
+		sq, err := store.OpenSQLite(cfg.DB)
+		if err != nil {
+			logger.Error("opening index", "db", cfg.DB, "err", err)
+			os.Exit(1)
+		}
+		defer sq.Close()
+		logger.Info("metadata index", "db", cfg.DB)
+		st = sq
+	}
+
+	handler := api.New(cfg, st, bee.New(cfg.BeeAPI), logger)
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           handler,

@@ -48,6 +48,7 @@ With rclone: `rclone config` → type `s3`, provider `Other`, endpoint `http://l
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
 | `-listen` | `S3WARM_LISTEN` | `:8333` | S3 API listen address |
+| `-db` | `S3WARM_DB` | `s3warm.db` | SQLite metadata index path (empty = in-memory, dev only) |
 | `-bee-api` | `S3WARM_BEE_API` | `http://127.0.0.1:1633` | Bee node API endpoint |
 | `-batch-id` | `S3WARM_BATCH_ID` | — | Default postage batch id (required for writes) |
 | `-access-key` | `S3WARM_ACCESS_KEY` | — | Access key id (empty = anonymous dev mode) |
@@ -73,7 +74,7 @@ cmd/s3warm/        entry point
 internal/api/      S3 REST routing, XML types, error envelope, handlers
 internal/auth/     AWS Signature V4 verification
 internal/bee/      Bee HTTP API client
-internal/store/    metadata index (interface + in-memory; SQLite/Postgres planned)
+internal/store/    metadata index (interface + SQLite and in-memory implementations)
 internal/config/   configuration
 docs/              design document + compatibility matrix
 ```

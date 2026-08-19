@@ -23,7 +23,7 @@ Exit: `aws s3 cp/ls/rm` round-trips against `bee dev`.
 
 Exit: rclone syncs a real tree; s3-tests subset green.
 
-- [ ] SQLite index (§5)
+- [x] SQLite index (§5) — cgo-free (modernc.org/sqlite), WAL mode, conformance suite shared with the in-memory store; persistence verified across a gateway restart against a live Bee node
 - [ ] Stamp manager v1: batch binding, utilization/TTL monitoring, `x-swarm-batch-ttl` (§9)
 - [ ] Conditional-request hardening (§10)
 - [ ] Explicit ack-policy surface, `network`/`node` tiers (§6)
