@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft v0.2 — adds key-based tenancy via ACT, commit-chain buckets with checkpointed feeds, snapshots/rollback |
+| **Status** | Draft v0.3 — v0.2 added ACT tenancy, commit-chain buckets, snapshots; v0.3 adds explicit PUT ack-policy tiers |
 | **Date** | 2026-08-19 |
 | **Scope** | Design of an Amazon S3–compatible HTTP API layer on top of [Swarm](https://www.ethswarm.org/), served by a gateway that talks to a [Bee](https://github.com/ethersphere/bee) node |
 
@@ -179,9 +179,19 @@ client ──► SigV4 verify (headers only)
        ◄── 200, ETag:"<md5>", x-swarm-reference:<ref>
 ```
 
-Latency note: `swarm-deferred-upload: true` (default) acks after local store + async push — S3-like latency, durability follows; `false` waits for network sync — slower, stronger. Configurable per deployment.
-
 Zero-byte objects (directory markers created by consoles/clients) are indexed without a Bee upload.
+
+### Ack policy — what a 200 on PUT means
+
+S3's contract on a successful PUT is that the object is **durable**, immediately readable and immediately listed; backup tools (restic, WAL archivers, `rclone move`) treat the 200 as "safe to delete my local copy". The spirit-of-S3 rule the gateway holds to: never ack a PUT that can still fail for a reason the client could have been told synchronously, and never lose an acked PUT to a crash. Async-ness itself is not the violation — S3 replicates asynchronously and sells reduced durability as One Zone-IA — *silent* relaxation is. So the durability point is an explicit, per-bucket tier:
+
+| Policy | 200 means | Notes |
+|---|---|---|
+| `ack=network` | Chunks pushed to the network (direct upload) | Strongest; slowest |
+| `ack=node` (default) | In the Bee node's local store (`swarm-deferred-upload: true`); network push follows | The One Zone-IA of Swarm; today's `-deferred` flag |
+| `ack=spool` (opt-in, future) | fsynced to a gateway write-ahead spool; a background uploader drains to Bee | Disk-speed PUTs; `x-swarm-reference` moves to later HEAD/GET responses |
+
+`ack=spool` (a local-first byte path, à la recordstore) is sound only under three rules: the spool is fsynced and replayed on restart, so a crash never loses an acked PUT; postage batch validity/capacity is checked synchronously against cached stamp state *before* the ack, so the only failures left async are availability failures (Bee/network down — retried until drained), never semantic ones S3 would have reported as a 4xx; and GETs are served from the spool until it drains. Whether it earns that complexity is an open question (§21) — the metadata layer, where S3 makes no promises, is already fully local-first (§5).
 
 ### GetObject
 
@@ -258,6 +268,7 @@ Capacity planning cheat-sheet (documented for operators): batch capacity ≈ 2^d
 - **Conditional writes:** `If-None-Match: *` and `If-Match` on PUT (S3 2024 additions) are trivial index constraints — phase 2, cheap, and valuable for coordination-hungry clients.
 - **Multi-gateway:** all instances share one Postgres index → same guarantees. The feed/manifest layer is *not* used for serving reads and is allowed to lag (eventual); it exists for portability and recovery.
 - **External writers:** data written to Swarm outside s3warm is not visible in buckets (by design); an `import` admin command can graft an existing reference into a bucket as a new key (O(1), it's a copy).
+- **Ack policy never trades consistency:** every ack tier (§6) commits the index before the 200, and `ack=spool` reads are served from the spool until drained — the tiers trade *durability*, read-after-write and list-after-write hold in all of them.
 
 ---
 
@@ -392,6 +403,8 @@ Rationale and exit criteria only; current progress is tracked with checkboxes in
 7. Checkpoint cadence defaults: what N commits / T seconds balances write cost against recovery freshness, and is the clean-shutdown flush enough for most operators?
 8. S3 Event Notifications over Swarm's native pub-sub (PSS/GSOC): the mechanism exists — is the demand worth the API surface?
 9. ACT revocation vs S3 expectations: forward-only revocation must be surfaced loudly — in docs, headers, or the grants API response?
+10. Does `ack=spool` (§6) earn its complexity? Ship `network`/`node` first; add the spool tier only on demonstrated demand for disk-speed PUTs.
+11. Multi-gateway checkpointing via a merge-and-retry shared pointer (three-way merge of manifest roots, recordstore-style) instead of a single checkpoint writer — worth prototyping?
 
 ---
 

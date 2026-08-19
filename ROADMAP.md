@@ -26,6 +26,7 @@ Exit: rclone syncs a real tree; s3-tests subset green.
 - [ ] SQLite index (§5)
 - [ ] Stamp manager v1: batch binding, utilization/TTL monitoring, `x-swarm-batch-ttl` (§9)
 - [ ] Conditional-request hardening (§10)
+- [ ] Explicit ack-policy surface, `network`/`node` tiers (§6)
 - [ ] docker-compose harness with `bee dev` (§15)
 - [ ] s3-tests subset in CI with pass/fail manifest (§15)
 - [ ] Prometheus metrics + structured logging polish (§16)
