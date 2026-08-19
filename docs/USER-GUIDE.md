@@ -297,9 +297,9 @@ The executable answer is [`test/s3tests/passing.txt`](../test/s3tests/passing.tx
 — every Ceph s3-tests conformance test s3warm passes, run in CI — and the
 per-operation [compatibility matrix](API-COMPATIBILITY.md). The short
 version: objects, listings, multipart, conditional requests, presigned
-URLs, streaming signatures, checksums, SSE-S3 and CORS all work. The
-common 501s you might hit: ACL mutation, versioning, object tagging and
-bucket policies (all on the [roadmap](../ROADMAP.md)).
+URLs, streaming signatures, checksums, SSE-S3, CORS, versioning and
+tagging all work. The common 501s you might hit: ACL mutation and
+bucket policies (both on the [roadmap](../ROADMAP.md)).
 
 ## 8. Troubleshooting
 

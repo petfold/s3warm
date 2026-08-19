@@ -857,3 +857,132 @@ func TestMultipartRoundTrip(t *testing.T) {
 	do(t, http.MethodDelete, base+"/mpu/other.bin?uploadId="+second.UploadID, nil, nil, http.StatusNoContent).Body.Close()
 	do(t, http.MethodDelete, base+"/mpu/other.bin?uploadId="+second.UploadID, nil, nil, http.StatusNotFound).Body.Close()
 }
+
+func TestTagging(t *testing.T) {
+	base := newGateway(t)
+	do(t, http.MethodPut, base+"/tags", nil, nil, http.StatusOK).Body.Close()
+
+	// Bucket tagging: absent set is NoSuchTagSet, then round-trip and delete.
+	resp := do(t, http.MethodGet, base+"/tags?tagging", nil, nil, http.StatusNotFound)
+	resp.Body.Close()
+	bucketDoc := `<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag><Tag><Key>team</Key><Value>storage</Value></Tag></TagSet></Tagging>`
+	do(t, http.MethodPut, base+"/tags?tagging", strings.NewReader(bucketDoc), nil, http.StatusNoContent).Body.Close()
+	resp = do(t, http.MethodGet, base+"/tags?tagging", nil, nil, http.StatusOK)
+	var got struct {
+		TagSet struct {
+			Tags []struct{ Key, Value string } `xml:"Tag"`
+		}
+	}
+	xml.NewDecoder(resp.Body).Decode(&got)
+	resp.Body.Close()
+	if len(got.TagSet.Tags) != 2 || got.TagSet.Tags[0].Key != "env" || got.TagSet.Tags[0].Value != "prod" {
+		t.Fatalf("bucket tags = %+v", got.TagSet.Tags)
+	}
+	do(t, http.MethodDelete, base+"/tags?tagging", nil, nil, http.StatusNoContent).Body.Close()
+	do(t, http.MethodGet, base+"/tags?tagging", nil, nil, http.StatusNotFound).Body.Close()
+
+	// Duplicate keys and oversize sets are InvalidTag.
+	dup := `<Tagging><TagSet><Tag><Key>a</Key><Value>1</Value></Tag><Tag><Key>a</Key><Value>2</Value></Tag></TagSet></Tagging>`
+	do(t, http.MethodPut, base+"/tags?tagging", strings.NewReader(dup), nil, http.StatusBadRequest).Body.Close()
+
+	// x-amz-tagging on PUT surfaces as x-amz-tagging-count on GET.
+	do(t, http.MethodPut, base+"/tags/a.txt", strings.NewReader("hi"),
+		map[string]string{"x-amz-tagging": "color=blue&size=x%20large"}, http.StatusOK).Body.Close()
+	resp = do(t, http.MethodGet, base+"/tags/a.txt", nil, nil, http.StatusOK)
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if c := resp.Header.Get("x-amz-tagging-count"); c != "2" {
+		t.Fatalf("x-amz-tagging-count = %q, want 2", c)
+	}
+	resp = do(t, http.MethodGet, base+"/tags/a.txt?tagging", nil, nil, http.StatusOK)
+	got.TagSet.Tags = nil
+	xml.NewDecoder(resp.Body).Decode(&got)
+	resp.Body.Close()
+	if len(got.TagSet.Tags) != 2 || got.TagSet.Tags[1].Value != "x large" {
+		t.Fatalf("object tags = %+v", got.TagSet.Tags)
+	}
+
+	// Object with no tags: GET tagging is 200 with an empty set (unlike buckets).
+	do(t, http.MethodPut, base+"/tags/b.txt", strings.NewReader("hi"), nil, http.StatusOK).Body.Close()
+	resp = do(t, http.MethodGet, base+"/tags/b.txt?tagging", nil, nil, http.StatusOK)
+	got.TagSet.Tags = nil
+	xml.NewDecoder(resp.Body).Decode(&got)
+	resp.Body.Close()
+	if len(got.TagSet.Tags) != 0 {
+		t.Fatalf("expected empty tag set, got %+v", got.TagSet.Tags)
+	}
+
+	// PUT/DELETE object tagging replace in place.
+	objDoc := `<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet></Tagging>`
+	do(t, http.MethodPut, base+"/tags/b.txt?tagging", strings.NewReader(objDoc), nil, http.StatusOK).Body.Close()
+	resp = do(t, http.MethodHead, base+"/tags/b.txt", nil, nil, http.StatusOK)
+	resp.Body.Close()
+	if c := resp.Header.Get("x-amz-tagging-count"); c != "1" {
+		t.Fatalf("tagging-count after put-tagging = %q, want 1", c)
+	}
+	do(t, http.MethodDelete, base+"/tags/b.txt?tagging", nil, nil, http.StatusNoContent).Body.Close()
+	resp = do(t, http.MethodHead, base+"/tags/b.txt", nil, nil, http.StatusOK)
+	resp.Body.Close()
+	if c := resp.Header.Get("x-amz-tagging-count"); c != "" {
+		t.Fatalf("tagging-count after delete-tagging = %q, want absent", c)
+	}
+
+	// Object tag sets are capped at 10 entries.
+	var big strings.Builder
+	big.WriteString("<Tagging><TagSet>")
+	for i := 0; i < 11; i++ {
+		fmt.Fprintf(&big, "<Tag><Key>k%d</Key><Value>v</Value></Tag>", i)
+	}
+	big.WriteString("</TagSet></Tagging>")
+	do(t, http.MethodPut, base+"/tags/b.txt?tagging", strings.NewReader(big.String()), nil, http.StatusBadRequest).Body.Close()
+
+	// Copy: default directive carries tags; REPLACE swaps them.
+	do(t, http.MethodPut, base+"/tags/copy1", nil,
+		map[string]string{"x-amz-copy-source": "/tags/a.txt"}, http.StatusOK).Body.Close()
+	resp = do(t, http.MethodHead, base+"/tags/copy1", nil, nil, http.StatusOK)
+	resp.Body.Close()
+	if c := resp.Header.Get("x-amz-tagging-count"); c != "2" {
+		t.Fatalf("copied tagging-count = %q, want 2", c)
+	}
+	do(t, http.MethodPut, base+"/tags/copy2", nil, map[string]string{
+		"x-amz-copy-source":       "/tags/a.txt",
+		"x-amz-tagging-directive": "REPLACE",
+		"x-amz-tagging":           "only=one",
+	}, http.StatusOK).Body.Close()
+	resp = do(t, http.MethodHead, base+"/tags/copy2", nil, nil, http.StatusOK)
+	resp.Body.Close()
+	if c := resp.Header.Get("x-amz-tagging-count"); c != "1" {
+		t.Fatalf("replaced tagging-count = %q, want 1", c)
+	}
+
+	// Versioned objects tag per version.
+	versioningDoc := `<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>`
+	do(t, http.MethodPut, base+"/tags?versioning", strings.NewReader(versioningDoc), nil, http.StatusOK).Body.Close()
+	resp = do(t, http.MethodPut, base+"/tags/v.txt", strings.NewReader("v1"),
+		map[string]string{"x-amz-tagging": "gen=1"}, http.StatusOK)
+	resp.Body.Close()
+	v1 := resp.Header.Get("x-amz-version-id")
+	do(t, http.MethodPut, base+"/tags/v.txt", strings.NewReader("v2"),
+		map[string]string{"x-amz-tagging": "gen=2"}, http.StatusOK).Body.Close()
+	resp = do(t, http.MethodGet, base+"/tags/v.txt?tagging&versionId="+v1, nil, nil, http.StatusOK)
+	got.TagSet.Tags = nil
+	xml.NewDecoder(resp.Body).Decode(&got)
+	resp.Body.Close()
+	if len(got.TagSet.Tags) != 1 || got.TagSet.Tags[0].Value != "1" {
+		t.Fatalf("v1 tags = %+v", got.TagSet.Tags)
+	}
+	if v := resp.Header.Get("x-amz-version-id"); v != v1 {
+		t.Fatalf("tagging version header = %q, want %q", v, v1)
+	}
+	// Retag the old version only.
+	do(t, http.MethodPut, base+"/tags/v.txt?tagging&versionId="+v1,
+		strings.NewReader(`<Tagging><TagSet><Tag><Key>gen</Key><Value>1b</Value></Tag></TagSet></Tagging>`),
+		nil, http.StatusOK).Body.Close()
+	resp = do(t, http.MethodGet, base+"/tags/v.txt?tagging", nil, nil, http.StatusOK)
+	got.TagSet.Tags = nil
+	xml.NewDecoder(resp.Body).Decode(&got)
+	resp.Body.Close()
+	if len(got.TagSet.Tags) != 1 || got.TagSet.Tags[0].Value != "2" {
+		t.Fatalf("latest tags after retagging v1 = %+v", got.TagSet.Tags)
+	}
+}

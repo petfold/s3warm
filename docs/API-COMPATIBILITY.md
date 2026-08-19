@@ -29,7 +29,7 @@ Design rationale: [`DESIGN.md`](DESIGN.md).
 | Get/Put/DeleteBucketEncryption | ✅ | SSE-S3 (AES256) default-encryption config; KMS rejected |
 | GetBucketLifecycleConfiguration | 🎯 P2 | Read-only synthetic rule derived from postage batch TTL |
 | PutBucketLifecycleConfiguration | ❌ | Expiry is postage TTL; extend by topping up the batch |
-| GetBucketTagging / PutBucketTagging | 🎯 P3 | |
+| Get/Put/DeleteBucketTagging | ✅ | Up to 50 tags; empty set answers `NoSuchTagSet`, as on AWS |
 | ListMultipartUploads | ✅ | Prefix filter; key/upload-id markers 🎯 |
 | Get/PutBucketNotificationConfiguration | 🎯 research | Candidate mapping to Swarm's native pub-sub (PSS/GSOC), design §21 |
 | Website / Replication / Inventory / Analytics / Metrics / Accelerate / Logging / RequestPayment / ObjectLock config | ❌ | Website = native `bzz://`; replication is inherent to Swarm |
@@ -53,7 +53,7 @@ Design rationale: [`DESIGN.md`](DESIGN.md).
 | GetObject/HeadObject `?partNumber` | ✅ | Part-ranged reads with `x-amz-mp-parts-count`; non-multipart objects are one part |
 | GetObject `response-*` overrides | ✅ | content-type/-disposition/-encoding/-language, cache-control, expires — signature-covered, as used by presigned links |
 | GetObjectAttributes | ✅ | ETag, Checksum, ObjectParts (with pagination), StorageClass, ObjectSize |
-| GetObjectTagging / PutObjectTagging / DeleteObjectTagging | 🎯 P3 | |
+| Get/Put/DeleteObjectTagging | ✅ | Per-version tag sets (`?versionId`), mutable in place; up to 10 tags, returned sorted by key; `x-amz-tagging` on PUT/initiate-multipart, `x-amz-tagging-directive` on copy, `x-amz-tagging-count` on GET/HEAD |
 | GetObjectAcl / PutObjectAcl | 🪧 P2 | Canned `private` |
 | RestoreObject / SelectObjectContent / GetObjectTorrent | ❌ | |
 | SSE-S3 (`x-amz-server-side-encryption: AES256`) | ✅ | Mapped to `swarm-encrypt`: Bee encrypts/decrypts; the key-bearing 64-byte reference stays private (design §12). Per-request, bucket-default, or gateway-wide. SSE-C/KMS rejected |

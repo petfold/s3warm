@@ -66,6 +66,8 @@ type Bucket struct {
 	CommitSeq int64
 	// CORS holds the bucket's CORS rules as JSON ("" = not configured).
 	CORS string
+	// Tags holds the bucket tag set as JSON ("" = none).
+	Tags string
 }
 
 // Snapshot is a labeled commit root (design §5): restoring one is an atomic
@@ -99,6 +101,9 @@ type Object struct {
 	// Encrypted marks SSE objects: the Swarm reference embeds the
 	// decryption key and must stay private (design §12).
 	Encrypted bool
+	// Tags holds the object's tag set as JSON ("" = none). Tags are
+	// per-version and mutable in place.
+	Tags string
 	// Versioning fields (design §11). VersionID is "null" for writes into
 	// never-versioned or suspended buckets; VSeq orders a key's versions
 	// (write-time UnixNano); DeleteMarker rows shadow the key.
@@ -132,6 +137,7 @@ type MultipartUpload struct {
 	UserMetadata map[string]string
 	BatchID      string
 	Encrypted    bool
+	Tags         string // tag set JSON, applied to the completed object
 }
 
 // Store is the metadata index. Implementations must be safe for concurrent
@@ -151,6 +157,11 @@ type Store interface {
 	SetBucketHead(ctx context.Context, bucket, root string, seq int64) error
 	// SetBucketCORS sets the bucket's CORS rules JSON ("" clears).
 	SetBucketCORS(ctx context.Context, bucket, corsJSON string) error
+	// SetBucketTagging sets the bucket tag set JSON ("" clears).
+	SetBucketTagging(ctx context.Context, bucket, tagsJSON string) error
+	// SetObjectTags replaces one version's tag set in place (versionID "" =
+	// the latest version).
+	SetObjectTags(ctx context.Context, bucket, key, versionID, tagsJSON string) error
 
 	PutSnapshot(ctx context.Context, s Snapshot) error
 	GetSnapshot(ctx context.Context, bucket, label string) (*Snapshot, error)

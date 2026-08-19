@@ -161,9 +161,20 @@ details on top of it.
   transport token stripped.
 - **Zero-byte objects** (directory markers) are indexed without a Swarm
   upload.
-- **ListObjectVersions** is served with unversioned semantics (every object
-  one `null` version), as S3 does for never-versioned buckets. Real
-  versioning is roadmap phase 3.
+- **Versioning.** `GET/PUT ?versioning` with Enabled/Suspended; versioned
+  writes return `x-amz-version-id`, deletes insert delete markers,
+  `?versionId` on GET/HEAD/DELETE/Copy/Attributes addresses one version
+  (deleting it promotes the next-newest). ListObjectVersions returns real
+  history — `Version` + `DeleteMarker` entries, newest-first per key, with
+  key/version-id-marker pagination. Never-versioned and suspended writes
+  carry the `null` version, as on AWS. Old version bytes were already
+  retained by content addressing — versioning is index-only.
+- **Tagging.** Bucket tag sets (`GET/PUT/DELETE ?tagging`, ≤50 tags; an
+  empty set answers `NoSuchTagSet`) and per-version object tag sets
+  (≤10 tags, mutable in place, returned sorted by key). `x-amz-tagging`
+  on PutObject and CreateMultipartUpload, `x-amz-tagging-directive`
+  COPY/REPLACE on copies, `x-amz-tagging-count` on GET/HEAD. Tag keys
+  ≤128 chars, values ≤256.
 
 ---
 
@@ -294,6 +305,7 @@ automatic deposit is logged and counted in
 | SigV4 clock skew | ±15 min |
 | Commit debounce | 3 s |
 | Snapshot label | `[A-Za-z0-9._-]{1,64}` |
+| Tags per object / bucket | 10 / 50 (keys ≤128 chars, values ≤256) |
 
 ### Deployment
 

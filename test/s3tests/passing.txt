@@ -296,3 +296,15 @@ s3tests/functional/test_s3.py::test_versioning_obj_plain_null_version_removal
 s3tests/functional/test_s3.py::test_versioning_obj_suspend_versions
 s3tests/functional/test_s3.py::test_versioning_obj_suspended_copy
 s3tests/functional/test_s3.py::test_versioning_stack_delete_merkers
+s3tests/functional/test_s3.py::test_get_obj_head_tagging
+s3tests/functional/test_s3.py::test_get_obj_tagging
+s3tests/functional/test_s3.py::test_put_delete_tags
+s3tests/functional/test_s3.py::test_put_excess_key_tags
+s3tests/functional/test_s3.py::test_put_excess_tags
+s3tests/functional/test_s3.py::test_put_excess_val_tags
+s3tests/functional/test_s3.py::test_put_max_kvsize_tags
+s3tests/functional/test_s3.py::test_put_max_tags
+s3tests/functional/test_s3.py::test_put_modify_tags
+s3tests/functional/test_s3.py::test_put_obj_with_tags
+s3tests/functional/test_s3.py::test_set_bucket_tagging
+s3tests/functional/test_s3.py::test_set_multipart_tagging

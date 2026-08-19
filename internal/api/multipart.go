@@ -50,6 +50,16 @@ func (s *Server) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Requ
 		s.writeError(w, r, *apiErr)
 		return
 	}
+	tags, apiErr := parseTaggingHeader(r.Header.Get("x-amz-tagging"))
+	if apiErr != nil {
+		s.writeError(w, r, *apiErr)
+		return
+	}
+	tagsJSON, apiErr := tagsToJSON(tags)
+	if apiErr != nil {
+		s.writeError(w, r, *apiErr)
+		return
+	}
 
 	var id [16]byte
 	rand.Read(id[:]) //nolint:errcheck // crypto/rand.Read never fails
@@ -63,6 +73,7 @@ func (s *Server) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Requ
 		UserMetadata: userMetadata(r.Header),
 		BatchID:      batch,
 		Encrypted:    encrypt,
+		Tags:         tagsJSON,
 	}
 	if err := s.store.CreateMultipartUpload(ctx, upload); err != nil {
 		s.writeError(w, r, storeError(err))
@@ -274,6 +285,7 @@ func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Re
 		LastModified: time.Now().UTC(),
 		Parts:        parts,
 		Encrypted:    upload.Encrypted,
+		Tags:         upload.Tags,
 	}
 	versionHeader := stampVersion(&obj, b.Versioning)
 	// Conditional completion, same semantics as conditional PUT (design §10).

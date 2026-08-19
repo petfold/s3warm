@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS buckets (
 	head_root  TEXT NOT NULL DEFAULT '',
 	commit_seq INTEGER NOT NULL DEFAULT 0,
 	cors       TEXT NOT NULL DEFAULT '',
-	versioning TEXT NOT NULL DEFAULT ''
+	versioning TEXT NOT NULL DEFAULT '',
+	tags       TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS snapshots (
 	bucket     TEXT NOT NULL,
@@ -58,6 +59,7 @@ CREATE TABLE IF NOT EXISTS objects (
 	checksum      TEXT NOT NULL DEFAULT '',
 	content_enc   TEXT NOT NULL DEFAULT '',
 	encrypted     INTEGER NOT NULL DEFAULT 0,
+	tags          TEXT NOT NULL DEFAULT '',
 	PRIMARY KEY (bucket, key, version_id)
 );
 CREATE INDEX IF NOT EXISTS objects_latest ON objects (bucket, key) WHERE is_latest = 1;
@@ -70,7 +72,8 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
 	storage_class TEXT NOT NULL DEFAULT '',
 	user_meta     TEXT NOT NULL DEFAULT 'null',
 	batch_id      TEXT NOT NULL DEFAULT '',
-	encrypted     INTEGER NOT NULL DEFAULT 0
+	encrypted     INTEGER NOT NULL DEFAULT 0,
+	tags          TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS multipart_parts (
 	upload_id     TEXT NOT NULL,
@@ -109,6 +112,9 @@ func OpenSQLite(path string) (*SQLite, error) {
 		`ALTER TABLE buckets ADD COLUMN commit_seq INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE buckets ADD COLUMN cors TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE buckets ADD COLUMN versioning TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE buckets ADD COLUMN tags TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE objects ADD COLUMN tags TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE multipart_uploads ADD COLUMN tags TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := db.Exec(mig); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			db.Close()
@@ -151,8 +157,8 @@ func migrateObjectsToVersioned(db *sql.DB) error {
 			encrypted INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY (bucket, key, version_id))`,
 		`INSERT INTO objects
-			(bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted)
-		 SELECT bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted
+			(bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted, tags)
+		 SELECT bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted, tags
 		 FROM objects_v1`,
 		`DROP TABLE objects_v1`,
 		`CREATE INDEX IF NOT EXISTS objects_latest ON objects (bucket, key) WHERE is_latest = 1`,
@@ -174,9 +180,9 @@ func (s *SQLite) CreateBucket(ctx context.Context, b Bucket) error {
 		b.CreatedAt = time.Now().UTC()
 	}
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO buckets (name, created_at, batch_id, sse, head_root, commit_seq, cors, versioning) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO buckets (name, created_at, batch_id, sse, head_root, commit_seq, cors, versioning, tags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT (name) DO NOTHING`,
-		b.Name, b.CreatedAt.UTC().Format(timeLayout), b.BatchID, b.Encryption, b.HeadRoot, b.CommitSeq, b.CORS, b.Versioning)
+		b.Name, b.CreatedAt.UTC().Format(timeLayout), b.BatchID, b.Encryption, b.HeadRoot, b.CommitSeq, b.CORS, b.Versioning, b.Tags)
 	if err != nil {
 		return err
 	}
@@ -188,10 +194,10 @@ func (s *SQLite) CreateBucket(ctx context.Context, b Bucket) error {
 
 func (s *SQLite) GetBucket(ctx context.Context, name string) (*Bucket, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT name, created_at, batch_id, sse, head_root, commit_seq, cors, versioning FROM buckets WHERE name = ?`, name)
+		`SELECT name, created_at, batch_id, sse, head_root, commit_seq, cors, versioning, tags FROM buckets WHERE name = ?`, name)
 	var b Bucket
 	var created string
-	if err := row.Scan(&b.Name, &created, &b.BatchID, &b.Encryption, &b.HeadRoot, &b.CommitSeq, &b.CORS, &b.Versioning); err != nil {
+	if err := row.Scan(&b.Name, &created, &b.BatchID, &b.Encryption, &b.HeadRoot, &b.CommitSeq, &b.CORS, &b.Versioning, &b.Tags); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrBucketNotFound
 		}
@@ -203,7 +209,7 @@ func (s *SQLite) GetBucket(ctx context.Context, name string) (*Bucket, error) {
 
 func (s *SQLite) ListBuckets(ctx context.Context) ([]Bucket, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT name, created_at, batch_id, sse, head_root, commit_seq, cors, versioning FROM buckets ORDER BY name`)
+		`SELECT name, created_at, batch_id, sse, head_root, commit_seq, cors, versioning, tags FROM buckets ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -212,7 +218,7 @@ func (s *SQLite) ListBuckets(ctx context.Context) ([]Bucket, error) {
 	for rows.Next() {
 		var b Bucket
 		var created string
-		if err := rows.Scan(&b.Name, &created, &b.BatchID, &b.Encryption, &b.HeadRoot, &b.CommitSeq, &b.CORS, &b.Versioning); err != nil {
+		if err := rows.Scan(&b.Name, &created, &b.BatchID, &b.Encryption, &b.HeadRoot, &b.CommitSeq, &b.CORS, &b.Versioning, &b.Tags); err != nil {
 			return nil, err
 		}
 		b.CreatedAt, _ = time.Parse(timeLayout, created)
@@ -281,6 +287,39 @@ func (s *SQLite) SetBucketCORS(ctx context.Context, bucket, corsJSON string) err
 	}
 	if n, err := res.RowsAffected(); err == nil && n == 0 {
 		return ErrBucketNotFound
+	}
+	return nil
+}
+
+// SetBucketTagging sets the bucket tag set JSON.
+func (s *SQLite) SetBucketTagging(ctx context.Context, bucket, tagsJSON string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE buckets SET tags = ? WHERE name = ?`, tagsJSON, bucket)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return ErrBucketNotFound
+	}
+	return nil
+}
+
+// SetObjectTags replaces one version's tag set in place.
+func (s *SQLite) SetObjectTags(ctx context.Context, bucket, key, versionID, tagsJSON string) error {
+	q := `UPDATE objects SET tags = ? WHERE bucket = ? AND key = ? AND is_latest = 1`
+	args := []any{tagsJSON, bucket, key}
+	if versionID != "" {
+		q = `UPDATE objects SET tags = ? WHERE bucket = ? AND key = ? AND version_id = ?`
+		args = append(args, versionID)
+	}
+	res, err := s.db.ExecContext(ctx, q, args...)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		if _, berr := s.GetBucket(ctx, bucket); berr != nil {
+			return berr
+		}
+		return ErrObjectNotFound
 	}
 	return nil
 }
@@ -391,12 +430,12 @@ func (s *SQLite) RestoreBucket(ctx context.Context, bucket string, objects []Obj
 		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO objects
-			 (bucket, key, version_id, vseq, is_latest, delete_marker, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted)
-			 VALUES (?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 (bucket, key, version_id, vseq, is_latest, delete_marker, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted, tags)
+			 VALUES (?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			o.Bucket, o.Key, o.VersionID, o.VSeq,
 			o.SwarmRef, o.BatchID, o.Size, o.ETag, o.ContentType,
 			o.StorageClass, string(meta), o.LastModified.UTC().Format(timeLayout), parts,
-			o.ChecksumAlgorithm, o.Checksum, o.ContentEncoding, o.Encrypted); err != nil {
+			o.ChecksumAlgorithm, o.Checksum, o.ContentEncoding, o.Encrypted, o.Tags); err != nil {
 			return err
 		}
 	}
@@ -454,12 +493,12 @@ func (s *SQLite) PutObject(ctx context.Context, o Object, cond *PutCondition) er
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT OR REPLACE INTO objects
-		 (bucket, key, version_id, vseq, is_latest, delete_marker, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted)
-		 VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 (bucket, key, version_id, vseq, is_latest, delete_marker, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted, tags)
+		 VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		o.Bucket, o.Key, o.VersionID, o.VSeq, o.DeleteMarker,
 		o.SwarmRef, o.BatchID, o.Size, o.ETag, o.ContentType,
 		o.StorageClass, string(meta), o.LastModified.UTC().Format(timeLayout), parts,
-		o.ChecksumAlgorithm, o.Checksum, o.ContentEncoding, o.Encrypted); err != nil {
+		o.ChecksumAlgorithm, o.Checksum, o.ContentEncoding, o.Encrypted, o.Tags); err != nil {
 		return err
 	}
 	// A same-version replace (suspended "null" overwrites) may have removed
@@ -578,7 +617,7 @@ func (s *SQLite) ListVersions(ctx context.Context, bucket, prefix, keyMarker, ve
 	return out, rows.Err()
 }
 
-const objectColumns = `bucket, key, version_id, vseq, is_latest, delete_marker, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted`
+const objectColumns = `bucket, key, version_id, vseq, is_latest, delete_marker, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts, checksum_alg, checksum, content_enc, encrypted, tags`
 
 func scanObject(row interface{ Scan(...any) error }) (*Object, error) {
 	var o Object
@@ -586,7 +625,7 @@ func scanObject(row interface{ Scan(...any) error }) (*Object, error) {
 	if err := row.Scan(&o.Bucket, &o.Key, &o.VersionID, &o.VSeq, &o.IsLatest, &o.DeleteMarker,
 		&o.SwarmRef, &o.BatchID, &o.Size, &o.ETag,
 		&o.ContentType, &o.StorageClass, &meta, &modified, &parts,
-		&o.ChecksumAlgorithm, &o.Checksum, &o.ContentEncoding, &o.Encrypted); err != nil {
+		&o.ChecksumAlgorithm, &o.Checksum, &o.ContentEncoding, &o.Encrypted, &o.Tags); err != nil {
 		return nil, err
 	}
 	json.Unmarshal([]byte(meta), &o.UserMetadata) //nolint:errcheck // written by us
@@ -672,22 +711,22 @@ func (s *SQLite) CreateMultipartUpload(ctx context.Context, u MultipartUpload) e
 	}
 	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO multipart_uploads
-		 (upload_id, bucket, key, initiated, content_type, storage_class, user_meta, batch_id, encrypted)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 (upload_id, bucket, key, initiated, content_type, storage_class, user_meta, batch_id, encrypted, tags)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		u.UploadID, u.Bucket, u.Key, u.Initiated.UTC().Format(timeLayout),
-		u.ContentType, u.StorageClass, string(meta), u.BatchID, u.Encrypted)
+		u.ContentType, u.StorageClass, string(meta), u.BatchID, u.Encrypted, u.Tags)
 	return err
 }
 
 func (s *SQLite) GetMultipartUpload(ctx context.Context, bucket, key, uploadID string) (*MultipartUpload, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT upload_id, bucket, key, initiated, content_type, storage_class, user_meta, batch_id, encrypted
+		`SELECT upload_id, bucket, key, initiated, content_type, storage_class, user_meta, batch_id, encrypted, tags
 		 FROM multipart_uploads WHERE upload_id = ? AND bucket = ? AND key = ?`,
 		uploadID, bucket, key)
 	var u MultipartUpload
 	var initiated, meta string
 	if err := row.Scan(&u.UploadID, &u.Bucket, &u.Key, &initiated,
-		&u.ContentType, &u.StorageClass, &meta, &u.BatchID, &u.Encrypted); err != nil {
+		&u.ContentType, &u.StorageClass, &meta, &u.BatchID, &u.Encrypted, &u.Tags); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrUploadNotFound
 		}
@@ -754,7 +793,7 @@ func (s *SQLite) ListMultipartUploads(ctx context.Context, bucket, prefix string
 		return nil, err
 	}
 	end := prefixEnd(prefix)
-	q := `SELECT upload_id, bucket, key, initiated, content_type, storage_class, user_meta, batch_id, encrypted
+	q := `SELECT upload_id, bucket, key, initiated, content_type, storage_class, user_meta, batch_id, encrypted, tags
 	      FROM multipart_uploads WHERE bucket = ? AND key >= ?`
 	args := []any{bucket, prefix}
 	if end != "" {
@@ -772,7 +811,7 @@ func (s *SQLite) ListMultipartUploads(ctx context.Context, bucket, prefix string
 		var u MultipartUpload
 		var initiated, meta string
 		if err := rows.Scan(&u.UploadID, &u.Bucket, &u.Key, &initiated,
-			&u.ContentType, &u.StorageClass, &meta, &u.BatchID, &u.Encrypted); err != nil {
+			&u.ContentType, &u.StorageClass, &meta, &u.BatchID, &u.Encrypted, &u.Tags); err != nil {
 			return nil, err
 		}
 		json.Unmarshal([]byte(meta), &u.UserMetadata) //nolint:errcheck // written by us

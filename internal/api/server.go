@@ -159,7 +159,9 @@ func (s *Server) dispatchBucket(w http.ResponseWriter, r *http.Request, bucket s
 			s.handleListSnapshots(w, r, bucket)
 		case q.Has("cors"):
 			s.handleGetBucketCors(w, r, bucket)
-		case anySubresource(q, "acl", "policy", "tagging",
+		case q.Has("tagging"):
+			s.handleGetBucketTagging(w, r, bucket)
+		case anySubresource(q, "acl", "policy",
 			"lifecycle", "website", "object-lock", "replication",
 			"logging", "notification", "requestPayment", "accelerate",
 			"intelligent-tiering", "inventory", "metrics", "analytics", "ownershipControls",
@@ -185,6 +187,10 @@ func (s *Server) dispatchBucket(w http.ResponseWriter, r *http.Request, bucket s
 			s.handlePutBucketCors(w, r, bucket)
 			return
 		}
+		if q.Has("tagging") {
+			s.handlePutBucketTagging(w, r, bucket)
+			return
+		}
 		if q.Has("x-swarm-snapshot") {
 			s.handleCreateSnapshot(w, r, bucket)
 			return
@@ -203,6 +209,10 @@ func (s *Server) dispatchBucket(w http.ResponseWriter, r *http.Request, bucket s
 		}
 		if q.Has("cors") {
 			s.handleDeleteBucketCors(w, r, bucket)
+			return
+		}
+		if q.Has("tagging") {
+			s.handleDeleteBucketTagging(w, r, bucket)
 			return
 		}
 		if len(q) > 0 {
@@ -237,7 +247,11 @@ func (s *Server) dispatchObject(w http.ResponseWriter, r *http.Request, bucket, 
 			s.handleGetObjectAttributes(w, r, bucket, key)
 			return
 		}
-		if anySubresource(q, "acl", "tagging", "legal-hold", "retention", "torrent") {
+		if q.Has("tagging") {
+			s.handleGetObjectTagging(w, r, bucket, key)
+			return
+		}
+		if anySubresource(q, "acl", "legal-hold", "retention", "torrent") {
 			s.notImplemented(w, r, "object subresource")
 			return
 		}
@@ -253,7 +267,11 @@ func (s *Server) dispatchObject(w http.ResponseWriter, r *http.Request, bucket, 
 			}
 			return
 		}
-		if anySubresource(q, "acl", "tagging", "legal-hold", "retention") {
+		if q.Has("tagging") {
+			s.handlePutObjectTagging(w, r, bucket, key)
+			return
+		}
+		if anySubresource(q, "acl", "legal-hold", "retention") {
 			s.notImplemented(w, r, "object subresource")
 			return
 		}
@@ -268,7 +286,7 @@ func (s *Server) dispatchObject(w http.ResponseWriter, r *http.Request, bucket, 
 			return
 		}
 		if q.Has("tagging") {
-			s.notImplemented(w, r, "object subresource")
+			s.handleDeleteObjectTagging(w, r, bucket, key)
 			return
 		}
 		s.handleDeleteObject(w, r, bucket, key)

@@ -75,10 +75,22 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 		return
 	}
 
+	tags, apiErr := parseTaggingHeader(r.Header.Get("x-amz-tagging"))
+	if apiErr != nil {
+		s.writeError(w, r, *apiErr)
+		return
+	}
+	tagsJSON, apiErr := tagsToJSON(tags)
+	if apiErr != nil {
+		s.writeError(w, r, *apiErr)
+		return
+	}
+
 	obj := store.Object{
 		Bucket:            bucket,
 		Key:               key,
 		SwarmRef:          res.Ref,
+		Tags:              tagsJSON,
 		BatchID:           batch,
 		Size:              res.Size,
 		ETag:              res.ETag,
@@ -430,6 +442,9 @@ func (s *Server) handleGetObject(w http.ResponseWriter, r *http.Request, bucket,
 	if obj.Encrypted {
 		h.Set("x-amz-server-side-encryption", "AES256")
 	}
+	if n := len(tagsFromJSON(obj.Tags)); n > 0 {
+		h.Set("x-amz-tagging-count", strconv.Itoa(n))
+	}
 	// The stored checksum covers the full object, so it must not accompany
 	// partial (ranged or part-numbered) responses — clients validate response
 	// bodies against it.
@@ -614,6 +629,18 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, bucket
 		obj.UserMetadata = userMetadata(r.Header)
 		if sc := r.Header.Get("x-amz-storage-class"); sc != "" {
 			obj.StorageClass = storageClassOf(sc)
+		}
+	}
+	// Tags follow their own directive (COPY by default).
+	if strings.ToUpper(r.Header.Get("x-amz-tagging-directive")) == "REPLACE" {
+		tags, apiErr := parseTaggingHeader(r.Header.Get("x-amz-tagging"))
+		if apiErr != nil {
+			s.writeError(w, r, *apiErr)
+			return
+		}
+		if obj.Tags, apiErr = tagsToJSON(tags); apiErr != nil {
+			s.writeError(w, r, *apiErr)
+			return
 		}
 	}
 	versionHeader := stampVersion(&obj, b.Versioning)

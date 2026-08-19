@@ -120,6 +120,34 @@ func (m *Memory) SetBucketCORS(_ context.Context, bucket, corsJSON string) error
 	return nil
 }
 
+func (m *Memory) SetBucketTagging(_ context.Context, bucket, tagsJSON string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.buckets[bucket]
+	if !ok {
+		return ErrBucketNotFound
+	}
+	b.meta.Tags = tagsJSON
+	return nil
+}
+
+func (m *Memory) SetObjectTags(_ context.Context, bucket, key, versionID, tagsJSON string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.buckets[bucket]
+	if !ok {
+		return ErrBucketNotFound
+	}
+	versions := b.objects[key]
+	for i := range versions {
+		if (versionID == "" && versions[i].IsLatest) || versions[i].VersionID == versionID {
+			versions[i].Tags = tagsJSON
+			return nil
+		}
+	}
+	return ErrObjectNotFound
+}
+
 func (m *Memory) SetBucketHead(_ context.Context, bucket, root string, seq int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

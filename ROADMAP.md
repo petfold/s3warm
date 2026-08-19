@@ -51,7 +51,7 @@ Exit: multi-gateway behind LB; a grantee reads a private bucket off-gateway.
 
 - [x] Versioning suite (§11): Enabled/Suspended modes, version rows with delete markers and latest-promotion, `?versionId` on GET/HEAD/DELETE/Copy/Attributes, real ListObjectVersions with pagination; index-only — old bytes were already retained by content addressing. Bucket restore flattens version history (noted)
 - [ ] ACT-backed grants + key-based multi-tenancy (§8)
-- [ ] Object/bucket tagging
+- [x] Object/bucket tagging: per-version object tag sets and bucket tag sets, `x-amz-tagging` header on PUT/initiate-multipart, copy `x-amz-tagging-directive`, `x-amz-tagging-count` on reads
 - [ ] Postgres index for HA (§10)
 - [x] Chequebook auto top-up: daily check, deposits wallet→chequebook below `-chequebook-min`, never touching the postage reserve (first slice of the money autopilot)
 - [ ] Stamp autopilot (§9)
