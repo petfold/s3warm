@@ -29,6 +29,7 @@ type Object struct {
 	Bucket       string
 	Key          string
 	SwarmRef     string // hex Swarm reference; empty for zero-byte objects
+	BatchID      string // postage batch that stamped this object's upload
 	Size         int64
 	ETag         string // hex MD5, unquoted
 	ContentType  string

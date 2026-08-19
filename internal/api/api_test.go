@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -65,6 +66,15 @@ func newFakeBee(t *testing.T) *httptest.Server {
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
+	mux.HandleFunc("GET /stamps/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		json.NewEncoder(w).Encode(map[string]any{
+			"batchID": id, "exists": true, "usable": id != unusableBatch,
+			"utilization": 8, "utilizationRatio": 0.25,
+			"depth": 21, "bucketDepth": 16, "amount": "1000",
+			"batchTTL": 7200, "immutableFlag": false,
+		})
+	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv
@@ -76,12 +86,12 @@ func newGateway(t *testing.T) string {
 	fakeBee := newFakeBee(t)
 	cfg := &config.Config{
 		BeeAPI:   fakeBee.URL,
-		BatchID:  strings.Repeat("ab", 32),
+		BatchID:  testBatch,
 		Region:   "us-east-1",
 		Deferred: true,
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(api.New(cfg, store.NewMemory(), bee.New(fakeBee.URL), logger))
+	srv := httptest.NewServer(api.New(cfg, store.NewMemory(), bee.New(fakeBee.URL), nil, logger))
 	t.Cleanup(srv.Close)
 	return srv.URL
 }
@@ -112,6 +122,11 @@ func md5hex(s string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+var (
+	testBatch     = strings.Repeat("ab", 32)
+	unusableBatch = strings.Repeat("00", 32)
+)
+
 func TestObjectRoundTrip(t *testing.T) {
 	base := newGateway(t)
 
@@ -128,6 +143,12 @@ func TestObjectRoundTrip(t *testing.T) {
 	if resp.Header.Get("x-swarm-reference") == "" {
 		t.Fatal("missing x-swarm-reference header")
 	}
+	if got := resp.Header.Get("x-swarm-postage-batch-id"); got != testBatch {
+		t.Fatalf("x-swarm-postage-batch-id = %q", got)
+	}
+	if ttl, err := strconv.Atoi(resp.Header.Get("x-swarm-batch-ttl")); err != nil || ttl <= 0 || ttl > 7200 {
+		t.Fatalf("x-swarm-batch-ttl = %q, %v", resp.Header.Get("x-swarm-batch-ttl"), err)
+	}
 
 	// GET
 	resp = do(t, http.MethodGet, base+"/demo/docs/hello.txt", nil, nil, http.StatusOK)
@@ -141,6 +162,9 @@ func TestObjectRoundTrip(t *testing.T) {
 	}
 	if got := resp.Header.Get("x-amz-meta-origin"); got != "test" {
 		t.Fatalf("x-amz-meta-origin = %q", got)
+	}
+	if got := resp.Header.Get("x-swarm-postage-batch-id"); got != testBatch {
+		t.Fatalf("GET x-swarm-postage-batch-id = %q", got)
 	}
 
 	// Range GET
@@ -272,6 +296,21 @@ func TestDeleteObjectsBatch(t *testing.T) {
 		}
 	}
 	do(t, http.MethodDelete, base+"/batch", nil, nil, http.StatusNoContent).Body.Close()
+}
+
+func TestPutRejectsBadBatch(t *testing.T) {
+	base := newGateway(t)
+	do(t, http.MethodPut, base+"/badbatch", nil, nil, http.StatusOK).Body.Close()
+
+	// A positively-diagnosed batch problem must fail the PUT synchronously
+	// (design §6 ack policy) with the SwarmPostageError extension code.
+	resp := do(t, http.MethodPut, base+"/badbatch/key.txt", strings.NewReader("data"),
+		map[string]string{"x-swarm-postage-batch-id": unusableBatch}, http.StatusPaymentRequired)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), "<Code>SwarmPostageError</Code>") {
+		t.Fatalf("expected SwarmPostageError, got: %s", body)
+	}
 }
 
 func TestBucketBasics(t *testing.T) {

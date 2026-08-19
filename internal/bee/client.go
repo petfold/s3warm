@@ -107,6 +107,42 @@ func (c *Client) DownloadBytes(ctx context.Context, ref, rangeHeader string) (*h
 	return resp, nil
 }
 
+// Stamp is a postage batch as reported by GET /stamps/{id}.
+type Stamp struct {
+	BatchID          string  `json:"batchID"`
+	Exists           bool    `json:"exists"`
+	Usable           bool    `json:"usable"`
+	Utilization      uint64  `json:"utilization"`
+	UtilizationRatio float64 `json:"utilizationRatio"`
+	Depth            uint8   `json:"depth"`
+	BucketDepth      uint8   `json:"bucketDepth"`
+	Amount           string  `json:"amount"`
+	BatchTTL         int64   `json:"batchTTL"` // seconds; negative = unknown/unbounded
+	ImmutableFlag    bool    `json:"immutableFlag"`
+	Label            string  `json:"label"`
+}
+
+// Stamp fetches one postage batch's state from the node.
+func (c *Client) Stamp(ctx context.Context, batchID string) (*Stamp, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/stamps/"+batchID, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, newStatusError(resp)
+	}
+	var out Stamp
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("bee: decoding stamp response: %w", err)
+	}
+	return &out, nil
+}
+
 func (c *Client) Health(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/health", nil)
 	if err != nil {

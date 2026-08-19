@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/base64"
@@ -47,6 +48,14 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 	if batch == "" {
 		batch = s.cfg.BatchID
 	}
+	// Synchronous batch validation (design §6, §9): a positively-diagnosed
+	// batch problem must surface on the PUT, never after the ack.
+	if batch != "" && r.ContentLength != 0 {
+		if err := s.stamps.Check(ctx, batch); err != nil {
+			s.writeError(w, r, errSwarmPostage.withMessage(err.Error()))
+			return
+		}
+	}
 
 	var ref string
 	if r.ContentLength != 0 {
@@ -87,6 +96,7 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 		Bucket:       bucket,
 		Key:          key,
 		SwarmRef:     ref,
+		BatchID:      batch,
 		Size:         body.n,
 		ETag:         etag,
 		ContentType:  r.Header.Get("Content-Type"),
@@ -104,8 +114,21 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 		// key, so it stays private (design §12).
 		w.Header().Set("x-swarm-reference", ref)
 	}
+	s.setBatchHeaders(ctx, w.Header(), batch)
 	w.Header().Set("ETag", `"`+etag+`"`)
 	w.WriteHeader(http.StatusOK)
+}
+
+// setBatchHeaders surfaces batch identity and estimated remaining life
+// (design §9: expiry is a real S3 difference, so it is made visible).
+func (s *Server) setBatchHeaders(ctx context.Context, h http.Header, batch string) {
+	if batch == "" {
+		return
+	}
+	h.Set("x-swarm-postage-batch-id", batch)
+	if info, err := s.stamps.Get(ctx, batch); err == nil {
+		h.Set("x-swarm-batch-ttl", strconv.FormatInt(int64(info.TTLRemaining().Seconds()), 10))
+	}
 }
 
 // handleGetObject serves GetObject (withBody) and HeadObject.
@@ -147,6 +170,7 @@ func (s *Server) handleGetObject(w http.ResponseWriter, r *http.Request, bucket,
 	if obj.SwarmRef != "" && !s.cfg.Encrypt {
 		h.Set("x-swarm-reference", obj.SwarmRef)
 	}
+	s.setBatchHeaders(ctx, h, obj.BatchID)
 
 	if !withBody || obj.SwarmRef == "" {
 		h.Set("Content-Length", strconv.FormatInt(obj.Size, 10))

@@ -15,6 +15,7 @@ import (
 	"github.com/petfold/s3warm/internal/api"
 	"github.com/petfold/s3warm/internal/bee"
 	"github.com/petfold/s3warm/internal/config"
+	"github.com/petfold/s3warm/internal/stamp"
 	"github.com/petfold/s3warm/internal/store"
 )
 
@@ -51,7 +52,17 @@ func main() {
 		st = sq
 	}
 
-	handler := api.New(cfg, st, bee.New(cfg.BeeAPI), logger)
+	beeClient := bee.New(cfg.BeeAPI)
+	stamps := stamp.NewManager(beeClient, logger)
+	if cfg.BatchID != "" {
+		checkCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := stamps.Check(checkCtx, cfg.BatchID); err != nil {
+			logger.Warn("default postage batch", "err", err)
+		}
+		cancel()
+	}
+
+	handler := api.New(cfg, st, beeClient, stamps, logger)
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           handler,
@@ -60,6 +71,7 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go stamps.Run(ctx)
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

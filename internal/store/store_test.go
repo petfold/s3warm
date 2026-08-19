@@ -28,6 +28,7 @@ func obj(bucket, key string) Object {
 		Bucket:       bucket,
 		Key:          key,
 		SwarmRef:     "ref-" + key,
+		BatchID:      "batch-" + key,
 		Size:         int64(len(key)),
 		ETag:         "etag-" + key,
 		ContentType:  "text/plain",
@@ -106,7 +107,7 @@ func TestObjectLifecycle(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got.SwarmRef != want.SwarmRef || got.ETag != want.ETag || got.Size != want.Size ||
+		if got.SwarmRef != want.SwarmRef || got.BatchID != want.BatchID || got.ETag != want.ETag || got.Size != want.Size ||
 			got.ContentType != want.ContentType || got.StorageClass != want.StorageClass ||
 			got.UserMetadata["origin"] != "test" || !got.LastModified.Equal(want.LastModified) {
 			t.Fatalf("GetObject = %+v, want %+v", got, want)

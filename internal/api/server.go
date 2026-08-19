@@ -17,6 +17,7 @@ import (
 	"github.com/petfold/s3warm/internal/auth"
 	"github.com/petfold/s3warm/internal/bee"
 	"github.com/petfold/s3warm/internal/config"
+	"github.com/petfold/s3warm/internal/stamp"
 	"github.com/petfold/s3warm/internal/store"
 )
 
@@ -24,11 +25,12 @@ type Server struct {
 	cfg      *config.Config
 	store    store.Store
 	bee      *bee.Client
+	stamps   *stamp.Manager
 	verifier *auth.Verifier
 	log      *slog.Logger
 }
 
-func New(cfg *config.Config, st store.Store, beeClient *bee.Client, logger *slog.Logger) *Server {
+func New(cfg *config.Config, st store.Store, beeClient *bee.Client, stamps *stamp.Manager, logger *slog.Logger) *Server {
 	creds := auth.StaticCredentials{}
 	if cfg.AccessKey != "" {
 		creds[cfg.AccessKey] = cfg.SecretKey
@@ -36,10 +38,14 @@ func New(cfg *config.Config, st store.Store, beeClient *bee.Client, logger *slog
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if stamps == nil {
+		stamps = stamp.NewManager(beeClient, logger)
+	}
 	return &Server{
-		cfg:   cfg,
-		store: st,
-		bee:   beeClient,
+		cfg:    cfg,
+		store:  st,
+		bee:    beeClient,
+		stamps: stamps,
 		verifier: &auth.Verifier{
 			Creds:          creds,
 			AllowAnonymous: cfg.AccessKey == "",

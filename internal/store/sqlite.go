@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite" // cgo-free sqlite driver
@@ -28,6 +29,7 @@ CREATE TABLE IF NOT EXISTS objects (
 	bucket        TEXT NOT NULL,
 	key           TEXT NOT NULL,
 	swarm_ref     TEXT NOT NULL,
+	batch_id      TEXT NOT NULL DEFAULT '',
 	size          INTEGER NOT NULL,
 	etag          TEXT NOT NULL,
 	content_type  TEXT NOT NULL DEFAULT '',
@@ -48,6 +50,13 @@ func OpenSQLite(path string) (*SQLite, error) {
 	if _, err := db.Exec(sqliteSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("initializing schema: %w", err)
+	}
+	// Migration for pre-batch_id databases; a duplicate-column error means
+	// the schema is already current.
+	if _, err := db.Exec(`ALTER TABLE objects ADD COLUMN batch_id TEXT NOT NULL DEFAULT ''`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column") {
+		db.Close()
+		return nil, fmt.Errorf("migrating schema: %w", err)
 	}
 	return &SQLite{db: db}, nil
 }
@@ -143,10 +152,10 @@ func (s *SQLite) PutObject(ctx context.Context, o Object) error {
 	}
 	res, err := s.db.ExecContext(ctx,
 		`INSERT OR REPLACE INTO objects
-		 (bucket, key, swarm_ref, size, etag, content_type, storage_class, user_meta, last_modified)
-		 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+		 (bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified)
+		 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 		 WHERE EXISTS (SELECT 1 FROM buckets WHERE name = ?1)`,
-		o.Bucket, o.Key, o.SwarmRef, o.Size, o.ETag, o.ContentType,
+		o.Bucket, o.Key, o.SwarmRef, o.BatchID, o.Size, o.ETag, o.ContentType,
 		o.StorageClass, string(meta), o.LastModified.UTC().Format(timeLayout))
 	if err != nil {
 		return err
@@ -157,12 +166,12 @@ func (s *SQLite) PutObject(ctx context.Context, o Object) error {
 	return nil
 }
 
-const objectColumns = `bucket, key, swarm_ref, size, etag, content_type, storage_class, user_meta, last_modified`
+const objectColumns = `bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified`
 
 func scanObject(row interface{ Scan(...any) error }) (*Object, error) {
 	var o Object
 	var meta, modified string
-	if err := row.Scan(&o.Bucket, &o.Key, &o.SwarmRef, &o.Size, &o.ETag,
+	if err := row.Scan(&o.Bucket, &o.Key, &o.SwarmRef, &o.BatchID, &o.Size, &o.ETag,
 		&o.ContentType, &o.StorageClass, &meta, &modified); err != nil {
 		return nil, err
 	}

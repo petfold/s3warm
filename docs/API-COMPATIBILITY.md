@@ -72,8 +72,8 @@ Design rationale: [`DESIGN.md`](DESIGN.md).
 | Extension | Direction | Meaning |
 |---|---|---|
 | `x-swarm-reference` | response | Swarm reference of the object (omitted for encrypted objects) |
-| `x-swarm-postage-batch-id` | request | Batch override for this write / bucket default at CreateBucket |
-| `x-swarm-batch-ttl` | response | 🎯 P1 — seconds until the object's batch expires |
+| `x-swarm-postage-batch-id` | request + response | Request: batch override for this write / bucket default at CreateBucket. Response: the batch that stamped the object (PUT/GET/HEAD) |
+| `x-swarm-batch-ttl` | response | ✅ Estimated seconds until the object's batch expires (PUT/GET/HEAD) |
 | `x-swarm-bucket-root` | response | 🎯 P2 — current commit root of the bucket (HeadBucket); capture it to snapshot |
 | `x-swarm-commit-seq` | response | 🎯 P2 — bucket commit sequence number (HeadBucket) |
 | Snapshot / rollback | extension op | 🎯 P2 — label a commit root; restore the bucket head to one (bucket-resource extension + admin CLI, design §5) |

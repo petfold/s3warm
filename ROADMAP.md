@@ -24,7 +24,7 @@ Exit: `aws s3 cp/ls/rm` round-trips against `bee dev`.
 Exit: rclone syncs a real tree; s3-tests subset green.
 
 - [x] SQLite index (§5) — cgo-free (modernc.org/sqlite), WAL mode, conformance suite shared with the in-memory store; persistence verified across a gateway restart against a live Bee node
-- [ ] Stamp manager v1: batch binding, utilization/TTL monitoring, `x-swarm-batch-ttl` (§9)
+- [x] Stamp manager v1 (§9): cached batch state, synchronous pre-upload validation (402 `SwarmPostageError` per the §6 ack rule), `x-swarm-postage-batch-id`/`x-swarm-batch-ttl` on PUT/GET/HEAD, background capacity/TTL warnings — Prometheus gauges land with the metrics item
 - [ ] Conditional-request hardening (§10)
 - [ ] Explicit ack-policy surface, `network`/`node` tiers (§6)
 - [ ] docker-compose harness with `bee dev` (§15)
