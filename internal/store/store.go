@@ -15,6 +15,7 @@ var (
 	ErrBucketExists       = errors.New("bucket already exists")
 	ErrBucketNotEmpty     = errors.New("bucket not empty")
 	ErrObjectNotFound     = errors.New("object not found")
+	ErrUploadNotFound     = errors.New("multipart upload not found")
 	ErrPreconditionFailed = errors.New("precondition failed")
 )
 
@@ -66,6 +67,31 @@ type Object struct {
 	StorageClass string
 	UserMetadata map[string]string
 	LastModified time.Time
+	// Parts is non-empty for composite (multipart) objects: the ordered
+	// part list the gateway stitches on reads (design §7). SwarmRef is
+	// empty for composites.
+	Parts []Part
+}
+
+// Part is one part of a multipart upload / composite object.
+type Part struct {
+	PartNumber   int
+	SwarmRef     string
+	Size         int64
+	ETag         string // hex MD5 of the part, unquoted
+	LastModified time.Time
+}
+
+// MultipartUpload is an in-progress upload session (design §7).
+type MultipartUpload struct {
+	UploadID     string
+	Bucket       string
+	Key          string
+	Initiated    time.Time
+	ContentType  string
+	StorageClass string
+	UserMetadata map[string]string
+	BatchID      string
 }
 
 // Store is the metadata index. Implementations must be safe for concurrent
@@ -88,4 +114,19 @@ type Store interface {
 	// ListObjects returns up to limit objects whose keys begin with prefix and
 	// sort strictly after `after`, in ascending key order.
 	ListObjects(ctx context.Context, bucket, prefix, after string, limit int) ([]Object, error)
+
+	CreateMultipartUpload(ctx context.Context, u MultipartUpload) error
+	// GetMultipartUpload fails with ErrUploadNotFound unless bucket, key and
+	// id all match an in-progress upload.
+	GetMultipartUpload(ctx context.Context, bucket, key, uploadID string) (*MultipartUpload, error)
+	// PutPart upserts a part by number.
+	PutPart(ctx context.Context, uploadID string, p Part) error
+	// ListParts returns up to limit parts with numbers strictly greater than
+	// afterPart, in ascending order.
+	ListParts(ctx context.Context, uploadID string, afterPart, limit int) ([]Part, error)
+	// ListMultipartUploads returns a bucket's in-progress uploads whose keys
+	// begin with prefix, ordered by (key, uploadID).
+	ListMultipartUploads(ctx context.Context, bucket, prefix string) ([]MultipartUpload, error)
+	// DeleteMultipartUpload removes the upload and its parts.
+	DeleteMultipartUpload(ctx context.Context, uploadID string) error
 }

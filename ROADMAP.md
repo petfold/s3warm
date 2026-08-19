@@ -35,7 +35,7 @@ Exit: rclone syncs a real tree; s3-tests subset green.
 
 Exit: restic + Java SDK v2 work; buckets browsable via `bzz://`; snapshot → rollback round-trip.
 
-- [ ] Multipart uploads: composite objects + optional consolidation (§7)
+- [x] Multipart uploads (§7): full API set, composite objects with range-stitched reads, retry-idempotent + conditional complete, `?partNumber` reads; manifest at 250 s3-tests. Still open: async consolidation, UploadPartCopy from composite sources
 - [ ] Presigned URLs (§8)
 - [ ] Streaming signatures (aws-chunked) + trailing checksums (§8)
 - [ ] SSE via `swarm-encrypt` (§12)

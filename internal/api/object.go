@@ -9,10 +9,10 @@ import (
 	"encoding/hex"
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"hash"
 	"io"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -52,25 +52,7 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 		}
 	}
 
-	// Stream the body to Bee while hashing: MD5 for the S3 ETag, SHA-256 to
-	// enforce the signed x-amz-content-sha256 (design §6).
-	md5h := md5.New()
-	writers := []io.Writer{md5h}
-	expectedSHA := strings.ToLower(r.Header.Get("X-Amz-Content-Sha256"))
-	var sha hash.Hash
-	if len(expectedSHA) == 64 {
-		sha = sha256.New()
-		writers = append(writers, sha)
-	}
-	body := &countingReader{r: io.TeeReader(r.Body, io.MultiWriter(writers...))}
-
-	batch := r.Header.Get("x-swarm-postage-batch-id")
-	if batch == "" {
-		batch = b.BatchID
-	}
-	if batch == "" {
-		batch = s.cfg.BatchID
-	}
+	batch := s.resolveBatch(r, b)
 	// Synchronous batch validation (design §6, §9): a positively-diagnosed
 	// batch problem must surface on the PUT, never after the ack.
 	if batch != "" && r.ContentLength != 0 {
@@ -80,48 +62,19 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 		}
 	}
 
-	var ref string
-	if r.ContentLength != 0 {
-		ref, err = s.bee.UploadBytes(ctx, body, bee.UploadOptions{
-			BatchID:         batch,
-			Encrypt:         s.cfg.Encrypt,
-			RedundancyLevel: s.redundancyFor(r.Header.Get("x-amz-storage-class")),
-			Deferred:        s.cfg.Ack != "network",
-			ContentLength:   r.ContentLength,
-		})
-		if err != nil {
-			s.writeError(w, r, beeError(err))
-			return
-		}
-	}
-	// Zero-byte objects (e.g. directory markers) are indexed without a Swarm
-	// upload; MD5 of the empty payload still applies.
-
-	md5sum := md5h.Sum(nil)
-	if sha != nil {
-		if got := hex.EncodeToString(sha.Sum(nil)); got != expectedSHA {
-			// The upload happened, but the object is not indexed; the stray
-			// stamped bytes simply expire (design §6).
-			s.writeError(w, r, errSHA256Mismatch)
-			return
-		}
-	}
-	if cmd5 := r.Header.Get("Content-MD5"); cmd5 != "" {
-		want, err := base64.StdEncoding.DecodeString(cmd5)
-		if err != nil || !bytes.Equal(want, md5sum) {
-			s.writeError(w, r, errBadDigest)
-			return
-		}
+	res, apiErr := s.uploadBody(r, batch, r.Header.Get("x-amz-storage-class"))
+	if apiErr != nil {
+		s.writeError(w, r, *apiErr)
+		return
 	}
 
-	etag := hex.EncodeToString(md5sum)
 	obj := store.Object{
 		Bucket:       bucket,
 		Key:          key,
-		SwarmRef:     ref,
+		SwarmRef:     res.Ref,
 		BatchID:      batch,
-		Size:         body.n,
-		ETag:         etag,
+		Size:         res.Size,
+		ETag:         res.ETag,
 		ContentType:  r.Header.Get("Content-Type"),
 		StorageClass: storageClassOf(r.Header.Get("x-amz-storage-class")),
 		UserMetadata: userMetadata(r.Header),
@@ -134,15 +87,82 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 		return
 	}
 
-	if ref != "" && !s.cfg.Encrypt {
+	if res.Ref != "" && !s.cfg.Encrypt {
 		// For encrypted objects the 64-byte reference embeds the decryption
 		// key, so it stays private (design §12).
-		w.Header().Set("x-swarm-reference", ref)
+		w.Header().Set("x-swarm-reference", res.Ref)
 	}
 	s.setBatchHeaders(ctx, w.Header(), batch)
-	w.Header().Set("ETag", `"`+etag+`"`)
+	w.Header().Set("ETag", `"`+res.ETag+`"`)
 	w.WriteHeader(http.StatusOK)
-	metrics.ObjectBytesIn.Add(float64(body.n))
+	metrics.ObjectBytesIn.Add(float64(res.Size))
+}
+
+// resolveBatch picks the postage batch for a write: request header override,
+// then bucket default, then gateway default (design §9).
+func (s *Server) resolveBatch(r *http.Request, b *store.Bucket) string {
+	if batch := r.Header.Get("x-swarm-postage-batch-id"); batch != "" {
+		return batch
+	}
+	if b.BatchID != "" {
+		return b.BatchID
+	}
+	return s.cfg.BatchID
+}
+
+// uploadResult is the outcome of streaming a request body to Swarm.
+type uploadResult struct {
+	Ref  string // empty for zero-byte bodies
+	Size int64
+	ETag string // hex MD5, unquoted
+}
+
+// uploadBody streams r's body to Bee while hashing — MD5 for the S3 ETag,
+// SHA-256 to enforce the signed x-amz-content-sha256 — and verifies
+// Content-MD5. Zero-byte bodies are not uploaded (MD5 of the empty payload
+// still applies). On error nothing is indexed by the caller; stray stamped
+// bytes expire with their batch (design §6).
+func (s *Server) uploadBody(r *http.Request, batch, storageClass string) (*uploadResult, *apiError) {
+	md5h := md5.New()
+	writers := []io.Writer{md5h}
+	expectedSHA := strings.ToLower(r.Header.Get("X-Amz-Content-Sha256"))
+	var sha hash.Hash
+	if len(expectedSHA) == 64 {
+		sha = sha256.New()
+		writers = append(writers, sha)
+	}
+	body := &countingReader{r: io.TeeReader(r.Body, io.MultiWriter(writers...))}
+
+	var ref string
+	if r.ContentLength != 0 {
+		var err error
+		ref, err = s.bee.UploadBytes(r.Context(), body, bee.UploadOptions{
+			BatchID:         batch,
+			Encrypt:         s.cfg.Encrypt,
+			RedundancyLevel: s.redundancyFor(storageClass),
+			Deferred:        s.cfg.Ack != "network",
+			ContentLength:   r.ContentLength,
+		})
+		if err != nil {
+			e := beeError(err)
+			return nil, &e
+		}
+	}
+	md5sum := md5h.Sum(nil)
+	if sha != nil {
+		if got := hex.EncodeToString(sha.Sum(nil)); got != expectedSHA {
+			e := errSHA256Mismatch
+			return nil, &e
+		}
+	}
+	if cmd5 := r.Header.Get("Content-MD5"); cmd5 != "" {
+		want, err := base64.StdEncoding.DecodeString(cmd5)
+		if err != nil || !bytes.Equal(want, md5sum) {
+			e := errBadDigest
+			return nil, &e
+		}
+	}
+	return &uploadResult{Ref: ref, Size: body.n, ETag: hex.EncodeToString(md5sum)}, nil
 }
 
 // setBatchHeaders surfaces batch identity and estimated remaining life
@@ -191,13 +211,28 @@ func (s *Server) handleGetObject(w http.ResponseWriter, r *http.Request, bucket,
 	h.Set("Content-Type", ct)
 	h.Set("x-amz-storage-class", obj.StorageClass)
 	for k, v := range obj.UserMetadata {
-		h.Set("x-amz-meta-"+k, v)
+		// Direct map write: Go's Set would canonicalize to X-Amz-Meta-Foo and
+		// clients would round-trip the metadata key as "Foo"; AWS emits
+		// all-lowercase.
+		h["x-amz-meta-"+k] = []string{v}
 	}
 	if obj.SwarmRef != "" && !s.cfg.Encrypt {
 		h.Set("x-swarm-reference", obj.SwarmRef)
 	}
 	s.setBatchHeaders(ctx, h, obj.BatchID)
 
+	if pn := r.URL.Query().Get("partNumber"); pn != "" {
+		// GetObject/HeadObject by part: rewrite into the part's byte range.
+		if apiErr := preparePartRequest(r, h, obj, pn); apiErr != nil {
+			s.writeError(w, r, *apiErr)
+			return
+		}
+	}
+
+	if withBody && len(obj.Parts) > 0 {
+		s.serveComposite(w, r, obj)
+		return
+	}
 	if !withBody || obj.SwarmRef == "" {
 		h.Set("Content-Length", strconv.FormatInt(obj.Size, 10))
 		w.WriteHeader(http.StatusOK)
@@ -272,19 +307,13 @@ func (s *Server) handleDeleteObjects(w http.ResponseWriter, r *http.Request, buc
 
 func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	ctx := r.Context()
-	src := r.Header.Get("x-amz-copy-source")
-	if strings.Contains(src, "?versionId=") {
+	if strings.Contains(r.Header.Get("x-amz-copy-source"), "?versionId=") {
 		s.notImplemented(w, r, "CopyObject with versionId")
 		return
 	}
-	unescaped, err := url.PathUnescape(src)
-	if err != nil {
-		s.writeError(w, r, errInvalidArgument.withMessage("invalid x-amz-copy-source"))
-		return
-	}
-	srcBucket, srcKey, ok := strings.Cut(strings.TrimPrefix(unescaped, "/"), "/")
-	if !ok || srcKey == "" {
-		s.writeError(w, r, errInvalidArgument.withMessage("x-amz-copy-source must be of the form bucket/key"))
+	srcBucket, srcKey, apiErr := parseCopySource(r)
+	if apiErr != nil {
+		s.writeError(w, r, *apiErr)
 		return
 	}
 	if _, err := s.store.GetBucket(ctx, bucket); err != nil {
@@ -358,6 +387,140 @@ func checkConditionals(r *http.Request, obj *store.Object) (int, bool) {
 		}
 	}
 	return 0, true
+}
+
+// serveComposite streams a multipart (composite) object by mapping the
+// requested byte range onto the ordered part list and issuing consecutive
+// sub-range reads against Bee — the join happens here, fully streaming
+// (design §7).
+func (s *Server) serveComposite(w http.ResponseWriter, r *http.Request, obj *store.Object) {
+	ctx := r.Context()
+	h := w.Header()
+
+	start, length := int64(0), obj.Size
+	status := http.StatusOK
+	if spec := r.Header.Get("Range"); spec != "" {
+		st, en, ok, satisfiable := parseRangeSpec(spec, obj.Size)
+		if !satisfiable {
+			s.writeError(w, r, errInvalidRange)
+			return
+		}
+		if ok { // unparseable/multi-range specs serve the full body, as S3 does
+			start, length = st, en-st+1
+			status = http.StatusPartialContent
+			h.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", st, en, obj.Size))
+		}
+	}
+	h.Set("Content-Length", strconv.FormatInt(length, 10))
+	w.WriteHeader(status)
+
+	var served, partOffset int64
+	remaining := length
+	for _, p := range obj.Parts {
+		if remaining <= 0 {
+			break
+		}
+		partStart, partEnd := partOffset, partOffset+p.Size-1
+		partOffset += p.Size
+		if p.Size == 0 || partEnd < start {
+			continue
+		}
+		lo := max(start-partStart, 0)
+		hi := min(p.Size-1, lo+remaining-1)
+		resp, err := s.bee.DownloadBytes(ctx, p.SwarmRef, fmt.Sprintf("bytes=%d-%d", lo, hi))
+		if err != nil {
+			// Headers are already written; the truncated body is all we can
+			// signal with. Log loudly.
+			s.log.Error("composite read failed mid-stream",
+				"bucket", obj.Bucket, "key", obj.Key, "part", p.PartNumber, "err", err)
+			return
+		}
+		n, err := io.Copy(w, resp.Body)
+		resp.Body.Close()
+		served += n
+		remaining -= n
+		if err != nil {
+			return // client hangup or upstream failure
+		}
+	}
+	metrics.ObjectBytesOut.Add(float64(served))
+}
+
+// preparePartRequest maps a GET/HEAD `partNumber` onto the part's byte range
+// (S3 semantics: a non-multipart object is one part; out-of-range part
+// numbers are 400 InvalidPart). Sets x-amz-mp-parts-count for composites.
+func preparePartRequest(r *http.Request, h http.Header, obj *store.Object, pnStr string) *apiError {
+	n, err := strconv.Atoi(pnStr)
+	if err != nil || n < 1 || n > maxPartNumber {
+		e := errInvalidArgument.withMessage("invalid partNumber")
+		return &e
+	}
+	if len(obj.Parts) == 0 {
+		if n != 1 {
+			e := errInvalidPart
+			return &e
+		}
+		if obj.Size > 0 {
+			r.Header.Set("Range", "bytes=0-")
+		}
+		return nil
+	}
+	if n > len(obj.Parts) {
+		e := errInvalidPart
+		return &e
+	}
+	h.Set("x-amz-mp-parts-count", strconv.Itoa(len(obj.Parts)))
+	var start int64
+	for _, p := range obj.Parts[:n-1] {
+		start += p.Size
+	}
+	if size := obj.Parts[n-1].Size; size > 0 {
+		r.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, start+size-1))
+	}
+	return nil
+}
+
+// parseRangeSpec parses a single-range header against size (end inclusive).
+// ok=false means "ignore the header, serve the whole body" (S3's behavior
+// for multi-range or malformed specs); satisfiable=false means 416.
+func parseRangeSpec(spec string, size int64) (start, end int64, ok, satisfiable bool) {
+	v, found := strings.CutPrefix(spec, "bytes=")
+	if !found || strings.Contains(v, ",") {
+		return 0, 0, false, true
+	}
+	first, last, found := strings.Cut(strings.TrimSpace(v), "-")
+	if !found {
+		return 0, 0, false, true
+	}
+	if first == "" { // suffix form: last N bytes
+		n, err := strconv.ParseInt(last, 10, 64)
+		if err != nil {
+			return 0, 0, false, true
+		}
+		if n <= 0 || size == 0 {
+			return 0, 0, false, false
+		}
+		return max(size-n, 0), size - 1, true, true
+	}
+	st, err := strconv.ParseInt(first, 10, 64)
+	if err != nil || st < 0 {
+		return 0, 0, false, true
+	}
+	if st >= size {
+		return 0, 0, false, false
+	}
+	en := size - 1
+	if last != "" {
+		en, err = strconv.ParseInt(last, 10, 64)
+		if err != nil {
+			return 0, 0, false, true
+		}
+		if en < st {
+			return 0, 0, false, true
+		}
+		en = min(en, size-1)
+	}
+	return st, en, true, true
 }
 
 // copySourceConditionals evaluates x-amz-copy-source-if-* against the

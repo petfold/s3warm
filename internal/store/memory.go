@@ -12,6 +12,7 @@ import (
 type Memory struct {
 	mu      sync.RWMutex
 	buckets map[string]*memBucket
+	uploads map[string]*memUpload
 }
 
 type memBucket struct {
@@ -19,8 +20,16 @@ type memBucket struct {
 	objects map[string]Object
 }
 
+type memUpload struct {
+	meta  MultipartUpload
+	parts map[int]Part
+}
+
 func NewMemory() *Memory {
-	return &Memory{buckets: make(map[string]*memBucket)}
+	return &Memory{
+		buckets: make(map[string]*memBucket),
+		uploads: make(map[string]*memUpload),
+	}
 }
 
 func (m *Memory) CreateBucket(_ context.Context, b Bucket) error {
@@ -134,4 +143,94 @@ func (m *Memory) ListObjects(_ context.Context, bucket, prefix, after string, li
 		out = append(out, b.objects[k])
 	}
 	return out, nil
+}
+
+func (m *Memory) CreateMultipartUpload(_ context.Context, u MultipartUpload) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.buckets[u.Bucket]; !ok {
+		return ErrBucketNotFound
+	}
+	if u.Initiated.IsZero() {
+		u.Initiated = time.Now().UTC()
+	}
+	m.uploads[u.UploadID] = &memUpload{meta: u, parts: make(map[int]Part)}
+	return nil
+}
+
+func (m *Memory) GetMultipartUpload(_ context.Context, bucket, key, uploadID string) (*MultipartUpload, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	u, ok := m.uploads[uploadID]
+	if !ok || u.meta.Bucket != bucket || u.meta.Key != key {
+		return nil, ErrUploadNotFound
+	}
+	meta := u.meta
+	return &meta, nil
+}
+
+func (m *Memory) PutPart(_ context.Context, uploadID string, p Part) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	u, ok := m.uploads[uploadID]
+	if !ok {
+		return ErrUploadNotFound
+	}
+	u.parts[p.PartNumber] = p
+	return nil
+}
+
+func (m *Memory) ListParts(_ context.Context, uploadID string, afterPart, limit int) ([]Part, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	u, ok := m.uploads[uploadID]
+	if !ok {
+		return nil, ErrUploadNotFound
+	}
+	nums := make([]int, 0, len(u.parts))
+	for n := range u.parts {
+		if n > afterPart {
+			nums = append(nums, n)
+		}
+	}
+	sort.Ints(nums)
+	if limit >= 0 && len(nums) > limit {
+		nums = nums[:limit]
+	}
+	out := make([]Part, 0, len(nums))
+	for _, n := range nums {
+		out = append(out, u.parts[n])
+	}
+	return out, nil
+}
+
+func (m *Memory) ListMultipartUploads(_ context.Context, bucket, prefix string) ([]MultipartUpload, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if _, ok := m.buckets[bucket]; !ok {
+		return nil, ErrBucketNotFound
+	}
+	var out []MultipartUpload
+	for _, u := range m.uploads {
+		if u.meta.Bucket == bucket && strings.HasPrefix(u.meta.Key, prefix) {
+			out = append(out, u.meta)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Key != out[j].Key {
+			return out[i].Key < out[j].Key
+		}
+		return out[i].UploadID < out[j].UploadID
+	})
+	return out, nil
+}
+
+func (m *Memory) DeleteMultipartUpload(_ context.Context, uploadID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.uploads[uploadID]; !ok {
+		return ErrUploadNotFound
+	}
+	delete(m.uploads, uploadID)
+	return nil
 }

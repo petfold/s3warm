@@ -36,7 +36,27 @@ CREATE TABLE IF NOT EXISTS objects (
 	storage_class TEXT NOT NULL DEFAULT '',
 	user_meta     TEXT NOT NULL DEFAULT 'null',
 	last_modified TEXT NOT NULL,
+	parts         TEXT NOT NULL DEFAULT '',
 	PRIMARY KEY (bucket, key)
+);
+CREATE TABLE IF NOT EXISTS multipart_uploads (
+	upload_id     TEXT PRIMARY KEY,
+	bucket        TEXT NOT NULL,
+	key           TEXT NOT NULL,
+	initiated     TEXT NOT NULL,
+	content_type  TEXT NOT NULL DEFAULT '',
+	storage_class TEXT NOT NULL DEFAULT '',
+	user_meta     TEXT NOT NULL DEFAULT 'null',
+	batch_id      TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS multipart_parts (
+	upload_id     TEXT NOT NULL,
+	part_number   INTEGER NOT NULL,
+	swarm_ref     TEXT NOT NULL,
+	size          INTEGER NOT NULL,
+	etag          TEXT NOT NULL,
+	last_modified TEXT NOT NULL,
+	PRIMARY KEY (upload_id, part_number)
 );
 `
 
@@ -51,12 +71,16 @@ func OpenSQLite(path string) (*SQLite, error) {
 		db.Close()
 		return nil, fmt.Errorf("initializing schema: %w", err)
 	}
-	// Migration for pre-batch_id databases; a duplicate-column error means
+	// Column migrations for older databases; a duplicate-column error means
 	// the schema is already current.
-	if _, err := db.Exec(`ALTER TABLE objects ADD COLUMN batch_id TEXT NOT NULL DEFAULT ''`); err != nil &&
-		!strings.Contains(err.Error(), "duplicate column") {
-		db.Close()
-		return nil, fmt.Errorf("migrating schema: %w", err)
+	for _, mig := range []string{
+		`ALTER TABLE objects ADD COLUMN batch_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE objects ADD COLUMN parts TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.Exec(mig); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			db.Close()
+			return nil, fmt.Errorf("migrating schema: %w", err)
+		}
 	}
 	return &SQLite{db: db}, nil
 }
@@ -176,27 +200,38 @@ func (s *SQLite) PutObject(ctx context.Context, o Object, cond *PutCondition) er
 			return ErrPreconditionFailed
 		}
 	}
+	parts := ""
+	if len(o.Parts) > 0 {
+		b, err := json.Marshal(o.Parts)
+		if err != nil {
+			return err
+		}
+		parts = string(b)
+	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT OR REPLACE INTO objects
-		 (bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 (bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		o.Bucket, o.Key, o.SwarmRef, o.BatchID, o.Size, o.ETag, o.ContentType,
-		o.StorageClass, string(meta), o.LastModified.UTC().Format(timeLayout)); err != nil {
+		o.StorageClass, string(meta), o.LastModified.UTC().Format(timeLayout), parts); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-const objectColumns = `bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified`
+const objectColumns = `bucket, key, swarm_ref, batch_id, size, etag, content_type, storage_class, user_meta, last_modified, parts`
 
 func scanObject(row interface{ Scan(...any) error }) (*Object, error) {
 	var o Object
-	var meta, modified string
+	var meta, modified, parts string
 	if err := row.Scan(&o.Bucket, &o.Key, &o.SwarmRef, &o.BatchID, &o.Size, &o.ETag,
-		&o.ContentType, &o.StorageClass, &meta, &modified); err != nil {
+		&o.ContentType, &o.StorageClass, &meta, &modified, &parts); err != nil {
 		return nil, err
 	}
 	json.Unmarshal([]byte(meta), &o.UserMetadata) //nolint:errcheck // written by us
+	if parts != "" {
+		json.Unmarshal([]byte(parts), &o.Parts) //nolint:errcheck // written by us
+	}
 	o.LastModified, _ = time.Parse(timeLayout, modified)
 	return &o, nil
 }
@@ -261,6 +296,148 @@ func (s *SQLite) ListObjects(ctx context.Context, bucket, prefix, after string, 
 		out = append(out, *o)
 	}
 	return out, rows.Err()
+}
+
+func (s *SQLite) CreateMultipartUpload(ctx context.Context, u MultipartUpload) error {
+	if _, err := s.GetBucket(ctx, u.Bucket); err != nil {
+		return err
+	}
+	if u.Initiated.IsZero() {
+		u.Initiated = time.Now().UTC()
+	}
+	meta, err := json.Marshal(u.UserMetadata)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO multipart_uploads
+		 (upload_id, bucket, key, initiated, content_type, storage_class, user_meta, batch_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		u.UploadID, u.Bucket, u.Key, u.Initiated.UTC().Format(timeLayout),
+		u.ContentType, u.StorageClass, string(meta), u.BatchID)
+	return err
+}
+
+func (s *SQLite) GetMultipartUpload(ctx context.Context, bucket, key, uploadID string) (*MultipartUpload, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT upload_id, bucket, key, initiated, content_type, storage_class, user_meta, batch_id
+		 FROM multipart_uploads WHERE upload_id = ? AND bucket = ? AND key = ?`,
+		uploadID, bucket, key)
+	var u MultipartUpload
+	var initiated, meta string
+	if err := row.Scan(&u.UploadID, &u.Bucket, &u.Key, &initiated,
+		&u.ContentType, &u.StorageClass, &meta, &u.BatchID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrUploadNotFound
+		}
+		return nil, err
+	}
+	json.Unmarshal([]byte(meta), &u.UserMetadata) //nolint:errcheck // written by us
+	u.Initiated, _ = time.Parse(timeLayout, initiated)
+	return &u, nil
+}
+
+func (s *SQLite) PutPart(ctx context.Context, uploadID string, p Part) error {
+	res, err := s.db.ExecContext(ctx,
+		`INSERT OR REPLACE INTO multipart_parts
+		 (upload_id, part_number, swarm_ref, size, etag, last_modified)
+		 SELECT ?, ?, ?, ?, ?, ?
+		 WHERE EXISTS (SELECT 1 FROM multipart_uploads WHERE upload_id = ?1)`,
+		uploadID, p.PartNumber, p.SwarmRef, p.Size, p.ETag,
+		p.LastModified.UTC().Format(timeLayout))
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return ErrUploadNotFound
+	}
+	return nil
+}
+
+func (s *SQLite) ListParts(ctx context.Context, uploadID string, afterPart, limit int) ([]Part, error) {
+	var one int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT 1 FROM multipart_uploads WHERE upload_id = ?`, uploadID).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrUploadNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if limit < 0 {
+		limit = -1
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT part_number, swarm_ref, size, etag, last_modified
+		 FROM multipart_parts WHERE upload_id = ? AND part_number > ?
+		 ORDER BY part_number LIMIT ?`, uploadID, afterPart, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Part
+	for rows.Next() {
+		var p Part
+		var modified string
+		if err := rows.Scan(&p.PartNumber, &p.SwarmRef, &p.Size, &p.ETag, &modified); err != nil {
+			return nil, err
+		}
+		p.LastModified, _ = time.Parse(timeLayout, modified)
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLite) ListMultipartUploads(ctx context.Context, bucket, prefix string) ([]MultipartUpload, error) {
+	if _, err := s.GetBucket(ctx, bucket); err != nil {
+		return nil, err
+	}
+	end := prefixEnd(prefix)
+	q := `SELECT upload_id, bucket, key, initiated, content_type, storage_class, user_meta, batch_id
+	      FROM multipart_uploads WHERE bucket = ? AND key >= ?`
+	args := []any{bucket, prefix}
+	if end != "" {
+		q += ` AND key < ?`
+		args = append(args, end)
+	}
+	q += ` ORDER BY key, upload_id`
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MultipartUpload
+	for rows.Next() {
+		var u MultipartUpload
+		var initiated, meta string
+		if err := rows.Scan(&u.UploadID, &u.Bucket, &u.Key, &initiated,
+			&u.ContentType, &u.StorageClass, &meta, &u.BatchID); err != nil {
+			return nil, err
+		}
+		json.Unmarshal([]byte(meta), &u.UserMetadata) //nolint:errcheck // written by us
+		u.Initiated, _ = time.Parse(timeLayout, initiated)
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLite) DeleteMultipartUpload(ctx context.Context, uploadID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after commit
+	res, err := tx.ExecContext(ctx, `DELETE FROM multipart_uploads WHERE upload_id = ?`, uploadID)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return ErrUploadNotFound
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM multipart_parts WHERE upload_id = ?`, uploadID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // prefixEnd returns the smallest string greater than every string with the

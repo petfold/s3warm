@@ -136,7 +136,9 @@ func (s *Server) dispatchBucket(w http.ResponseWriter, r *http.Request, bucket s
 			s.handleGetBucketVersioning(w, r, bucket)
 		case q.Has("versions"):
 			s.handleListObjectVersions(w, r, bucket)
-		case anySubresource(q, "uploads", "acl", "policy", "cors", "tagging",
+		case q.Has("uploads"):
+			s.handleListMultipartUploads(w, r, bucket)
+		case anySubresource(q, "acl", "policy", "cors", "tagging",
 			"lifecycle", "encryption", "website", "object-lock", "replication",
 			"logging", "notification", "requestPayment", "accelerate",
 			"intelligent-tiering", "inventory", "metrics", "analytics", "ownershipControls",
@@ -179,7 +181,7 @@ func (s *Server) dispatchObject(w http.ResponseWriter, r *http.Request, bucket, 
 	switch r.Method {
 	case http.MethodGet:
 		if q.Has("uploadId") {
-			s.notImplemented(w, r, "ListParts")
+			s.handleListParts(w, r, bucket, key)
 			return
 		}
 		if anySubresource(q, "acl", "tagging", "attributes", "legal-hold", "retention", "torrent") {
@@ -191,7 +193,11 @@ func (s *Server) dispatchObject(w http.ResponseWriter, r *http.Request, bucket, 
 		s.handleGetObject(w, r, bucket, key, false)
 	case http.MethodPut:
 		if q.Has("uploadId") {
-			s.notImplemented(w, r, "UploadPart")
+			if r.Header.Get("x-amz-copy-source") != "" {
+				s.handleUploadPartCopy(w, r, bucket, key)
+			} else {
+				s.handleUploadPart(w, r, bucket, key)
+			}
 			return
 		}
 		if anySubresource(q, "acl", "tagging", "legal-hold", "retention") {
@@ -205,7 +211,7 @@ func (s *Server) dispatchObject(w http.ResponseWriter, r *http.Request, bucket, 
 		s.handlePutObject(w, r, bucket, key)
 	case http.MethodDelete:
 		if q.Has("uploadId") {
-			s.notImplemented(w, r, "AbortMultipartUpload")
+			s.handleAbortMultipartUpload(w, r, bucket, key)
 			return
 		}
 		if q.Has("tagging") {
@@ -215,11 +221,11 @@ func (s *Server) dispatchObject(w http.ResponseWriter, r *http.Request, bucket, 
 		s.handleDeleteObject(w, r, bucket, key)
 	case http.MethodPost:
 		if q.Has("uploads") {
-			s.notImplemented(w, r, "CreateMultipartUpload")
+			s.handleCreateMultipartUpload(w, r, bucket, key)
 			return
 		}
 		if q.Has("uploadId") {
-			s.notImplemented(w, r, "CompleteMultipartUpload")
+			s.handleCompleteMultipartUpload(w, r, bucket, key)
 			return
 		}
 		s.notImplemented(w, r, "object POST")

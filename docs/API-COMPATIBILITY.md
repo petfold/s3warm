@@ -30,7 +30,7 @@ Design rationale: [`DESIGN.md`](DESIGN.md).
 | GetBucketLifecycleConfiguration | 🎯 P2 | Read-only synthetic rule derived from postage batch TTL |
 | PutBucketLifecycleConfiguration | ❌ | Expiry is postage TTL; extend by topping up the batch |
 | GetBucketTagging / PutBucketTagging | 🎯 P3 | |
-| ListMultipartUploads | 🎯 P2 | |
+| ListMultipartUploads | ✅ | Prefix filter; key/upload-id markers 🎯 |
 | Get/PutBucketNotificationConfiguration | 🎯 research | Candidate mapping to Swarm's native pub-sub (PSS/GSOC), design §21 |
 | Website / Replication / Inventory / Analytics / Metrics / Accelerate / Logging / RequestPayment / ObjectLock config | ❌ | Website = native `bzz://`; replication is inherent to Swarm |
 
@@ -39,17 +39,18 @@ Design rationale: [`DESIGN.md`](DESIGN.md).
 | Operation | Status | Notes |
 |---|---|---|
 | PutObject | ✅ | Streaming; MD5 ETag; `Content-MD5` + `x-amz-content-sha256` enforced; `x-amz-meta-*`; zero-byte objects; `x-swarm-reference` response header |
-| GetObject | ✅ | Range pass-through; conditional headers; composite stitching 🎯 P2 |
+| GetObject | ✅ | Range pass-through; conditional headers; composite (multipart) objects stitched from parts, including ranges across part boundaries |
 | HeadObject | ✅ | |
 | DeleteObject | ✅ | Index removal; bytes expire with the postage batch |
 | DeleteObjects (batch) | ✅ | Quiet mode supported |
 | CopyObject | ✅ | O(1) — same Swarm reference; `x-amz-metadata-directive` COPY/REPLACE; `x-amz-copy-source-if-*` conditionals; `?versionId` source 🎯 P3 |
-| CreateMultipartUpload | 🎯 P2 | |
-| UploadPart | 🎯 P2 | Parts stream straight to `/bytes`, no staging |
-| UploadPartCopy | 🎯 P2 | Whole-object O(1); byte-range re-streams |
-| CompleteMultipartUpload | 🎯 P2 | Composite object + S3 multipart ETag; optional async consolidation |
-| AbortMultipartUpload | 🎯 P2 | Abandoned parts expire with stamps |
-| ListParts | 🎯 P2 | |
+| CreateMultipartUpload | ✅ | Metadata/content-type/storage-class captured; batch validated at initiate |
+| UploadPart | ✅ | Parts stream straight to `/bytes`, no staging; 1–10000, integrity headers enforced |
+| UploadPartCopy | ✅ | Whole-object simple source is O(1) (same reference); byte-range re-streams; composite source 🎯 |
+| CompleteMultipartUpload | ✅ | Composite object + S3 multipart ETag; retry-idempotent; conditional (`If-Match`/`If-None-Match`); min part size enforced; async consolidation 🎯 |
+| AbortMultipartUpload | ✅ | Abandoned parts expire with stamps — GC is automatic |
+| ListParts | ✅ | With part-number-marker/max-parts pagination |
+| GetObject/HeadObject `?partNumber` | ✅ | Part-ranged reads with `x-amz-mp-parts-count`; non-multipart objects are one part |
 | GetObjectAttributes | 🎯 P2 | |
 | GetObjectTagging / PutObjectTagging / DeleteObjectTagging | 🎯 P3 | |
 | GetObjectAcl / PutObjectAcl | 🪧 P2 | Canned `private` |

@@ -41,6 +41,10 @@ var (
 	errBadDigest          = apiError{"BadDigest", http.StatusBadRequest, "The Content-MD5 you specified did not match what we received"}
 	errSHA256Mismatch     = apiError{"XAmzContentSHA256Mismatch", http.StatusBadRequest, "The provided x-amz-content-sha256 header does not match what was computed"}
 	errPreconditionFailed = apiError{"PreconditionFailed", http.StatusPreconditionFailed, "At least one of the preconditions you specified did not hold"}
+	errNoSuchUpload       = apiError{"NoSuchUpload", http.StatusNotFound, "The specified multipart upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed"}
+	errInvalidPart        = apiError{"InvalidPart", http.StatusBadRequest, "One or more of the specified parts could not be found. The part may not have been uploaded, or the specified entity tag may not match the part's entity tag"}
+	errInvalidPartOrder   = apiError{"InvalidPartOrder", http.StatusBadRequest, "The list of parts was not in ascending order. Parts must be ordered by part number"}
+	errEntityTooSmall     = apiError{"EntityTooSmall", http.StatusBadRequest, "Your proposed upload is smaller than the minimum allowed object size. Each part must be at least 5 MB in size, except the last part"}
 	errInvalidRange       = apiError{"InvalidRange", http.StatusRequestedRangeNotSatisfiable, "The requested range is not satisfiable"}
 	// errSwarmPostage is an s3warm extension (design §9): postage batch
 	// problems are 402 so SDKs fail fast instead of retry-looping.
@@ -99,6 +103,8 @@ func storeError(err error) apiError {
 		return errBucketNotEmpty
 	case errors.Is(err, store.ErrPreconditionFailed):
 		return errPreconditionFailed
+	case errors.Is(err, store.ErrUploadNotFound):
+		return errNoSuchUpload
 	default:
 		return errInternal.withMessage(err.Error())
 	}

@@ -370,7 +370,106 @@ func TestBucketBasics(t *testing.T) {
 		t.Fatalf("GetBucketLocation: %s", body)
 	}
 
-	// Multipart is explicitly NotImplemented for now.
-	resp = do(t, http.MethodPost, base+"/valid-bucket/big.bin?uploads", nil, nil, http.StatusNotImplemented)
+}
+
+func TestMultipartRoundTrip(t *testing.T) {
+	base := newGateway(t)
+	do(t, http.MethodPut, base+"/mpu", nil, nil, http.StatusOK).Body.Close()
+
+	// Initiate.
+	resp := do(t, http.MethodPost, base+"/mpu/big.bin?uploads", nil,
+		map[string]string{"Content-Type": "application/x-thing", "x-amz-meta-src": "mpu"}, http.StatusOK)
+	var initiated struct {
+		UploadID string `xml:"UploadId"`
+	}
+	if err := xml.NewDecoder(resp.Body).Decode(&initiated); err != nil || initiated.UploadID == "" {
+		t.Fatalf("initiate: %v (%+v)", err, initiated)
+	}
 	resp.Body.Close()
+	uid := initiated.UploadID
+
+	// Two parts: 5 MiB + a small tail crossing a part boundary on read.
+	part1 := bytes.Repeat([]byte("s3warm-part-one!"), 5*1024*1024/16)
+	part2 := []byte("tail-of-the-object")
+	etag1, etag2 := md5hex(string(part1)), md5hex(string(part2))
+
+	resp = do(t, http.MethodPut, base+"/mpu/big.bin?partNumber=1&uploadId="+uid,
+		bytes.NewReader(part1), nil, http.StatusOK)
+	resp.Body.Close()
+	if got := resp.Header.Get("ETag"); got != `"`+etag1+`"` {
+		t.Fatalf("part 1 ETag = %s", got)
+	}
+	do(t, http.MethodPut, base+"/mpu/big.bin?partNumber=2&uploadId="+uid,
+		bytes.NewReader(part2), nil, http.StatusOK).Body.Close()
+
+	// ListParts sees both.
+	resp = do(t, http.MethodGet, base+"/mpu/big.bin?uploadId="+uid, nil, nil, http.StatusOK)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), "<PartNumber>1</PartNumber>") ||
+		!strings.Contains(string(body), "<PartNumber>2</PartNumber>") {
+		t.Fatalf("ListParts: %s", body)
+	}
+
+	// Wrong ETag → InvalidPart; wrong order → InvalidPartOrder.
+	complete := func(payload string, wantStatus int) string {
+		t.Helper()
+		resp := do(t, http.MethodPost, base+"/mpu/big.bin?uploadId="+uid,
+			strings.NewReader(payload), nil, wantStatus)
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return string(b)
+	}
+	if out := complete(`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"deadbeef"</ETag></Part></CompleteMultipartUpload>`,
+		http.StatusBadRequest); !strings.Contains(out, "<Code>InvalidPart</Code>") {
+		t.Fatalf("wrong etag: %s", out)
+	}
+	if out := complete(fmt.Sprintf(`<CompleteMultipartUpload><Part><PartNumber>2</PartNumber><ETag>%s</ETag></Part><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>`, etag2, etag1),
+		http.StatusBadRequest); !strings.Contains(out, "<Code>InvalidPartOrder</Code>") {
+		t.Fatalf("wrong order: %s", out)
+	}
+
+	// Complete: S3 multipart ETag algebra.
+	sum1, _ := hex.DecodeString(etag1)
+	sum2, _ := hex.DecodeString(etag2)
+	concat := md5.Sum(append(sum1, sum2...))
+	wantETag := hex.EncodeToString(concat[:]) + "-2"
+	out := complete(fmt.Sprintf(`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part><Part><PartNumber>2</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>`, etag1, etag2),
+		http.StatusOK)
+	if !strings.Contains(out, wantETag) {
+		t.Fatalf("complete ETag: want %s in %s", wantETag, out)
+	}
+
+	// Full GET: stitched content matches.
+	want := append(append([]byte{}, part1...), part2...)
+	resp = do(t, http.MethodGet, base+"/mpu/big.bin", nil, nil, http.StatusOK)
+	got, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !bytes.Equal(got, want) {
+		t.Fatalf("stitched GET: %d bytes, want %d", len(got), len(want))
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/x-thing" {
+		t.Fatalf("Content-Type = %q", ct)
+	}
+
+	// Range GET across the part boundary.
+	boundary := int64(len(part1))
+	rangeSpec := fmt.Sprintf("bytes=%d-%d", boundary-4, boundary+3)
+	resp = do(t, http.MethodGet, base+"/mpu/big.bin", nil,
+		map[string]string{"Range": rangeSpec}, http.StatusPartialContent)
+	got, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !bytes.Equal(got, want[boundary-4:boundary+4]) {
+		t.Fatalf("boundary range = %q, want %q", got, want[boundary-4:boundary+4])
+	}
+
+	// Abort a second upload; it disappears.
+	resp = do(t, http.MethodPost, base+"/mpu/other.bin?uploads", nil, nil, http.StatusOK)
+	var second struct {
+		UploadID string `xml:"UploadId"`
+	}
+	xml.NewDecoder(resp.Body).Decode(&second)
+	resp.Body.Close()
+	do(t, http.MethodDelete, base+"/mpu/other.bin?uploadId="+second.UploadID, nil, nil, http.StatusNoContent).Body.Close()
+	do(t, http.MethodDelete, base+"/mpu/other.bin?uploadId="+second.UploadID, nil, nil, http.StatusNotFound).Body.Close()
 }
