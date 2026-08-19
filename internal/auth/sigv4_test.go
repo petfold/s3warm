@@ -185,6 +185,85 @@ func TestVerifyAnonymousAllowed(t *testing.T) {
 	}
 }
 
+// The presigned-URL vector from the AWS documentation, "Authenticating
+// Requests: Using Query Parameters (AWS Signature Version 4)".
+const presignedVectorURL = "http://examplebucket.s3.amazonaws.com/test.txt" +
+	"?X-Amz-Algorithm=AWS4-HMAC-SHA256" +
+	"&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request" +
+	"&X-Amz-Date=20130524T000000Z" +
+	"&X-Amz-Expires=86400" +
+	"&X-Amz-SignedHeaders=host" +
+	"&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"
+
+func TestVerifyAWSVectorPresigned(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, presignedVectorURL, nil)
+	id, err := newTestVerifier().Verify(r)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if id.AccessKey != testAccessKey {
+		t.Fatalf("access key = %q", id.AccessKey)
+	}
+}
+
+func TestVerifyPresignedRejections(t *testing.T) {
+	tests := []struct {
+		name     string
+		mutate   func(u string) string
+		now      time.Time
+		wantCode string
+	}{
+		{
+			name:     "expired",
+			mutate:   func(u string) string { return u },
+			now:      time.Date(2013, 5, 25, 0, 0, 1, 0, time.UTC), // 1s past X-Amz-Expires
+			wantCode: "AccessDenied",
+		},
+		{
+			name: "tampered signature",
+			mutate: func(u string) string {
+				return strings.Replace(u, "f604d404", "f604d405", 1)
+			},
+			wantCode: "SignatureDoesNotMatch",
+		},
+		{
+			name: "tampered path",
+			mutate: func(u string) string {
+				return strings.Replace(u, "/test.txt", "/other.txt", 1)
+			},
+			wantCode: "SignatureDoesNotMatch",
+		},
+		{
+			name: "expires beyond seven days",
+			mutate: func(u string) string {
+				return strings.Replace(u, "X-Amz-Expires=86400", "X-Amz-Expires=604801", 1)
+			},
+			wantCode: "AccessDenied",
+		},
+		{
+			name: "missing expires",
+			mutate: func(u string) string {
+				return strings.Replace(u, "&X-Amz-Expires=86400", "", 1)
+			},
+			wantCode: "AccessDenied",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			v := newTestVerifier()
+			if !tc.now.IsZero() {
+				v.Now = func() time.Time { return tc.now }
+			}
+			r := httptest.NewRequest(http.MethodGet, tc.mutate(presignedVectorURL), nil)
+			_, err := v.Verify(r)
+			var ae *Error
+			if !errors.As(err, &ae) || ae.Code != tc.wantCode {
+				t.Fatalf("Verify = %v, want code %q", err, tc.wantCode)
+			}
+		})
+	}
+}
+
 func TestEncodePath(t *testing.T) {
 	for in, want := range map[string]string{
 		"/test$file.text": "/test%24file.text",

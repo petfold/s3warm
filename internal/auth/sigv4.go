@@ -17,9 +17,11 @@ import (
 )
 
 const (
-	algorithm   = "AWS4-HMAC-SHA256"
-	iso8601     = "20060102T150405Z"
-	defaultSkew = 15 * time.Minute
+	algorithm       = "AWS4-HMAC-SHA256"
+	iso8601         = "20060102T150405Z"
+	defaultSkew     = 15 * time.Minute
+	unsignedPayload = "UNSIGNED-PAYLOAD"
+	maxPresignAge   = 7 * 24 * time.Hour // S3's X-Amz-Expires ceiling
 )
 
 // Error is an authentication failure carrying an S3 error code.
@@ -62,7 +64,7 @@ func (v *Verifier) Verify(r *http.Request) (*Identity, error) {
 	authz := r.Header.Get("Authorization")
 	if authz == "" {
 		if r.URL.Query().Get("X-Amz-Algorithm") != "" {
-			return nil, &Error{"NotImplemented", "presigned URLs are not implemented yet"}
+			return v.verifyPresigned(r)
 		}
 		if v.AllowAnonymous {
 			return &Identity{Anonymous: true}, nil
@@ -133,36 +135,105 @@ func (v *Verifier) Verify(r *http.Request) (*Identity, error) {
 	if !strings.HasPrefix(amzDate, scopeDate) {
 		return nil, &Error{"AuthorizationHeaderMalformed", "date in credential scope does not match request date"}
 	}
-	now := time.Now()
-	if v.Now != nil {
-		now = v.Now()
-	}
-	skew := v.MaxSkew
-	if skew == 0 {
-		skew = defaultSkew
-	}
-	if d := now.Sub(t); d > skew || d < -skew {
+	now := v.now()
+	if d := now.Sub(t); d > v.skew() || d < -v.skew() {
 		return nil, &Error{"RequestTimeTooSkewed", "the difference between the request time and the server's time is too large"}
 	}
 
-	canonReq := canonicalRequest(r, signedHeaders, payloadHash)
-	crSum := sha256.Sum256([]byte(canonReq))
+	canonReq := canonicalRequest(r, r.URL.Query(), signedHeaders, payloadHash)
+	if !signatureMatches(secret, amzDate, scopeDate, scopeRegion, canonReq, signature) {
+		return nil, &Error{"SignatureDoesNotMatch", "the request signature we calculated does not match the signature you provided"}
+	}
+	return &Identity{AccessKey: accessKey}, nil
+}
+
+// verifyPresigned authenticates a query-string-signed request — a presigned
+// URL (design §8). The payload is unsigned by definition; expiry is bounded
+// by X-Amz-Expires.
+func (v *Verifier) verifyPresigned(r *http.Request) (*Identity, error) {
+	q := r.URL.Query()
+	if q.Get("X-Amz-Algorithm") != algorithm {
+		return nil, &Error{"AuthorizationQueryParametersError", "unsupported X-Amz-Algorithm"}
+	}
+	credential := q.Get("X-Amz-Credential")
+	signedHeaders := q.Get("X-Amz-SignedHeaders")
+	signature := q.Get("X-Amz-Signature")
+	amzDate := q.Get("X-Amz-Date")
+	if credential == "" || signedHeaders == "" || signature == "" || amzDate == "" {
+		return nil, &Error{"AuthorizationQueryParametersError", "missing required X-Amz-* query parameters"}
+	}
+	scope := strings.Split(credential, "/")
+	if len(scope) != 5 || scope[4] != "aws4_request" || scope[3] != "s3" {
+		return nil, &Error{"AuthorizationQueryParametersError", "malformed X-Amz-Credential"}
+	}
+	accessKey, scopeDate, scopeRegion := scope[0], scope[1], scope[2]
+	secret, ok := v.Creds.Lookup(accessKey)
+	if !ok {
+		return nil, &Error{"InvalidAccessKeyId", "the access key id you provided does not exist in our records"}
+	}
+
+	// Out-of-range or missing X-Amz-Expires is 403 on AWS, not 400.
+	expires, err := strconv.ParseInt(q.Get("X-Amz-Expires"), 10, 64)
+	if err != nil || expires < 1 || time.Duration(expires)*time.Second > maxPresignAge {
+		return nil, &Error{"AccessDenied", "X-Amz-Expires must be between 1 and 604800 seconds"}
+	}
+	t, err := time.Parse(iso8601, amzDate)
+	if err != nil {
+		return nil, &Error{"AuthorizationQueryParametersError", "malformed X-Amz-Date"}
+	}
+	if !strings.HasPrefix(amzDate, scopeDate) {
+		return nil, &Error{"AuthorizationQueryParametersError", "date in credential scope does not match X-Amz-Date"}
+	}
+	now := v.now()
+	if now.After(t.Add(time.Duration(expires) * time.Second)) {
+		return nil, &Error{"AccessDenied", "Request has expired"}
+	}
+	if t.Sub(now) > v.skew() {
+		return nil, &Error{"RequestTimeTooSkewed", "the request signature date is in the future"}
+	}
+
+	// The signature itself is excluded from the canonical query.
+	canonQuery := url.Values{}
+	for k, vs := range q {
+		if k != "X-Amz-Signature" {
+			canonQuery[k] = vs
+		}
+	}
+	canonReq := canonicalRequest(r, canonQuery, signedHeaders, unsignedPayload)
+	if !signatureMatches(secret, amzDate, scopeDate, scopeRegion, canonReq, signature) {
+		return nil, &Error{"SignatureDoesNotMatch", "the request signature we calculated does not match the signature you provided"}
+	}
+	return &Identity{AccessKey: accessKey}, nil
+}
+
+func (v *Verifier) now() time.Time {
+	if v.Now != nil {
+		return v.Now()
+	}
+	return time.Now()
+}
+
+func (v *Verifier) skew() time.Duration {
+	if v.MaxSkew != 0 {
+		return v.MaxSkew
+	}
+	return defaultSkew
+}
+
+func signatureMatches(secret, amzDate, scopeDate, scopeRegion, canonicalReq, signature string) bool {
+	crSum := sha256.Sum256([]byte(canonicalReq))
 	stringToSign := strings.Join([]string{
 		algorithm,
 		amzDate,
 		strings.Join([]string{scopeDate, scopeRegion, "s3", "aws4_request"}, "/"),
 		hex.EncodeToString(crSum[:]),
 	}, "\n")
-
 	key := signingKey(secret, scopeDate, scopeRegion, "s3")
 	want := hex.EncodeToString(hmacSHA256(key, stringToSign))
-	if !hmac.Equal([]byte(want), []byte(strings.ToLower(signature))) {
-		return nil, &Error{"SignatureDoesNotMatch", "the request signature we calculated does not match the signature you provided"}
-	}
-	return &Identity{AccessKey: accessKey}, nil
+	return hmac.Equal([]byte(want), []byte(strings.ToLower(signature)))
 }
 
-func canonicalRequest(r *http.Request, signedHeaders, payloadHash string) string {
+func canonicalRequest(r *http.Request, query url.Values, signedHeaders, payloadHash string) string {
 	names := strings.Split(signedHeaders, ";")
 	lowered := make([]string, len(names))
 	var headers strings.Builder
@@ -190,7 +261,7 @@ func canonicalRequest(r *http.Request, signedHeaders, payloadHash string) string
 	return strings.Join([]string{
 		r.Method,
 		EncodePath(r.URL.Path),
-		canonicalQuery(r.URL.Query()),
+		canonicalQuery(query),
 		headers.String(),
 		strings.Join(lowered, ";"),
 		payloadHash,

@@ -91,6 +91,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// CORS preflights are unsigned, so they are answered before auth. With
+	// no CORS configuration (planned, design roadmap) AWS returns 400.
+	if r.Method == http.MethodOptions {
+		s.writeError(sw, r, apiError{"BadRequest", http.StatusBadRequest,
+			"Insufficient information. Origin request header needed."})
+		return
+	}
+
 	if _, err := s.verifier.Verify(r); err != nil {
 		s.writeError(sw, r, authError(err))
 		return

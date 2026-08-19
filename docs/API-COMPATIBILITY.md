@@ -51,6 +51,7 @@ Design rationale: [`DESIGN.md`](DESIGN.md).
 | AbortMultipartUpload | ✅ | Abandoned parts expire with stamps — GC is automatic |
 | ListParts | ✅ | With part-number-marker/max-parts pagination |
 | GetObject/HeadObject `?partNumber` | ✅ | Part-ranged reads with `x-amz-mp-parts-count`; non-multipart objects are one part |
+| GetObject `response-*` overrides | ✅ | content-type/-disposition/-encoding/-language, cache-control, expires — signature-covered, as used by presigned links |
 | GetObjectAttributes | 🎯 P2 | |
 | GetObjectTagging / PutObjectTagging / DeleteObjectTagging | 🎯 P3 | |
 | GetObjectAcl / PutObjectAcl | 🪧 P2 | Canned `private` |
@@ -62,7 +63,7 @@ Design rationale: [`DESIGN.md`](DESIGN.md).
 | Mechanism | Status | Notes |
 |---|---|---|
 | SigV4, Authorization header | ✅ | AWS doc test vectors in unit tests; any region label accepted (service must be `s3`) |
-| SigV4 presigned URLs | 🎯 P2 | |
+| SigV4 presigned URLs | ✅ | Query-string auth with `UNSIGNED-PAYLOAD`; expiry enforced (out-of-range `X-Amz-Expires` is 403, as on AWS); AWS doc vector in unit tests |
 | `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` (aws-chunked) | 🎯 P2 | Required by Java SDK v2 defaults |
 | Trailing checksums (`x-amz-checksum-*`) | 🎯 P2 | |
 | SigV2 | ❌ | Legacy |

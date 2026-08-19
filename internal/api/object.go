@@ -209,6 +209,20 @@ func (s *Server) handleGetObject(w http.ResponseWriter, r *http.Request, bucket,
 		ct = "application/octet-stream"
 	}
 	h.Set("Content-Type", ct)
+	// Response header overrides — authenticated-only in S3 and covered by
+	// the signature; commonly carried by presigned URLs.
+	for param, hdr := range map[string]string{
+		"response-content-type":        "Content-Type",
+		"response-content-language":    "Content-Language",
+		"response-expires":             "Expires",
+		"response-cache-control":       "Cache-Control",
+		"response-content-disposition": "Content-Disposition",
+		"response-content-encoding":    "Content-Encoding",
+	} {
+		if val := r.URL.Query().Get(param); val != "" {
+			h.Set(hdr, val)
+		}
+	}
 	h.Set("x-amz-storage-class", obj.StorageClass)
 	for k, v := range obj.UserMetadata {
 		// Direct map write: Go's Set would canonicalize to X-Amz-Meta-Foo and
