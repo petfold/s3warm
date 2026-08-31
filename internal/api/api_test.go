@@ -1490,3 +1490,81 @@ func TestRecoveryRecipientSettableAfterCreation(t *testing.T) {
 	resp := do(t, http.MethodPut, base+"/late?x-swarm-snapshot=v1", nil, nil, http.StatusOK)
 	resp.Body.Close()
 }
+
+// The refusal message is the only place most operators meet this problem, so
+// it must name the non-destructive remedy and must not tell anyone to delete
+// the objects the commit chain exists to protect.
+func TestCommitRefusalNamesTheNonDestructiveRemedy(t *testing.T) {
+	base := newGateway(t)
+	do(t, http.MethodPut, base+"/advice", nil, nil, http.StatusOK).Body.Close()
+	do(t, http.MethodPut, base+"/advice/secret", strings.NewReader("x"),
+		map[string]string{"x-amz-server-side-encryption": "AES256"}, http.StatusOK).Body.Close()
+	resp := do(t, http.MethodPut, base+"/advice?x-swarm-snapshot=v1", nil, nil, http.StatusBadRequest)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	msg := string(body)
+	if !strings.Contains(msg, "x-swarm-recovery-recipient") {
+		t.Fatalf("refusal must name the endpoint that fixes it: %s", msg)
+	}
+	for _, bad := range []string{"recreate the bucket", "delete"} {
+		if strings.Contains(msg, bad) {
+			t.Fatalf("refusal advises a destructive remedy (%q): %s", bad, msg)
+		}
+	}
+}
+
+// Clearing a recipient on a bucket that still holds encrypted objects would
+// freeze its chain silently — the exact failure this work removes.
+func TestClearingRecipientRefusedWhileEncryptedObjectsExist(t *testing.T) {
+	id, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := newGateway(t)
+	do(t, http.MethodPut, base+"/clr", nil,
+		map[string]string{"x-swarm-recovery-recipient": id.Recipient().String()},
+		http.StatusOK).Body.Close()
+	do(t, http.MethodPut, base+"/clr/secret", strings.NewReader("x"),
+		map[string]string{"x-amz-server-side-encryption": "AES256"}, http.StatusOK).Body.Close()
+
+	resp := do(t, http.MethodPut, base+"/clr?x-swarm-recovery-recipient", nil,
+		map[string]string{"x-swarm-recovery-recipient": ""}, http.StatusBadRequest)
+	resp.Body.Close()
+
+	// The chain still works afterwards: the refusal changed nothing.
+	do(t, http.MethodPut, base+"/clr?x-swarm-snapshot=v1", nil, nil, http.StatusOK).Body.Close()
+
+	// Clearing is fine once the encrypted objects are gone.
+	do(t, http.MethodDelete, base+"/clr/secret", nil, nil, http.StatusNoContent).Body.Close()
+	do(t, http.MethodPut, base+"/clr?x-swarm-recovery-recipient", nil,
+		map[string]string{"x-swarm-recovery-recipient": ""}, http.StatusOK).Body.Close()
+}
+
+// A wrong recovery identity is an operator mistake, not an upstream outage:
+// 503 would send them hunting the wrong problem and invites SDK retries.
+func TestWrongIdentityIsClientError(t *testing.T) {
+	id, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := newGateway(t)
+	do(t, http.MethodPut, base+"/wrongid", nil,
+		map[string]string{"x-swarm-recovery-recipient": id.Recipient().String()},
+		http.StatusOK).Body.Close()
+	do(t, http.MethodPut, base+"/wrongid/secret", strings.NewReader("x"),
+		map[string]string{"x-amz-server-side-encryption": "AES256"}, http.StatusOK).Body.Close()
+	resp := do(t, http.MethodPut, base+"/wrongid?x-swarm-snapshot=v1", nil, nil, http.StatusOK)
+	var snap struct {
+		Root string `json:"root"`
+	}
+	json.NewDecoder(resp.Body).Decode(&snap) //nolint:errcheck
+	resp.Body.Close()
+
+	do(t, http.MethodPost, base+"/wrongid?x-swarm-restore="+snap.Root, nil,
+		map[string]string{"x-swarm-recovery-identity": other.String()},
+		http.StatusBadRequest).Body.Close()
+}

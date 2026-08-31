@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/xml"
 	"errors"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/petfold/s3warm/internal/manifest"
 	"github.com/petfold/s3warm/internal/recovery"
 	"github.com/petfold/s3warm/internal/store"
 )
@@ -258,6 +260,22 @@ func (s *Server) handlePutBucketRecoveryRecipient(w http.ResponseWriter, r *http
 			return
 		}
 	}
+	if rec == "" {
+		// Clearing on a bucket that still holds encrypted references would
+		// freeze its chain on the next commit, with a 200 and no hint of it —
+		// the silent-freeze failure this whole change set exists to remove.
+		has, err := s.bucketHasKeyBearingRefs(r.Context(), bucket)
+		if err != nil {
+			s.writeError(w, r, storeError(err))
+			return
+		}
+		if has && s.commits != nil {
+			s.writeError(w, r, errInvalidRequest.withMessage(
+				"this bucket holds encrypted objects, so clearing its recovery recipient "+
+					"would stop its commit chain: delete those objects first, or set a different recipient"))
+			return
+		}
+	}
 	if err := s.store.SetBucketRecoveryRecipient(r.Context(), bucket, rec); err != nil {
 		s.writeError(w, r, storeError(err))
 		return
@@ -265,6 +283,29 @@ func (s *Server) handlePutBucketRecoveryRecipient(w http.ResponseWriter, r *http
 	// Objects written before this point keep their references; the next commit
 	// seals them. A bucket whose chain was frozen for want of a recipient
 	// resumes committing from here.
-	s.commits.Notify(bucket)
+	if rec != "" {
+		s.commits.Notify(bucket)
+	}
 	w.WriteHeader(http.StatusOK)
+}
+
+// bucketHasKeyBearingRefs reports whether any object in the bucket holds a
+// reference that must be sealed before the bucket can commit.
+func (s *Server) bucketHasKeyBearingRefs(ctx context.Context, bucket string) (bool, error) {
+	after := ""
+	for {
+		page, err := s.store.ListObjects(ctx, bucket, "", after, 1000)
+		if err != nil {
+			return false, err
+		}
+		for _, o := range page {
+			if manifest.HasKeyBearingRefs(o) {
+				return true, nil
+			}
+		}
+		if len(page) < 1000 {
+			return false, nil
+		}
+		after = page[len(page)-1].Key
+	}
 }

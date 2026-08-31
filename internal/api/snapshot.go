@@ -123,6 +123,13 @@ func (s *Server) handleRestoreBucket(w http.ResponseWriter, r *http.Request, buc
 	ls := manifest.NewLoadSaver(s.bee, "", true)
 	commit, err := manifest.GetCommit(ctx, ls, root, identity)
 	if err != nil {
+		// A wrong or rotated identity is the likeliest operator error in a
+		// recovery drill; reporting it as an upstream outage sends them
+		// hunting the wrong problem, and 503 invites SDK retries.
+		if errors.Is(err, recovery.ErrDecrypt) || errors.Is(err, manifest.ErrCommitVersion) {
+			s.writeError(w, r, errInvalidRequest.withMessage(err.Error()))
+			return
+		}
 		s.writeError(w, r, beeError(err))
 		return
 	}

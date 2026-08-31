@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/petfold/s3warm/internal/bee"
+	"github.com/petfold/s3warm/internal/manifest"
 	"github.com/petfold/s3warm/internal/store"
 )
 
@@ -578,6 +579,13 @@ func (s *Server) getCopySource(r *http.Request) (*store.Object, *store.Bucket, *
 // encrypted while its bytes are not. Both silently break the bucket's
 // promises, exactly as the ACT boundary does.
 func sseCopyBoundary(srcObj *store.Object, dstEncrypted bool) *apiError {
+	// Keyed off the reference, not the flag — the same doctrine as the rest of
+	// the sealing path. A zero-byte encrypted object has no reference to
+	// smuggle, so refusing that copy would be a behaviour change buying
+	// nothing.
+	if !manifest.HasKeyBearingRefs(*srcObj) && !dstEncrypted {
+		return nil
+	}
 	if srcObj.Encrypted == dstEncrypted {
 		return nil
 	}

@@ -7,29 +7,41 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"filippo.io/age"
 
+	"github.com/petfold/s3warm/internal/recovery"
 	"github.com/petfold/s3warm/internal/store"
 )
 
 // memLS is an in-memory mantaray LoadSaver that keeps every chunk it is given,
 // so a test can inspect everything a commit publishes.
-type memLS struct{ saved map[string][]byte }
+//
+// The mutex is load-bearing, not hygiene: mantaray saves forks concurrently,
+// and a dropped entry would make everythingPublished() return less than was
+// actually published — the leak assertions would then pass by failing to look.
+type memLS struct {
+	mu    sync.Mutex
+	saved map[string][]byte
+}
 
 func newMemLS() *memLS { return &memLS{saved: map[string][]byte{}} }
 
 func (m *memLS) Save(_ context.Context, data []byte) ([]byte, error) {
 	sum := sha256.Sum256(data)
 	ref := sum[:32]
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.saved[hex.EncodeToString(ref)] = append([]byte(nil), data...)
 	return ref, nil
 }
 
 func (m *memLS) Load(_ context.Context, ref []byte) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	data, ok := m.saved[hex.EncodeToString(ref)]
 	if !ok {
 		return nil, errors.New("not found")
@@ -40,6 +52,8 @@ func (m *memLS) Load(_ context.Context, ref []byte) ([]byte, error) {
 // everythingPublished concatenates every chunk the commit wrote, which is
 // exactly what a holder of the root can read off Swarm.
 func (m *memLS) everythingPublished() []byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	var all bytes.Buffer
 	for _, v := range m.saved {
 		all.Write(v)
@@ -67,7 +81,7 @@ func testIdentity(t *testing.T) (age.Identity, age.Recipient, string) {
 }
 
 func commitWith(objs ...store.Object) *Commit {
-	return &Commit{Version: 1, Bucket: "b", Seq: 1, Timestamp: time.Unix(0, 0).UTC(), Objects: objs}
+	return &Commit{Version: CommitVersion, Bucket: "b", Seq: 1, Timestamp: time.Unix(0, 0).UTC(), Objects: objs}
 }
 
 func sseObject() store.Object {
@@ -171,9 +185,10 @@ func TestGetCommitWrongIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := GetCommit(context.Background(), ls, root, other); err == nil ||
-		!strings.Contains(err.Error(), "decrypting reference") {
-		t.Fatalf("want a decryption error, got %v", err)
+	// Assert on the sentinel, not the wording: callers classify on it to map a
+	// wrong identity to 400 rather than a 503 node outage.
+	if _, err := GetCommit(context.Background(), ls, root, other); !errors.Is(err, recovery.ErrDecrypt) {
+		t.Fatalf("want recovery.ErrDecrypt, got %v", err)
 	}
 }
 
@@ -280,6 +295,8 @@ func TestSSEDescriptorDescribesTheObject(t *testing.T) {
 		t.Fatal(err)
 	}
 	var descs []SSEDescriptor
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
 	for _, chunk := range ls.saved {
 		var d SSEDescriptor
 		if json.Unmarshal(chunk, &d) == nil && d.Kind == "sse/1" {
@@ -310,8 +327,19 @@ func TestGetCommitRefusesNewerVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := GetCommit(context.Background(), ls, root, nil); err == nil ||
-		!strings.Contains(err.Error(), "newer than this gateway understands") {
-		t.Fatalf("want a version refusal, got %v", err)
+	if _, err := GetCommit(context.Background(), ls, root, nil); !errors.Is(err, ErrCommitVersion) {
+		t.Fatalf("want ErrCommitVersion, got %v", err)
+	}
+
+	// L4: a document claiming a version this reader predates is refused too,
+	// rather than being interpreted as if it were understood.
+	c0 := commitWith(sseObject())
+	c0.Version = 0
+	root0, err := Build(context.Background(), ls, c0, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := GetCommit(context.Background(), ls, root0, nil); !errors.Is(err, ErrCommitVersion) {
+		t.Fatalf("version 0 should be refused, got %v", err)
 	}
 }

@@ -472,3 +472,59 @@ func TestRecoveryRecipientRoundTrip(t *testing.T) {
 		}
 	})
 }
+
+// The migration test that would actually have caught the missing Postgres
+// ALTER. TestRecoveryRecipientRoundTrip cannot: openTestPostgres creates a
+// fresh schema, so CREATE TABLE IF NOT EXISTS always includes the column and
+// the ALTER loop is never what makes the test pass. The real failure needs a
+// buckets table that pre-dates the column, which is what this builds.
+func TestPostgresMigratesPreExistingBucketsTable(t *testing.T) {
+	dsn := os.Getenv("S3WARM_TEST_POSTGRES")
+	if dsn == "" {
+		t.Skip("S3WARM_TEST_POSTGRES not set")
+	}
+	schema := fmt.Sprintf("s3warm_migr_%d", atomic.AddInt64(&testSchemaSeq, 1))
+	admin, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open postgres: %v", err)
+	}
+	defer admin.Close()
+	if _, err := admin.Exec("CREATE SCHEMA " + schema); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	t.Cleanup(func() { admin.Exec("DROP SCHEMA " + schema + " CASCADE") }) //nolint:errcheck
+
+	// The pre-upgrade shape: every column except recovery_recipient.
+	if _, err := admin.Exec(`CREATE TABLE ` + schema + `.buckets (
+		name TEXT PRIMARY KEY, created_at TEXT NOT NULL,
+		batch_id TEXT NOT NULL DEFAULT '', sse TEXT NOT NULL DEFAULT '',
+		head_root TEXT NOT NULL DEFAULT '', commit_seq BIGINT NOT NULL DEFAULT 0,
+		cors TEXT NOT NULL DEFAULT '', versioning TEXT NOT NULL DEFAULT '',
+		tags TEXT NOT NULL DEFAULT '', owner TEXT NOT NULL DEFAULT '',
+		act BOOLEAN NOT NULL DEFAULT FALSE, act_history TEXT NOT NULL DEFAULT '',
+		act_grantees TEXT NOT NULL DEFAULT '')`); err != nil {
+		t.Fatalf("create legacy table: %v", err)
+	}
+	if _, err := admin.Exec(`INSERT INTO ` + schema + `.buckets (name, created_at) VALUES ('legacy', '2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatalf("seed legacy row: %v", err)
+	}
+
+	s, err := OpenPostgres(dsn + "?search_path=" + schema)
+	if err != nil {
+		t.Fatalf("upgrading an existing deployment must not fail: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	// Every read path uses the new column list; before the migration these
+	// failed with `column "recovery_recipient" does not exist`.
+	b, err := s.GetBucket(context.Background(), "legacy")
+	if err != nil {
+		t.Fatalf("GetBucket after upgrade: %v", err)
+	}
+	if b.RecoveryRecipient != "" {
+		t.Fatalf("migrated column should default empty, got %q", b.RecoveryRecipient)
+	}
+	if _, err := s.ListBuckets(context.Background()); err != nil {
+		t.Fatalf("ListBuckets after upgrade: %v", err)
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -47,6 +48,11 @@ type Commit struct {
 	sealed int
 }
 
+// ErrCommitVersion marks a commit document this gateway will not interpret.
+// Refusing beats guessing: a reader that ignored SealedRef would build an
+// index of empty references and call it a restore.
+var ErrCommitVersion = errors.New("unsupported commit document version")
+
 // CommitVersion is the commit-document format version. Version 2 added
 // SealedRef: an object's reference may be sealed to the bucket's recovery
 // recipient, so a reader that ignores it would silently produce an index of
@@ -62,15 +68,16 @@ const CommitVersion = 2
 // A composite object seals each part, so SealedParts carries them in order and
 // SealedRef is empty; a single-part object is the reverse.
 type SSEDescriptor struct {
-	Kind        string             `json:"s3warm"`                // "sse/1"
-	SealedRef   string             `json:"sealedRef,omitempty"`   // age-encrypted 64-byte reference
-	SealedParts []SealedPart       `json:"sealedParts,omitempty"` // composite objects
+	Kind        string       `json:"s3warm"`                // "sse/1"
+	SealedRef   string       `json:"sealedRef,omitempty"`   // age-encrypted 64-byte reference
+	SealedParts []SealedPart `json:"sealedParts,omitempty"` // composite objects
 }
 
 // SealedPart is one part of a composite object with its reference sealed.
 type SealedPart struct {
 	PartNumber int    `json:"partNumber"`
-	SealedRef  string `json:"sealedRef"`
+	SwarmRef   string `json:"swarmRef,omitempty"`  // plaintext parts of a mixed composite
+	SealedRef  string `json:"sealedRef,omitempty"` // key-bearing parts
 	Size       int64  `json:"size"`
 }
 
@@ -362,15 +369,20 @@ func entryFor(ctx context.Context, ls mantaray.LoadSaver, o store.Object, rec ag
 			d.SealedRef = sealed
 		}
 		for _, p := range o.Parts {
-			if !keyBearing(p.SwarmRef) {
-				continue
+			sp := SealedPart{PartNumber: p.PartNumber, Size: p.Size}
+			if keyBearing(p.SwarmRef) {
+				sealed, err := recovery.Encrypt(rec, p.SwarmRef)
+				if err != nil {
+					return nil, nil, err
+				}
+				sp.SealedRef = sealed
+			} else {
+				// A mixed composite keeps its plaintext parts in the clear;
+				// dropping them would leave the descriptor describing a
+				// shorter object than exists.
+				sp.SwarmRef = p.SwarmRef
 			}
-			sealed, err := recovery.Encrypt(rec, p.SwarmRef)
-			if err != nil {
-				return nil, nil, err
-			}
-			d.SealedParts = append(d.SealedParts, SealedPart{
-				PartNumber: p.PartNumber, SealedRef: sealed, Size: p.Size})
+			d.SealedParts = append(d.SealedParts, sp)
 		}
 		desc, err := json.Marshal(d)
 		if err != nil {
@@ -437,9 +449,9 @@ func GetCommit(ctx context.Context, ls mantaray.LoadSaver, rootHex string, id ag
 		Parent: w.Parent, Timestamp: w.Timestamp,
 		Objects: make([]store.Object, 0, len(w.Objects)),
 	}
-	if w.Version > CommitVersion {
-		return nil, fmt.Errorf("commit document version %d is newer than this gateway understands (%d): upgrade s3warm",
-			w.Version, CommitVersion)
+	if w.Version < 1 || w.Version > CommitVersion {
+		return nil, fmt.Errorf("%w: document is version %d, this gateway understands 1..%d",
+			ErrCommitVersion, w.Version, CommitVersion)
 	}
 	for _, wo := range w.Objects {
 		o, sealed, err := open(wo, id)
@@ -463,4 +475,3 @@ func GetCommit(ctx context.Context, ls mantaray.LoadSaver, rootHex string, id ag
 // and nothing sealed, and inferring would make such a bucket permanently
 // unrestorable.
 func (c *Commit) SealedCount() int { return c.sealed }
-

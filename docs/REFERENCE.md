@@ -328,6 +328,9 @@ An SSE object's Swarm reference is 64 bytes and embeds its decryption key, so it
 - Sealing is randomised per commit, so a commit document changes even when the bucket has not. For buckets with encrypted objects the document's chunks therefore do not dedup against the previous commit — object chunks still do, and unchanged manifest forks are still shared, but the document itself is rewritten each time.
 - `bzz://{root}/{key}` serves the descriptor, not the object: an encrypted object is not browsable. That is the point of encrypting it.
 - Restoring such a bucket needs the identity, passed per request. The gateway serves a live bucket from its index and never stores the identity.
+- **Rotating the recipient does not re-seal old commits.** Every root stays sealed to whichever recipient was current when it was written, and nothing in the chain records which one that was — `HeadBucket` advertises only the bucket's current recipient. Keep retired identities for as long as you keep the roots that need them, and label them. Restoring an old root with the wrong identity fails loudly (`400`), never silently.
+- Clearing the recipient on a bucket that still holds encrypted objects is refused, because it would stop the chain on the next commit.
+- **During a rolling upgrade, restore from the new binary only.** A pre-v2 gateway reading a version-2 document ignores `SealedRef` and builds an index of empty references without complaining — the version field cannot protect a reader that predates it.
 - Losing the identity means losing the ability to rebuild an index from a root. The objects remain readable through a gateway that still has its index; they are unrecoverable from the bare chain. Keep it wherever you keep the rest of your recovery material.
 - The chain still publishes key names, sizes, ETags, batch IDs and user metadata for every bucket. Encryption covers the object bytes, not the shape of the bucket.
 

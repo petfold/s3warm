@@ -16,12 +16,18 @@ package recovery
 import (
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
 
 	"filippo.io/age"
 )
+
+// ErrDecrypt marks a sealed reference that could not be opened — nearly always
+// the wrong identity. Callers distinguish it from upstream failures so an
+// operator mistake is not reported as a node outage.
+var ErrDecrypt = errors.New("cannot decrypt sealed reference")
 
 // ParseRecipient validates an age recipient (the public half, "age1...").
 func ParseRecipient(s string) (age.Recipient, error) {
@@ -68,11 +74,11 @@ func Decrypt(identity age.Identity, sealed string) (string, error) {
 	}
 	raw, err := base64.StdEncoding.DecodeString(sealed)
 	if err != nil {
-		return "", fmt.Errorf("sealed reference is not base64: %w", err)
+		return "", fmt.Errorf("%w: not base64: %v", ErrDecrypt, err)
 	}
 	r, err := age.Decrypt(bytes.NewReader(raw), identity)
 	if err != nil {
-		return "", fmt.Errorf("decrypting reference (wrong identity?): %w", err)
+		return "", fmt.Errorf("%w (wrong identity?): %v", ErrDecrypt, err)
 	}
 	out, err := io.ReadAll(r)
 	if err != nil {

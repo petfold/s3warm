@@ -20,14 +20,20 @@ import (
 // the commit chain is public by design and would leak the bucket's keys.
 var ErrACTBucket = errors.New("commit chain is disabled for ACT-protected buckets")
 
-// ErrNoRecoveryRecipient marks a commit refused because the bucket holds SSE
-// objects but has no recovery recipient. Their references embed decryption
-// keys, so committing them without sealing would publish read access to the
-// bucket; refusing is the safe default. Set x-swarm-recovery-recipient at
-// CreateBucket to enable the chain for an encrypted bucket.
+// ErrNoRecoveryRecipient marks a commit refused because the bucket holds
+// encrypted references but has no recovery recipient. Such references embed
+// decryption keys, so committing them unsealed would publish read access to
+// the bucket; refusing is the safe default.
+//
+// The remedy must never be "delete the objects": they are what the commit
+// chain exists to protect. The recipient is settable on a live bucket, and
+// the message says so, because this string is the only place most operators
+// will meet the problem.
 var ErrNoRecoveryRecipient = errors.New(
-	"commit chain needs a recovery recipient for buckets with SSE objects: " +
-		"recreate the bucket with x-swarm-recovery-recipient (an age X25519 recipient)")
+	"commit chain needs a recovery recipient before it can carry this bucket's encrypted objects: " +
+		"set one with PUT /{bucket}?x-swarm-recovery-recipient " +
+		"(header x-swarm-recovery-recipient: an age X25519 recipient). " +
+		"Existing objects are kept and sealed on the next commit")
 
 // DefaultDebounce batches a burst of mutations into one commit (design §5:
 // a commit costs only the changed path's node chain, but building it still
@@ -113,10 +119,18 @@ func (c *Committer) Run(ctx context.Context) {
 
 // CommitNow builds and records a commit for the bucket immediately,
 // returning the new root and sequence.
-func (c *Committer) CommitNow(ctx context.Context, bucket string) (string, int64, error) {
+func (c *Committer) CommitNow(ctx context.Context, bucket string) (root string, seq int64, err error) {
 	if c == nil {
 		return "", 0, fmt.Errorf("commits are disabled")
 	}
+	defer func() {
+		// Every failure here freezes the bucket's chain, and a frozen chain is
+		// invisible from the S3 API. ACT buckets are excluded: they have no
+		// chain by design, so their "failure" is the intended state.
+		if err != nil && !errors.Is(err, ErrACTBucket) {
+			metrics.CommitFailures.Inc()
+		}
+	}()
 	c.commit.Lock()
 	defer c.commit.Unlock()
 	c.mu.Lock()
@@ -170,15 +184,13 @@ func (c *Committer) CommitNow(ctx context.Context, bucket string) (string, int64
 		}
 	}
 	ls := NewLoadSaver(c.bee, batch, c.deferred)
-	root, err := Build(ctx, ls, commit, rec)
+	root, err = Build(ctx, ls, commit, rec)
 	if err != nil {
-		// Counted here rather than in the debounce loop so synchronous
-		// snapshots are covered too: a frozen chain is invisible from the S3
-		// API either way.
-		metrics.CommitFailures.Inc()
 		return "", 0, err
 	}
-	if err := c.store.SetBucketHead(ctx, bucket, root, commit.Seq); err != nil {
+	if err = c.store.SetBucketHead(ctx, bucket, root, commit.Seq); err != nil {
+		// The commit reached Swarm but the head never advanced, which freezes
+		// the chain just as thoroughly as a build failure.
 		return "", 0, err
 	}
 	c.log.Info("bucket commit", "bucket", bucket, "root", root, "seq", commit.Seq, "objects", len(objects))
