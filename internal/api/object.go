@@ -689,6 +689,10 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
+	// Deliberately no recipient check here. A plain PUT with SSE into the same
+	// bucket freezes the chain identically, so gating only CopyObject would
+	// change behaviour without preventing the state. The commit refusal is the
+	// control, and it now names the endpoint that fixes it.
 	// Server-side copy on a content-addressed store is a metadata operation:
 	// the new key points at the same Swarm reference (design §6).
 	obj := *srcObj

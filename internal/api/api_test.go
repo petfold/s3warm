@@ -1,6 +1,8 @@
 package api_test
 
 import (
+	"filippo.io/age"
+
 	"bytes"
 	"crypto/hmac"
 	"crypto/md5"
@@ -1360,4 +1362,227 @@ func TestACTGrants(t *testing.T) {
 
 	// The public commit chain stays off: snapshots refuse ACT buckets.
 	do(t, http.MethodPut, base+"/vault?x-swarm-snapshot=v1", nil, nil, http.StatusBadRequest).Body.Close()
+}
+
+// An SSE bucket without a recovery recipient must refuse to commit rather than
+// publish decryption keys — and must say so clearly, not fail deep in mantaray
+// with "invalid entry size".
+func TestSSECommitRefusedWithoutRecipient(t *testing.T) {
+	base := newGateway(t)
+	do(t, http.MethodPut, base+"/nosse", nil, nil, http.StatusOK).Body.Close()
+	do(t, http.MethodPut, base+"/nosse/secret", strings.NewReader("hidden"),
+		map[string]string{"x-amz-server-side-encryption": "AES256"}, http.StatusOK).Body.Close()
+
+	resp := do(t, http.MethodPut, base+"/nosse?x-swarm-snapshot=v1", nil, nil, http.StatusBadRequest)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), "recovery recipient") {
+		t.Fatalf("want a recovery-recipient error, got %s", body)
+	}
+	if strings.Contains(string(body), "invalid entry size") {
+		t.Fatal("mantaray's width error leaked to the client")
+	}
+}
+
+// The whole point, end to end: an SSE bucket with a recipient commits, the
+// chain carries no plaintext reference, and the bucket restores from its root
+// when the identity is supplied.
+func TestSSECommitChainRoundTrip(t *testing.T) {
+	id, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := newGateway(t)
+	do(t, http.MethodPut, base+"/enc", nil,
+		map[string]string{"x-swarm-recovery-recipient": id.Recipient().String()},
+		http.StatusOK).Body.Close()
+
+	// HeadBucket advertises the recipient (public half only).
+	resp := do(t, http.MethodHead, base+"/enc", nil, nil, http.StatusOK)
+	resp.Body.Close()
+	if resp.Header.Get("x-swarm-recovery-recipient") != id.Recipient().String() {
+		t.Fatal("HeadBucket should advertise the recovery recipient")
+	}
+
+	sse := map[string]string{"x-amz-server-side-encryption": "AES256"}
+	do(t, http.MethodPut, base+"/enc/resources.tar.gz", strings.NewReader("every secret"), sse, http.StatusOK).Body.Close()
+	do(t, http.MethodPut, base+"/enc/public.txt", strings.NewReader("not secret"), nil, http.StatusOK).Body.Close()
+
+	resp = do(t, http.MethodPut, base+"/enc?x-swarm-snapshot=v1", nil, nil, http.StatusOK)
+	var snap struct {
+		Root string `json:"root"`
+	}
+	json.NewDecoder(resp.Body).Decode(&snap) //nolint:errcheck
+	resp.Body.Close()
+	if snap.Root == "" {
+		t.Fatal("SSE bucket with a recipient must commit")
+	}
+
+	// Destroy the object, then restore the bucket from its root.
+	do(t, http.MethodDelete, base+"/enc/resources.tar.gz", nil, nil, http.StatusNoContent).Body.Close()
+	do(t, http.MethodGet, base+"/enc/resources.tar.gz", nil, nil, http.StatusNotFound).Body.Close()
+
+	// Without the identity the restore refuses rather than half-restoring.
+	resp = do(t, http.MethodPost, base+"/enc?x-swarm-restore="+snap.Root, nil, nil, http.StatusBadRequest)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), "sealed references") {
+		t.Fatalf("want a sealed-reference error, got %s", body)
+	}
+
+	// With it, the bucket comes back and the object reads.
+	do(t, http.MethodPost, base+"/enc?x-swarm-restore="+snap.Root, nil,
+		map[string]string{"x-swarm-recovery-identity": id.String()}, http.StatusOK).Body.Close()
+	resp = do(t, http.MethodGet, base+"/enc/resources.tar.gz", nil, nil, http.StatusOK)
+	got, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(got) != "every secret" {
+		t.Fatalf("restored object = %q", got)
+	}
+}
+
+// F1 end to end. An SSE object copied as a whole-object part into a plaintext
+// multipart upload used to smuggle its key-bearing reference into a public
+// commit chain. S3 permits the copy (the Ceph suite asserts it), so it must
+// still succeed — by re-streaming rather than reusing the reference — and the
+// resulting chain must carry no key-bearing reference.
+func TestUploadPartCopyAcrossEncryptionBoundaryDoesNotLeak(t *testing.T) {
+	base := newGateway(t)
+	do(t, http.MethodPut, base+"/sec", nil, nil, http.StatusOK).Body.Close()
+	do(t, http.MethodPut, base+"/pub", nil, nil, http.StatusOK).Body.Close()
+	const payload = "top secret payload"
+	do(t, http.MethodPut, base+"/sec/secret", strings.NewReader(payload),
+		map[string]string{"x-amz-server-side-encryption": "AES256"}, http.StatusOK).Body.Close()
+
+	resp := do(t, http.MethodPost, base+"/pub/leak?uploads", nil, nil, http.StatusOK)
+	var init struct {
+		UploadID string `xml:"UploadId"`
+	}
+	xml.NewDecoder(resp.Body).Decode(&init) //nolint:errcheck
+	resp.Body.Close()
+
+	// The copy is legal S3 and must work.
+	resp = do(t, http.MethodPut, base+"/pub/leak?partNumber=1&uploadId="+init.UploadID, nil,
+		map[string]string{"x-amz-copy-source": "/sec/secret"}, http.StatusOK)
+	var cp struct {
+		ETag string `xml:"ETag"`
+	}
+	xml.NewDecoder(resp.Body).Decode(&cp) //nolint:errcheck
+	resp.Body.Close()
+
+	do(t, http.MethodPost, base+"/pub/leak?uploadId="+init.UploadID,
+		strings.NewReader("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"+
+			cp.ETag+"</ETag></Part></CompleteMultipartUpload>"), nil, http.StatusOK).Body.Close()
+
+	// It round-trips, and the plaintext bucket commits with no recipient —
+	// which is only possible because no key-bearing reference is present.
+	resp = do(t, http.MethodGet, base+"/pub/leak", nil, nil, http.StatusOK)
+	got, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(got) != payload {
+		t.Fatalf("copied part = %q", got)
+	}
+	do(t, http.MethodPut, base+"/pub?x-swarm-snapshot=v1", nil, nil, http.StatusOK).Body.Close()
+}
+
+// A bucket that acquires encrypted objects after creation must be recoverable
+// without deleting them: the recipient is settable, and the chain resumes.
+func TestRecoveryRecipientSettableAfterCreation(t *testing.T) {
+	id, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := newGateway(t)
+	do(t, http.MethodPut, base+"/late", nil, nil, http.StatusOK).Body.Close()
+	do(t, http.MethodPut, base+"/late/secret", strings.NewReader("hidden"),
+		map[string]string{"x-amz-server-side-encryption": "AES256"}, http.StatusOK).Body.Close()
+
+	// Frozen: no recipient, so no commit.
+	do(t, http.MethodPut, base+"/late?x-swarm-snapshot=v1", nil, nil, http.StatusBadRequest).Body.Close()
+
+	// Set one — without deleting the object the chain exists to protect.
+	do(t, http.MethodPut, base+"/late?x-swarm-recovery-recipient", nil,
+		map[string]string{"x-swarm-recovery-recipient": id.Recipient().String()},
+		http.StatusOK).Body.Close()
+
+	resp := do(t, http.MethodPut, base+"/late?x-swarm-snapshot=v1", nil, nil, http.StatusOK)
+	resp.Body.Close()
+}
+
+// The refusal message is the only place most operators meet this problem, so
+// it must name the non-destructive remedy and must not tell anyone to delete
+// the objects the commit chain exists to protect.
+func TestCommitRefusalNamesTheNonDestructiveRemedy(t *testing.T) {
+	base := newGateway(t)
+	do(t, http.MethodPut, base+"/advice", nil, nil, http.StatusOK).Body.Close()
+	do(t, http.MethodPut, base+"/advice/secret", strings.NewReader("x"),
+		map[string]string{"x-amz-server-side-encryption": "AES256"}, http.StatusOK).Body.Close()
+	resp := do(t, http.MethodPut, base+"/advice?x-swarm-snapshot=v1", nil, nil, http.StatusBadRequest)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	msg := string(body)
+	if !strings.Contains(msg, "x-swarm-recovery-recipient") {
+		t.Fatalf("refusal must name the endpoint that fixes it: %s", msg)
+	}
+	for _, bad := range []string{"recreate the bucket", "delete"} {
+		if strings.Contains(msg, bad) {
+			t.Fatalf("refusal advises a destructive remedy (%q): %s", bad, msg)
+		}
+	}
+}
+
+// Clearing a recipient on a bucket that still holds encrypted objects would
+// freeze its chain silently — the exact failure this work removes.
+func TestClearingRecipientRefusedWhileEncryptedObjectsExist(t *testing.T) {
+	id, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := newGateway(t)
+	do(t, http.MethodPut, base+"/clr", nil,
+		map[string]string{"x-swarm-recovery-recipient": id.Recipient().String()},
+		http.StatusOK).Body.Close()
+	do(t, http.MethodPut, base+"/clr/secret", strings.NewReader("x"),
+		map[string]string{"x-amz-server-side-encryption": "AES256"}, http.StatusOK).Body.Close()
+
+	resp := do(t, http.MethodPut, base+"/clr?x-swarm-recovery-recipient", nil,
+		map[string]string{"x-swarm-recovery-recipient": ""}, http.StatusBadRequest)
+	resp.Body.Close()
+
+	// The chain still works afterwards: the refusal changed nothing.
+	do(t, http.MethodPut, base+"/clr?x-swarm-snapshot=v1", nil, nil, http.StatusOK).Body.Close()
+
+	// Clearing is fine once the encrypted objects are gone.
+	do(t, http.MethodDelete, base+"/clr/secret", nil, nil, http.StatusNoContent).Body.Close()
+	do(t, http.MethodPut, base+"/clr?x-swarm-recovery-recipient", nil,
+		map[string]string{"x-swarm-recovery-recipient": ""}, http.StatusOK).Body.Close()
+}
+
+// A wrong recovery identity is an operator mistake, not an upstream outage:
+// 503 would send them hunting the wrong problem and invites SDK retries.
+func TestWrongIdentityIsClientError(t *testing.T) {
+	id, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := newGateway(t)
+	do(t, http.MethodPut, base+"/wrongid", nil,
+		map[string]string{"x-swarm-recovery-recipient": id.Recipient().String()},
+		http.StatusOK).Body.Close()
+	do(t, http.MethodPut, base+"/wrongid/secret", strings.NewReader("x"),
+		map[string]string{"x-amz-server-side-encryption": "AES256"}, http.StatusOK).Body.Close()
+	resp := do(t, http.MethodPut, base+"/wrongid?x-swarm-snapshot=v1", nil, nil, http.StatusOK)
+	var snap struct {
+		Root string `json:"root"`
+	}
+	json.NewDecoder(resp.Body).Decode(&snap) //nolint:errcheck
+	resp.Body.Close()
+
+	do(t, http.MethodPost, base+"/wrongid?x-swarm-restore="+snap.Root, nil,
+		map[string]string{"x-swarm-recovery-identity": other.String()},
+		http.StatusBadRequest).Body.Close()
 }

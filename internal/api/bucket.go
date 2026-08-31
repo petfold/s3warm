@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/xml"
 	"errors"
 	"io"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/petfold/s3warm/internal/manifest"
+	"github.com/petfold/s3warm/internal/recovery"
 	"github.com/petfold/s3warm/internal/store"
 )
 
@@ -70,6 +73,17 @@ func (s *Server) handleCreateBucket(w http.ResponseWriter, r *http.Request, buck
 	if !id.Root() {
 		b.Owner = id.Tenant
 	}
+	// x-swarm-recovery-recipient enables the commit chain for a bucket that
+	// holds SSE objects: their references embed decryption keys, so they are
+	// sealed to this recipient before entering the chain (design §5, §12).
+	// Only the public half is stored; the identity is supplied per restore.
+	if rec := r.Header.Get("x-swarm-recovery-recipient"); rec != "" {
+		if _, err := recovery.ParseRecipient(rec); err != nil {
+			s.writeError(w, r, errInvalidArgument.withMessage(err.Error()))
+			return
+		}
+		b.RecoveryRecipient = rec
+	}
 	// x-swarm-act: true makes the bucket ACT-protected (design §8): its ACT
 	// history starts here, before any object, so every upload extends one
 	// history.
@@ -127,6 +141,11 @@ func (s *Server) handleHeadBucket(w http.ResponseWriter, r *http.Request, bucket
 	if b.HeadRoot != "" {
 		w.Header().Set("x-swarm-bucket-root", b.HeadRoot)
 		w.Header().Set("x-swarm-commit-seq", strconv.FormatInt(b.CommitSeq, 10))
+	}
+	if b.RecoveryRecipient != "" {
+		// The public half only. Its presence tells a client the chain covers
+		// this bucket's encrypted objects, and which key restores them.
+		w.Header().Set("x-swarm-recovery-recipient", b.RecoveryRecipient)
 	}
 	if b.ACT {
 		// Everything a grantee needs (plus per-object references) to read the
@@ -192,6 +211,10 @@ func (s *Server) handlePutBucketEncryption(w http.ResponseWriter, r *http.Reques
 			"only SSE-S3 (AES256) is supported, got "+alg))
 		return
 	}
+	// Deliberately not gated on having a recovery recipient. SSE predates the
+	// commit chain and is useful without it; a bucket that turns SSE on with
+	// no recipient simply stops committing, with an error naming the endpoint
+	// that fixes it, and resumes once one is set.
 	if err := s.store.SetBucketEncryption(r.Context(), bucket, "AES256"); err != nil {
 		s.writeError(w, r, storeError(err))
 		return
@@ -215,4 +238,74 @@ func (s *Server) handleGetBucketVersioning(w http.ResponseWriter, r *http.Reques
 	}
 	// Never-versioned buckets return the empty configuration, as on S3.
 	writeXML(w, http.StatusOK, versioningConfiguration{Xmlns: s3Xmlns, Status: b.Versioning})
+}
+
+// handlePutBucketRecoveryRecipient sets or clears the bucket's recovery
+// recipient: PUT /{bucket}?x-swarm-recovery-recipient with the recipient in
+// the header of the same name (empty header clears it).
+//
+// Settable after creation on purpose. A bucket can acquire encrypted objects
+// long after it was made — by enabling default SSE, or by a copy from an
+// encrypted bucket — and without this the only way out of the resulting
+// refusal would be to delete the objects the commit chain exists to protect.
+func (s *Server) handlePutBucketRecoveryRecipient(w http.ResponseWriter, r *http.Request, bucket string) {
+	if _, err := s.store.GetBucket(r.Context(), bucket); err != nil {
+		s.writeError(w, r, storeError(err))
+		return
+	}
+	rec := r.Header.Get("x-swarm-recovery-recipient")
+	if rec != "" {
+		if _, err := recovery.ParseRecipient(rec); err != nil {
+			s.writeError(w, r, errInvalidArgument.withMessage(err.Error()))
+			return
+		}
+	}
+	if rec == "" {
+		// Clearing on a bucket that still holds encrypted references would
+		// freeze its chain on the next commit, with a 200 and no hint of it —
+		// the silent-freeze failure this whole change set exists to remove.
+		has, err := s.bucketHasKeyBearingRefs(r.Context(), bucket)
+		if err != nil {
+			s.writeError(w, r, storeError(err))
+			return
+		}
+		if has && s.commits != nil {
+			s.writeError(w, r, errInvalidRequest.withMessage(
+				"this bucket holds encrypted objects, so clearing its recovery recipient "+
+					"would stop its commit chain: delete those objects first, or set a different recipient"))
+			return
+		}
+	}
+	if err := s.store.SetBucketRecoveryRecipient(r.Context(), bucket, rec); err != nil {
+		s.writeError(w, r, storeError(err))
+		return
+	}
+	// Objects written before this point keep their references; the next commit
+	// seals them. A bucket whose chain was frozen for want of a recipient
+	// resumes committing from here.
+	if rec != "" {
+		s.commits.Notify(bucket)
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// bucketHasKeyBearingRefs reports whether any object in the bucket holds a
+// reference that must be sealed before the bucket can commit.
+func (s *Server) bucketHasKeyBearingRefs(ctx context.Context, bucket string) (bool, error) {
+	after := ""
+	for {
+		page, err := s.store.ListObjects(ctx, bucket, "", after, 1000)
+		if err != nil {
+			return false, err
+		}
+		for _, o := range page {
+			if manifest.HasKeyBearingRefs(o) {
+				return true, nil
+			}
+		}
+		if len(page) < 1000 {
+			return false, nil
+		}
+		after = page[len(page)-1].Key
+	}
 }

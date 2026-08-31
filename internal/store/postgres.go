@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS buckets (
 	owner      TEXT NOT NULL DEFAULT '',
 	act        BOOLEAN NOT NULL DEFAULT FALSE,
 	act_history  TEXT NOT NULL DEFAULT '',
-	act_grantees TEXT NOT NULL DEFAULT ''
+	act_grantees TEXT NOT NULL DEFAULT '',
+	recovery_recipient TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS snapshots (
 	bucket     TEXT COLLATE "C" NOT NULL,
@@ -140,9 +141,18 @@ func OpenPostgres(dsn string) (*Postgres, error) {
 		db.Close()
 		return nil, fmt.Errorf("initializing schema: %w", err)
 	}
-	// Column migrations for databases created by older versions land here,
-	// in the SQLite ALTER-loop pattern (none needed yet — the schema above
-	// is the first Postgres shape).
+	// Column migrations for databases created by older versions. CREATE TABLE
+	// IF NOT EXISTS above is a no-op on an existing table, so every column
+	// added after the first Postgres shape must also appear here or existing
+	// deployments break on upgrade.
+	for _, stmt := range []string{
+		`ALTER TABLE buckets ADD COLUMN IF NOT EXISTS recovery_recipient TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("migrating schema: %w", err)
+		}
+	}
 	return &Postgres{db: db}, nil
 }
 
@@ -161,11 +171,11 @@ func (s *Postgres) CreateBucket(ctx context.Context, b Bucket) error {
 		b.CreatedAt = time.Now().UTC()
 	}
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO buckets (name, created_at, batch_id, sse, head_root, commit_seq, cors, versioning, tags, owner, act, act_history, act_grantees)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		`INSERT INTO buckets (name, created_at, batch_id, sse, head_root, commit_seq, cors, versioning, tags, owner, act, act_history, act_grantees, recovery_recipient)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		 ON CONFLICT (name) DO NOTHING`,
 		b.Name, b.CreatedAt.UTC().Format(timeLayout), b.BatchID, b.Encryption, b.HeadRoot, b.CommitSeq, b.CORS, b.Versioning, b.Tags,
-		b.Owner, b.ACT, b.ActHistory, b.ActGrantees)
+		b.Owner, b.ACT, b.ActHistory, b.ActGrantees, b.RecoveryRecipient)
 	if err != nil {
 		return err
 	}
@@ -175,13 +185,13 @@ func (s *Postgres) CreateBucket(ctx context.Context, b Bucket) error {
 	return nil
 }
 
-const bucketColumns = `name, created_at, batch_id, sse, head_root, commit_seq, cors, versioning, tags, owner, act, act_history, act_grantees`
+const bucketColumns = `name, created_at, batch_id, sse, head_root, commit_seq, cors, versioning, tags, owner, act, act_history, act_grantees, recovery_recipient`
 
 func scanBucket(row interface{ Scan(...any) error }) (*Bucket, error) {
 	var b Bucket
 	var created string
 	if err := row.Scan(&b.Name, &created, &b.BatchID, &b.Encryption, &b.HeadRoot, &b.CommitSeq, &b.CORS, &b.Versioning, &b.Tags,
-		&b.Owner, &b.ACT, &b.ActHistory, &b.ActGrantees); err != nil {
+		&b.Owner, &b.ACT, &b.ActHistory, &b.ActGrantees, &b.RecoveryRecipient); err != nil {
 		return nil, err
 	}
 	b.CreatedAt, _ = time.Parse(timeLayout, created)
@@ -261,6 +271,10 @@ func (s *Postgres) SetBucketEncryption(ctx context.Context, bucket, algorithm st
 
 func (s *Postgres) SetBucketVersioning(ctx context.Context, bucket, status string) error {
 	return s.setBucketColumn(ctx, `UPDATE buckets SET versioning = $1 WHERE name = $2`, status, bucket)
+}
+
+func (s *Postgres) SetBucketRecoveryRecipient(ctx context.Context, bucket, recipient string) error {
+	return s.setBucketColumn(ctx, `UPDATE buckets SET recovery_recipient = $1 WHERE name = $2`, recipient, bucket)
 }
 
 func (s *Postgres) SetBucketCORS(ctx context.Context, bucket, corsJSON string) error {

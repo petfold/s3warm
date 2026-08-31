@@ -176,7 +176,16 @@ func (s *Server) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, bu
 	}
 
 	part := store.Part{PartNumber: partNumber, LastModified: time.Now().UTC()}
-	if rangeSpec := r.Header.Get("x-amz-copy-source-range"); rangeSpec == "" || srcObj.SwarmRef == "" {
+	rangeSpec := r.Header.Get("x-amz-copy-source-range")
+	// Reference reuse is only safe while the copy stays on one side of the
+	// encryption boundary. The reference carries the source's encryption with
+	// it, so reusing it across the boundary would either put a key-bearing
+	// reference in an object nothing seals, or mark an object encrypted whose
+	// bytes are not. S3 allows the copy, so re-stream it instead of refusing:
+	// the read decrypts, the write re-encrypts under the destination's
+	// setting, and the O(1) path is simply not taken.
+	crossesSSE := srcObj.Encrypted != upload.Encrypted
+	if srcObj.SwarmRef == "" || (rangeSpec == "" && !crossesSSE) {
 		// Whole-object copy on a content-addressed store: reuse the reference.
 		part.SwarmRef = srcObj.SwarmRef
 		part.Size = srcObj.Size
@@ -188,9 +197,12 @@ func (s *Server) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, bu
 		}
 	} else {
 		// x-amz-copy-source-range is strictly bytes=first-last, within bounds
-		// (no clamping, no suffix/open forms).
+		// (no clamping, no suffix/open forms). Absent, this is a whole-object
+		// copy that crossed the encryption boundary and must be re-streamed.
 		var st, en int64
-		if _, err := fmt.Sscanf(rangeSpec, "bytes=%d-%d", &st, &en); err != nil ||
+		if rangeSpec == "" {
+			st, en = 0, srcObj.Size-1
+		} else if _, err := fmt.Sscanf(rangeSpec, "bytes=%d-%d", &st, &en); err != nil ||
 			fmt.Sprintf("bytes=%d-%d", st, en) != rangeSpec ||
 			st > en || en >= srcObj.Size {
 			s.writeError(w, r, errInvalidRange)

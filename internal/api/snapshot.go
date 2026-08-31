@@ -3,11 +3,15 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"regexp"
 	"time"
 
+	"filippo.io/age"
+
 	"github.com/petfold/s3warm/internal/manifest"
+	"github.com/petfold/s3warm/internal/recovery"
 	"github.com/petfold/s3warm/internal/store"
 )
 
@@ -104,15 +108,42 @@ func (s *Server) handleRestoreBucket(w http.ResponseWriter, r *http.Request, buc
 		return
 	}
 
+	// The recovery identity is supplied per request and never stored: the
+	// gateway serves a live bucket from its index and needs the identity only
+	// to rebuild one from a commit root (design §5).
+	var identity age.Identity
+	if raw := r.Header.Get("x-swarm-recovery-identity"); raw != "" {
+		var err error
+		if identity, err = recovery.ParseIdentity(raw); err != nil {
+			s.writeError(w, r, errInvalidArgument.withMessage(err.Error()))
+			return
+		}
+	}
+
 	ls := manifest.NewLoadSaver(s.bee, "", true)
-	commit, err := manifest.GetCommit(ctx, ls, root)
+	commit, err := manifest.GetCommit(ctx, ls, root, identity)
 	if err != nil {
+		// A wrong or rotated identity is the likeliest operator error in a
+		// recovery drill; reporting it as an upstream outage sends them
+		// hunting the wrong problem, and 503 invites SDK retries.
+		if errors.Is(err, recovery.ErrDecrypt) || errors.Is(err, manifest.ErrCommitVersion) {
+			s.writeError(w, r, errInvalidRequest.withMessage(err.Error()))
+			return
+		}
 		s.writeError(w, r, beeError(err))
 		return
 	}
 	if commit.Bucket != bucket {
 		s.writeError(w, r, errInvalidRequest.withMessage(
 			"commit "+root+" belongs to bucket "+commit.Bucket))
+		return
+	}
+	// Restoring a bucket whose SSE references are still sealed would produce
+	// an index full of unreadable rows, so refuse rather than half-restore.
+	if n := commit.SealedCount(); n > 0 {
+		s.writeError(w, r, errInvalidRequest.withMessage(fmt.Sprintf(
+			"%d of %d objects have sealed references: supply the bucket's recovery identity "+
+				"in x-swarm-recovery-identity to restore them", n, len(commit.Objects))))
 		return
 	}
 	// The rollback itself: the index swap is atomic, and the head points at
@@ -131,7 +162,8 @@ func (s *Server) handleRestoreBucket(w http.ResponseWriter, r *http.Request, buc
 // commitError maps commit failures: store errors keep their mapping,
 // everything else surfaces as a Bee/upstream problem.
 func commitError(err error) apiError {
-	if errors.Is(err, manifest.ErrACTBucket) {
+	if errors.Is(err, manifest.ErrACTBucket) || errors.Is(err, manifest.ErrNoRecoveryRecipient) {
+		// The client's configuration is the problem, not the upstream node.
 		return errInvalidRequest.withMessage(err.Error())
 	}
 	if e := storeError(err); e.Code != errInternal.Code {

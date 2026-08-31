@@ -72,6 +72,12 @@ type Bucket struct {
 	// Empty means root-owned: visible to root keys only, like any bucket,
 	// but never to tenant keys.
 	Owner string
+	// RecoveryRecipient is an age X25519 recipient ("age1..."). When set, the
+	// Swarm references of SSE objects are encrypted to it before they enter
+	// the commit chain, so a commit root stops being a read capability for
+	// the bucket's encrypted objects (design §5, §12). Empty means the chain
+	// is unavailable for SSE objects and commits refuse to build.
+	RecoveryRecipient string
 	// ACT fields (design §8): ACT marks the bucket ACT-protected — every
 	// object is uploaded with swarm-act under the node's publisher key.
 	// ActHistory is the bucket's ACT history address; ActGrantees is the
@@ -176,6 +182,7 @@ type Store interface {
 	DeleteBucket(ctx context.Context, name string) error
 	// SetBucketEncryption sets the bucket-default SSE algorithm ("" clears).
 	SetBucketEncryption(ctx context.Context, bucket, algorithm string) error
+	SetBucketRecoveryRecipient(ctx context.Context, bucket, recipient string) error
 	// SetBucketVersioning sets the versioning status ("Enabled"/"Suspended").
 	SetBucketVersioning(ctx context.Context, bucket, status string) error
 	// SetBucketHead records the bucket's latest commit root and sequence.

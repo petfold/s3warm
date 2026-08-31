@@ -32,6 +32,16 @@ var (
 		Help: "Object payload bytes served (GetObject).",
 	})
 
+	// A commit that cannot be built freezes the bucket's chain: writes keep
+	// succeeding, so nothing in the S3 API reveals that snapshots, rollback
+	// and feed checkpoints have stopped covering new data. Alert on this.
+	// Unlabelled on purpose: bucket names are user-supplied, and a tenant able
+	// to create buckets could otherwise mint unbounded label series.
+	CommitFailures = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "s3warm_commit_failures_total",
+		Help: "Bucket commits that could not be built. A non-zero rate means some bucket's commit chain is frozen; the gateway log names it.",
+	})
+
 	BeeRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "s3warm_bee_requests_total",
 		Help: "Upstream Bee API requests by operation and status code (0 = transport error).",
