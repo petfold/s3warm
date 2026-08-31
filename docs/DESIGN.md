@@ -293,7 +293,7 @@ The commit chain (§5) is the *portable* representation of history: bucket-level
 
 HEAD/GET/List report the class the client wrote.
 
-**SSE:** `x-amz-server-side-encryption: AES256` → `swarm-encrypt: true`. The 64-byte reference (which embeds the decryption key) lives only in the index; `x-swarm-reference` is suppressed for encrypted objects. SSE-KMS/SSE-C rejected (phase 3 may map SSE-C to gateway-side AES-GCM). Responses echo `x-amz-server-side-encryption: AES256`.
+**SSE:** `x-amz-server-side-encryption: AES256` → `swarm-encrypt: true`. The 64-byte reference (which embeds the decryption key) never leaves the gateway in the clear: it lives in the index, `x-swarm-reference` is suppressed for encrypted objects, and it enters the commit chain only sealed to the bucket's recovery recipient (§5). A bucket with SSE objects and no recipient does not commit at all. SSE-KMS/SSE-C rejected (phase 3 may map SSE-C to gateway-side AES-GCM). Responses echo `x-amz-server-side-encryption: AES256`.
 
 ---
 

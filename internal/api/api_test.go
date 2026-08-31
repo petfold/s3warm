@@ -1,6 +1,8 @@
 package api_test
 
 import (
+	"filippo.io/age"
+
 	"bytes"
 	"crypto/hmac"
 	"crypto/md5"
@@ -1360,4 +1362,81 @@ func TestACTGrants(t *testing.T) {
 
 	// The public commit chain stays off: snapshots refuse ACT buckets.
 	do(t, http.MethodPut, base+"/vault?x-swarm-snapshot=v1", nil, nil, http.StatusBadRequest).Body.Close()
+}
+
+// An SSE bucket without a recovery recipient must refuse to commit rather than
+// publish decryption keys — and must say so clearly, not fail deep in mantaray
+// with "invalid entry size".
+func TestSSECommitRefusedWithoutRecipient(t *testing.T) {
+	base := newGateway(t)
+	do(t, http.MethodPut, base+"/nosse", nil, nil, http.StatusOK).Body.Close()
+	do(t, http.MethodPut, base+"/nosse/secret", strings.NewReader("hidden"),
+		map[string]string{"x-amz-server-side-encryption": "AES256"}, http.StatusOK).Body.Close()
+
+	resp := do(t, http.MethodPut, base+"/nosse?x-swarm-snapshot=v1", nil, nil, http.StatusBadRequest)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), "recovery recipient") {
+		t.Fatalf("want a recovery-recipient error, got %s", body)
+	}
+	if strings.Contains(string(body), "invalid entry size") {
+		t.Fatal("mantaray's width error leaked to the client")
+	}
+}
+
+// The whole point, end to end: an SSE bucket with a recipient commits, the
+// chain carries no plaintext reference, and the bucket restores from its root
+// when the identity is supplied.
+func TestSSECommitChainRoundTrip(t *testing.T) {
+	id, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := newGateway(t)
+	do(t, http.MethodPut, base+"/enc", nil,
+		map[string]string{"x-swarm-recovery-recipient": id.Recipient().String()},
+		http.StatusOK).Body.Close()
+
+	// HeadBucket advertises the recipient (public half only).
+	resp := do(t, http.MethodHead, base+"/enc", nil, nil, http.StatusOK)
+	resp.Body.Close()
+	if resp.Header.Get("x-swarm-recovery-recipient") != id.Recipient().String() {
+		t.Fatal("HeadBucket should advertise the recovery recipient")
+	}
+
+	sse := map[string]string{"x-amz-server-side-encryption": "AES256"}
+	do(t, http.MethodPut, base+"/enc/resources.tar.gz", strings.NewReader("every secret"), sse, http.StatusOK).Body.Close()
+	do(t, http.MethodPut, base+"/enc/public.txt", strings.NewReader("not secret"), nil, http.StatusOK).Body.Close()
+
+	resp = do(t, http.MethodPut, base+"/enc?x-swarm-snapshot=v1", nil, nil, http.StatusOK)
+	var snap struct {
+		Root string `json:"root"`
+	}
+	json.NewDecoder(resp.Body).Decode(&snap) //nolint:errcheck
+	resp.Body.Close()
+	if snap.Root == "" {
+		t.Fatal("SSE bucket with a recipient must commit")
+	}
+
+	// Destroy the object, then restore the bucket from its root.
+	do(t, http.MethodDelete, base+"/enc/resources.tar.gz", nil, nil, http.StatusNoContent).Body.Close()
+	do(t, http.MethodGet, base+"/enc/resources.tar.gz", nil, nil, http.StatusNotFound).Body.Close()
+
+	// Without the identity the restore refuses rather than half-restoring.
+	resp = do(t, http.MethodPost, base+"/enc?x-swarm-restore="+snap.Root, nil, nil, http.StatusBadRequest)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), "sealed references") {
+		t.Fatalf("want a sealed-reference error, got %s", body)
+	}
+
+	// With it, the bucket comes back and the object reads.
+	do(t, http.MethodPost, base+"/enc?x-swarm-restore="+snap.Root, nil,
+		map[string]string{"x-swarm-recovery-identity": id.String()}, http.StatusOK).Body.Close()
+	resp = do(t, http.MethodGet, base+"/enc/resources.tar.gz", nil, nil, http.StatusOK)
+	got, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(got) != "every secret" {
+		t.Fatalf("restored object = %q", got)
+	}
 }

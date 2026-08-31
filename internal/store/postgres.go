@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS buckets (
 	owner      TEXT NOT NULL DEFAULT '',
 	act        BOOLEAN NOT NULL DEFAULT FALSE,
 	act_history  TEXT NOT NULL DEFAULT '',
-	act_grantees TEXT NOT NULL DEFAULT ''
+	act_grantees TEXT NOT NULL DEFAULT '',
+	recovery_recipient TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS snapshots (
 	bucket     TEXT COLLATE "C" NOT NULL,
@@ -161,11 +162,11 @@ func (s *Postgres) CreateBucket(ctx context.Context, b Bucket) error {
 		b.CreatedAt = time.Now().UTC()
 	}
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO buckets (name, created_at, batch_id, sse, head_root, commit_seq, cors, versioning, tags, owner, act, act_history, act_grantees)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		`INSERT INTO buckets (name, created_at, batch_id, sse, head_root, commit_seq, cors, versioning, tags, owner, act, act_history, act_grantees, recovery_recipient)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		 ON CONFLICT (name) DO NOTHING`,
 		b.Name, b.CreatedAt.UTC().Format(timeLayout), b.BatchID, b.Encryption, b.HeadRoot, b.CommitSeq, b.CORS, b.Versioning, b.Tags,
-		b.Owner, b.ACT, b.ActHistory, b.ActGrantees)
+		b.Owner, b.ACT, b.ActHistory, b.ActGrantees, b.RecoveryRecipient)
 	if err != nil {
 		return err
 	}
@@ -175,13 +176,13 @@ func (s *Postgres) CreateBucket(ctx context.Context, b Bucket) error {
 	return nil
 }
 
-const bucketColumns = `name, created_at, batch_id, sse, head_root, commit_seq, cors, versioning, tags, owner, act, act_history, act_grantees`
+const bucketColumns = `name, created_at, batch_id, sse, head_root, commit_seq, cors, versioning, tags, owner, act, act_history, act_grantees, recovery_recipient`
 
 func scanBucket(row interface{ Scan(...any) error }) (*Bucket, error) {
 	var b Bucket
 	var created string
 	if err := row.Scan(&b.Name, &created, &b.BatchID, &b.Encryption, &b.HeadRoot, &b.CommitSeq, &b.CORS, &b.Versioning, &b.Tags,
-		&b.Owner, &b.ACT, &b.ActHistory, &b.ActGrantees); err != nil {
+		&b.Owner, &b.ACT, &b.ActHistory, &b.ActGrantees, &b.RecoveryRecipient); err != nil {
 		return nil, err
 	}
 	b.CreatedAt, _ = time.Parse(timeLayout, created)

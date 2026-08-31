@@ -200,6 +200,8 @@ details on top of it.
 | `x-swarm-redundancy-strategy` | GET | Erasure-coding fetch strategy override (0–4) |
 | `x-swarm-redundancy-fallback-mode` | GET | Fetch fallback (`true`/`false`) |
 | `x-swarm-act: true` | CreateBucket | Make the bucket **ACT-protected**: every object is uploaded under Swarm's Access Control Trie (see below) |
+| `x-swarm-recovery-recipient` | CreateBucket | An age X25519 recipient (`age1...`). Required before a bucket holding **SSE** objects can commit: their references are sealed to it before entering the public commit chain (see below) |
+| `x-swarm-recovery-identity` | `POST ?x-swarm-restore=` | The matching age identity (`AGE-SECRET-KEY-1...`), needed to rebuild an index from a commit root. Supplied per request and never stored |
 
 ### Response headers
 
@@ -210,6 +212,7 @@ details on top of it.
 | `x-swarm-batch-ttl` | PUT/GET/HEAD object | Estimated seconds until that batch (and the object) expires |
 | `x-swarm-bucket-root` | HeadBucket, snapshot/restore | The bucket's current commit root — browse via `/bzz/{root}/{key}` |
 | `x-swarm-commit-seq` | HeadBucket | Commit sequence number |
+| `x-swarm-recovery-recipient` | HeadBucket | The bucket's recovery recipient, if set (the public half only) |
 | `x-swarm-act-history` | HeadBucket, GET/HEAD object (ACT buckets) | The bucket's ACT history address — one of the three values a grantee needs for native reads |
 | `x-swarm-act-publisher` | HeadBucket, GET/HEAD object (ACT buckets) | The publisher's compressed public key (the gateway's Bee node) |
 
@@ -252,7 +255,7 @@ Bee resolves the bucket's latest root via
 |---|---|
 | `PUT /{bucket}?x-swarm-snapshot=<label>` | Forces a commit, records `<label>` → root, pins the root on the gateway's Bee node. Returns JSON `{bucket, label, root, seq, createdAt}` |
 | `GET /{bucket}?x-swarm-snapshot` | Lists snapshots (JSON) |
-| `POST /{bucket}?x-swarm-restore=<label or 64-hex root>` | Atomic whole-bucket rollback: replaces the entire object set from the commit document and points the head at that root. Returns JSON `{bucket, root, seq, objects}` |
+| `POST /{bucket}?x-swarm-restore=<label or 64-hex root>` | Atomic whole-bucket rollback: replaces the entire object set from the commit document and points the head at that root. Returns JSON `{bucket, root, seq, objects}`. If the commit contains sealed (SSE) references, pass `x-swarm-recovery-identity`; without it the restore is refused rather than performed half-blind |
 
 Labels match `[A-Za-z0-9._-]{1,64}`. Restore accepts any commit root whose
 document names the same bucket — including roots from before a restore, so
@@ -305,6 +308,14 @@ uploaded *before* the grant become readable too.
 - ACT references are 64-byte encrypted references: possession alone grants
   nothing, so `x-swarm-reference` is still exposed — but a bare `bzz://`
   URL will not work; native access needs the three values above.
+**SSE objects and the chain.** An SSE object's Swarm reference is 64 bytes and embeds its decryption key, so it can be neither a manifest fork entry (mantaray entries are single-width, and the commit document's own entry is 32 bytes) nor public. Such objects are represented by an `sse/1` descriptor — the same indirection as `composite/1` — holding the reference **encrypted to the bucket's recovery recipient**, and the commit document carries `SealedRef` in place of `SwarmRef`. Consequences, stated plainly:
+
+- A bucket holding SSE objects and **no** recovery recipient **cannot commit**. Snapshots, rollback and feed checkpoints are unavailable for it, and `PUT ?x-swarm-snapshot=` returns `400` saying so. Set `x-swarm-recovery-recipient` at CreateBucket.
+- `bzz://{root}/{key}` serves the descriptor, not the object: an encrypted object is not browsable. That is the point of encrypting it.
+- Restoring such a bucket needs the identity, passed per request. The gateway serves a live bucket from its index and never stores the identity.
+- Losing the identity means losing the ability to rebuild an index from a root. The objects remain readable through a gateway that still has its index; they are unrecoverable from the bare chain. Keep it wherever you keep the rest of your recovery material.
+- The chain still publishes key names, sizes, ETags, batch IDs and user metadata for every bucket. Encryption covers the object bytes, not the shape of the bucket.
+
 - **The public commit chain is off** for ACT buckets (it would leak key
   names and structure), so snapshots/restore are unavailable there.
 - Reference-reusing copies (CopyObject, whole-object UploadPartCopy)

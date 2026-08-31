@@ -8,13 +8,26 @@ import (
 	"sync"
 	"time"
 
+	"filippo.io/age"
+
 	"github.com/petfold/s3warm/internal/bee"
+	"github.com/petfold/s3warm/internal/metrics"
+	"github.com/petfold/s3warm/internal/recovery"
 	"github.com/petfold/s3warm/internal/store"
 )
 
 // ErrACTBucket marks a commit skipped because the bucket is ACT-protected:
 // the commit chain is public by design and would leak the bucket's keys.
 var ErrACTBucket = errors.New("commit chain is disabled for ACT-protected buckets")
+
+// ErrNoRecoveryRecipient marks a commit refused because the bucket holds SSE
+// objects but has no recovery recipient. Their references embed decryption
+// keys, so committing them without sealing would publish read access to the
+// bucket; refusing is the safe default. Set x-swarm-recovery-recipient at
+// CreateBucket to enable the chain for an encrypted bucket.
+var ErrNoRecoveryRecipient = errors.New(
+	"commit chain needs a recovery recipient for buckets with SSE objects: " +
+		"recreate the bucket with x-swarm-recovery-recipient (an age X25519 recipient)")
 
 // DefaultDebounce batches a burst of mutations into one commit (design §5:
 // a commit costs only the changed path's node chain, but building it still
@@ -88,6 +101,10 @@ func (c *Committer) Run(ctx context.Context) {
 			c.mu.Unlock()
 			for _, b := range due {
 				if _, _, err := c.CommitNow(ctx, b); err != nil && !errors.Is(err, ErrACTBucket) {
+					// A frozen chain is invisible from the S3 API — writes keep
+					// succeeding while recovery quietly stops covering new data —
+					// so this is counted, not just logged.
+					metrics.CommitFailures.WithLabelValues(b).Inc()
 					c.log.Warn("commit failed", "bucket", b, "err", err)
 				}
 			}
@@ -147,8 +164,14 @@ func (c *Committer) CommitNow(ctx context.Context, bucket string) (string, int64
 		Timestamp: time.Now().UTC(),
 		Objects:   objects,
 	}
+	var rec age.Recipient
+	if b.RecoveryRecipient != "" {
+		if rec, err = recovery.ParseRecipient(b.RecoveryRecipient); err != nil {
+			return "", 0, err
+		}
+	}
 	ls := NewLoadSaver(c.bee, batch, c.deferred)
-	root, err := Build(ctx, ls, commit)
+	root, err := Build(ctx, ls, commit, rec)
 	if err != nil {
 		return "", 0, err
 	}

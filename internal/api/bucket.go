@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/petfold/s3warm/internal/recovery"
 	"github.com/petfold/s3warm/internal/store"
 )
 
@@ -70,6 +71,17 @@ func (s *Server) handleCreateBucket(w http.ResponseWriter, r *http.Request, buck
 	if !id.Root() {
 		b.Owner = id.Tenant
 	}
+	// x-swarm-recovery-recipient enables the commit chain for a bucket that
+	// holds SSE objects: their references embed decryption keys, so they are
+	// sealed to this recipient before entering the chain (design §5, §12).
+	// Only the public half is stored; the identity is supplied per restore.
+	if rec := r.Header.Get("x-swarm-recovery-recipient"); rec != "" {
+		if _, err := recovery.ParseRecipient(rec); err != nil {
+			s.writeError(w, r, errInvalidArgument.withMessage(err.Error()))
+			return
+		}
+		b.RecoveryRecipient = rec
+	}
 	// x-swarm-act: true makes the bucket ACT-protected (design §8): its ACT
 	// history starts here, before any object, so every upload extends one
 	// history.
@@ -127,6 +139,11 @@ func (s *Server) handleHeadBucket(w http.ResponseWriter, r *http.Request, bucket
 	if b.HeadRoot != "" {
 		w.Header().Set("x-swarm-bucket-root", b.HeadRoot)
 		w.Header().Set("x-swarm-commit-seq", strconv.FormatInt(b.CommitSeq, 10))
+	}
+	if b.RecoveryRecipient != "" {
+		// The public half only. Its presence tells a client the chain covers
+		// this bucket's encrypted objects, and which key restores them.
+		w.Header().Set("x-swarm-recovery-recipient", b.RecoveryRecipient)
 	}
 	if b.ACT {
 		// Everything a grantee needs (plus per-object references) to read the
