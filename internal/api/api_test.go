@@ -1440,3 +1440,53 @@ func TestSSECommitChainRoundTrip(t *testing.T) {
 		t.Fatalf("restored object = %q", got)
 	}
 }
+
+// F1 end to end: an SSE object copied as a whole-object part into a plaintext
+// multipart upload used to smuggle its key-bearing reference into a public
+// commit chain. The copy is now refused at the encryption boundary.
+func TestUploadPartCopyCannotCrossEncryptionBoundary(t *testing.T) {
+	base := newGateway(t)
+	do(t, http.MethodPut, base+"/sec", nil, nil, http.StatusOK).Body.Close()
+	do(t, http.MethodPut, base+"/pub", nil, nil, http.StatusOK).Body.Close()
+	do(t, http.MethodPut, base+"/sec/secret", strings.NewReader("top secret payload"),
+		map[string]string{"x-amz-server-side-encryption": "AES256"}, http.StatusOK).Body.Close()
+
+	resp := do(t, http.MethodPost, base+"/pub/leak?uploads", nil, nil, http.StatusOK)
+	var init struct {
+		UploadID string `xml:"UploadId"`
+	}
+	xml.NewDecoder(resp.Body).Decode(&init) //nolint:errcheck
+	resp.Body.Close()
+
+	resp = do(t, http.MethodPut, base+"/pub/leak?partNumber=1&uploadId="+init.UploadID, nil,
+		map[string]string{"x-amz-copy-source": "/sec/secret"}, http.StatusBadRequest)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), "encryption boundary") {
+		t.Fatalf("want an encryption-boundary refusal, got %s", body)
+	}
+}
+
+// A bucket that acquires encrypted objects after creation must be recoverable
+// without deleting them: the recipient is settable, and the chain resumes.
+func TestRecoveryRecipientSettableAfterCreation(t *testing.T) {
+	id, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := newGateway(t)
+	do(t, http.MethodPut, base+"/late", nil, nil, http.StatusOK).Body.Close()
+	do(t, http.MethodPut, base+"/late/secret", strings.NewReader("hidden"),
+		map[string]string{"x-amz-server-side-encryption": "AES256"}, http.StatusOK).Body.Close()
+
+	// Frozen: no recipient, so no commit.
+	do(t, http.MethodPut, base+"/late?x-swarm-snapshot=v1", nil, nil, http.StatusBadRequest).Body.Close()
+
+	// Set one — without deleting the object the chain exists to protect.
+	do(t, http.MethodPut, base+"/late?x-swarm-recovery-recipient", nil,
+		map[string]string{"x-swarm-recovery-recipient": id.Recipient().String()},
+		http.StatusOK).Body.Close()
+
+	resp := do(t, http.MethodPut, base+"/late?x-swarm-snapshot=v1", nil, nil, http.StatusOK)
+	resp.Body.Close()
+}

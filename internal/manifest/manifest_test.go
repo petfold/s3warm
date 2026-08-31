@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -192,5 +193,125 @@ func TestPlaintextBucketUnchanged(t *testing.T) {
 	}
 	if got.Objects[0].SwarmRef != plainRef || got.SealedCount() != 0 {
 		t.Fatalf("plaintext round trip broken: %+v", got.Objects[0])
+	}
+}
+
+// F1 regression. A part's reference can arrive from a different object than
+// the one being written (a whole-object UploadPartCopy reuses the source's
+// reference), so an object flagged Encrypted=false can carry a key-bearing
+// reference. Sealing must follow the reference, not the flag.
+func TestKeyBearingRefSealedRegardlessOfObjectFlag(t *testing.T) {
+	_, rec, _ := testIdentity(t)
+	ls := newMemLS()
+	// Encrypted=false, yet the part holds a 64-byte key-bearing reference.
+	smuggled := store.Object{Bucket: "b", Key: "leak", Size: 20, ETag: "e-1",
+		Encrypted: false, VersionID: "null", IsLatest: true,
+		Parts: []store.Part{{PartNumber: 1, SwarmRef: sseRef2, Size: 20, ETag: "p"}}}
+
+	if _, err := Build(context.Background(), newMemLS(), commitWith(smuggled), nil); !errors.Is(err, ErrNoRecoveryRecipient) {
+		t.Fatal("a smuggled key-bearing reference must still require a recipient")
+	}
+	if _, err := Build(context.Background(), ls, commitWith(smuggled), rec); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(ls.everythingPublished(), []byte(sseRef2)) {
+		t.Fatal("key-bearing reference published from an object flagged Encrypted=false")
+	}
+}
+
+// F3 regression. A zero-byte SSE object has no reference and nothing sealed;
+// it must not be counted as sealed or the bucket never restores.
+func TestZeroByteSSEObjectIsRestorable(t *testing.T) {
+	id, rec, _ := testIdentity(t)
+	ls := newMemLS()
+	empty := store.Object{Bucket: "b", Key: "empty.bin", SwarmRef: "", Size: 0,
+		ETag: "d41d8cd98f00b204e9800998ecf8427e", Encrypted: true, VersionID: "null", IsLatest: true}
+	root, err := Build(context.Background(), ls, commitWith(empty), rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := GetCommit(context.Background(), ls, root, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := got.SealedCount(); n != 0 {
+		t.Fatalf("zero-byte SSE object counted as sealed (%d): bucket would never restore", n)
+	}
+	// And it needs no recipient, since there is nothing to seal.
+	if _, err := Build(context.Background(), newMemLS(), commitWith(empty), nil); err != nil {
+		t.Fatalf("zero-byte SSE object should not require a recipient: %v", err)
+	}
+}
+
+// F5 regression. A plaintext composite with an empty part reference must not
+// block restore of an entirely unencrypted bucket.
+func TestPlaintextCompositeNotCountedSealed(t *testing.T) {
+	ls := newMemLS()
+	o := store.Object{Bucket: "b", Key: "mixed", Size: 3, ETag: "e-1",
+		Encrypted: false, VersionID: "null", IsLatest: true,
+		Parts: []store.Part{
+			{PartNumber: 1, SwarmRef: plainRef, Size: 3, ETag: "p"},
+			{PartNumber: 2, SwarmRef: "", Size: 0, ETag: "z"},
+		}}
+	root, err := Build(context.Background(), ls, commitWith(o), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := GetCommit(context.Background(), ls, root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := got.SealedCount(); n != 0 {
+		t.Fatalf("plaintext composite counted as sealed (%d)", n)
+	}
+}
+
+// F6 regression. The sse/1 descriptor must actually describe the object: a
+// composite's descriptor carries its parts, and two different objects must not
+// produce the same chunk.
+func TestSSEDescriptorDescribesTheObject(t *testing.T) {
+	_, rec, _ := testIdentity(t)
+	ls := newMemLS()
+	a := sseMultipart()
+	b := sseMultipart()
+	b.Key = "big-2"
+	b.Parts = []store.Part{{PartNumber: 1, SwarmRef: sseRef, Size: 10, ETag: "q"}}
+	if _, err := Build(context.Background(), ls, commitWith(a, b), rec); err != nil {
+		t.Fatal(err)
+	}
+	var descs []SSEDescriptor
+	for _, chunk := range ls.saved {
+		var d SSEDescriptor
+		if json.Unmarshal(chunk, &d) == nil && d.Kind == "sse/1" {
+			descs = append(descs, d)
+		}
+	}
+	if len(descs) != 2 {
+		t.Fatalf("want one descriptor per SSE object, got %d", len(descs))
+	}
+	for _, d := range descs {
+		if len(d.SealedParts) == 0 {
+			t.Fatal("composite descriptor carries no parts")
+		}
+		if d.SealedParts[0].SealedRef == "" {
+			t.Fatal("descriptor part has an empty sealed reference")
+		}
+	}
+}
+
+// F7 regression. A reader must refuse a commit document newer than it
+// understands rather than silently producing an index of empty references.
+func TestGetCommitRefusesNewerVersion(t *testing.T) {
+	_, rec, _ := testIdentity(t)
+	ls := newMemLS()
+	c := commitWith(sseObject())
+	c.Version = CommitVersion + 1
+	root, err := Build(context.Background(), ls, c, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := GetCommit(context.Background(), ls, root, nil); err == nil ||
+		!strings.Contains(err.Error(), "newer than this gateway understands") {
+		t.Fatalf("want a version refusal, got %v", err)
 	}
 }

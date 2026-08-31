@@ -209,6 +209,10 @@ func (s *Server) handlePutBucketEncryption(w http.ResponseWriter, r *http.Reques
 			"only SSE-S3 (AES256) is supported, got "+alg))
 		return
 	}
+	// Deliberately not gated on having a recovery recipient. SSE predates the
+	// commit chain and is useful without it; a bucket that turns SSE on with
+	// no recipient simply stops committing, with an error naming the endpoint
+	// that fixes it, and resumes once one is set.
 	if err := s.store.SetBucketEncryption(r.Context(), bucket, "AES256"); err != nil {
 		s.writeError(w, r, storeError(err))
 		return
@@ -232,4 +236,35 @@ func (s *Server) handleGetBucketVersioning(w http.ResponseWriter, r *http.Reques
 	}
 	// Never-versioned buckets return the empty configuration, as on S3.
 	writeXML(w, http.StatusOK, versioningConfiguration{Xmlns: s3Xmlns, Status: b.Versioning})
+}
+
+// handlePutBucketRecoveryRecipient sets or clears the bucket's recovery
+// recipient: PUT /{bucket}?x-swarm-recovery-recipient with the recipient in
+// the header of the same name (empty header clears it).
+//
+// Settable after creation on purpose. A bucket can acquire encrypted objects
+// long after it was made — by enabling default SSE, or by a copy from an
+// encrypted bucket — and without this the only way out of the resulting
+// refusal would be to delete the objects the commit chain exists to protect.
+func (s *Server) handlePutBucketRecoveryRecipient(w http.ResponseWriter, r *http.Request, bucket string) {
+	if _, err := s.store.GetBucket(r.Context(), bucket); err != nil {
+		s.writeError(w, r, storeError(err))
+		return
+	}
+	rec := r.Header.Get("x-swarm-recovery-recipient")
+	if rec != "" {
+		if _, err := recovery.ParseRecipient(rec); err != nil {
+			s.writeError(w, r, errInvalidArgument.withMessage(err.Error()))
+			return
+		}
+	}
+	if err := s.store.SetBucketRecoveryRecipient(r.Context(), bucket, rec); err != nil {
+		s.writeError(w, r, storeError(err))
+		return
+	}
+	// Objects written before this point keep their references; the next commit
+	// seals them. A bucket whose chain was frozen for want of a recipient
+	// resumes committing from here.
+	s.commits.Notify(bucket)
+	w.WriteHeader(http.StatusOK)
 }

@@ -20,6 +20,7 @@ import (
 	"github.com/petfold/s3warm/internal/auth"
 	"github.com/petfold/s3warm/internal/bee"
 	"github.com/petfold/s3warm/internal/metrics"
+	"github.com/petfold/s3warm/internal/manifest"
 	"github.com/petfold/s3warm/internal/store"
 )
 
@@ -689,6 +690,18 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
+	// A copied encrypted reference needs a recipient in the destination
+	// bucket, or the destination's chain freezes on its next commit — a
+	// silent failure the copier never sees.
+	// ACT buckets are exempt: their references are 64 bytes too, but they have
+	// no commit chain to publish anything into (ErrACTBucket).
+	if !b.ACT && manifest.HasKeyBearingRefs(*srcObj) && b.RecoveryRecipient == "" && s.commits != nil {
+		s.writeError(w, r, errInvalidRequest.withMessage(
+			"copying an encrypted object needs a recovery recipient on the destination bucket "+
+				"so its reference can be sealed into the commit chain: set one with PUT /"+bucket+
+				"?x-swarm-recovery-recipient"))
+		return
+	}
 	// Server-side copy on a content-addressed store is a metadata operation:
 	// the new key points at the same Swarm reference (design §6).
 	obj := *srcObj

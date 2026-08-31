@@ -178,6 +178,10 @@ func (s *Server) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, bu
 	part := store.Part{PartNumber: partNumber, LastModified: time.Now().UTC()}
 	if rangeSpec := r.Header.Get("x-amz-copy-source-range"); rangeSpec == "" || srcObj.SwarmRef == "" {
 		// Whole-object copy on a content-addressed store: reuse the reference.
+		if apiErr := sseCopyBoundary(srcObj, upload.Encrypted); apiErr != nil {
+			s.writeError(w, r, *apiErr)
+			return
+		}
 		part.SwarmRef = srcObj.SwarmRef
 		part.Size = srcObj.Size
 		part.ETag = srcObj.ETag
@@ -563,6 +567,24 @@ func (s *Server) getCopySource(r *http.Request) (*store.Object, *store.Bucket, *
 		return nil, nil, &errNoSuchKey
 	}
 	return obj, srcB, nil
+}
+
+// sseCopyBoundary rejects reference-reusing copies that cross an encryption
+// boundary. A whole-object copy reuses the source's Swarm reference, but the
+// destination object's Encrypted flag comes from the destination request — so
+// copying an SSE object into a plaintext one would leave a 64-byte
+// key-bearing reference inside an object nothing knows to seal, publishing it
+// in the commit chain; and copying plaintext into an SSE object would mark it
+// encrypted while its bytes are not. Both silently break the bucket's
+// promises, exactly as the ACT boundary does.
+func sseCopyBoundary(srcObj *store.Object, dstEncrypted bool) *apiError {
+	if srcObj.Encrypted == dstEncrypted {
+		return nil
+	}
+	e := errInvalidRequest.withMessage(
+		"copies across a server-side-encryption boundary cannot reuse references; " +
+			"download and re-upload instead")
+	return &e
 }
 
 // actCopyBoundary rejects reference-reusing copies that cross an ACT

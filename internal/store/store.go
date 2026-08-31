@@ -182,6 +182,7 @@ type Store interface {
 	DeleteBucket(ctx context.Context, name string) error
 	// SetBucketEncryption sets the bucket-default SSE algorithm ("" clears).
 	SetBucketEncryption(ctx context.Context, bucket, algorithm string) error
+	SetBucketRecoveryRecipient(ctx context.Context, bucket, recipient string) error
 	// SetBucketVersioning sets the versioning status ("Enabled"/"Suspended").
 	SetBucketVersioning(ctx context.Context, bucket, status string) error
 	// SetBucketHead records the bucket's latest commit root and sequence.

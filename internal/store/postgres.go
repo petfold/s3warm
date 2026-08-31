@@ -141,9 +141,18 @@ func OpenPostgres(dsn string) (*Postgres, error) {
 		db.Close()
 		return nil, fmt.Errorf("initializing schema: %w", err)
 	}
-	// Column migrations for databases created by older versions land here,
-	// in the SQLite ALTER-loop pattern (none needed yet — the schema above
-	// is the first Postgres shape).
+	// Column migrations for databases created by older versions. CREATE TABLE
+	// IF NOT EXISTS above is a no-op on an existing table, so every column
+	// added after the first Postgres shape must also appear here or existing
+	// deployments break on upgrade.
+	for _, stmt := range []string{
+		`ALTER TABLE buckets ADD COLUMN IF NOT EXISTS recovery_recipient TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("migrating schema: %w", err)
+		}
+	}
 	return &Postgres{db: db}, nil
 }
 
@@ -262,6 +271,10 @@ func (s *Postgres) SetBucketEncryption(ctx context.Context, bucket, algorithm st
 
 func (s *Postgres) SetBucketVersioning(ctx context.Context, bucket, status string) error {
 	return s.setBucketColumn(ctx, `UPDATE buckets SET versioning = $1 WHERE name = $2`, status, bucket)
+}
+
+func (s *Postgres) SetBucketRecoveryRecipient(ctx context.Context, bucket, recipient string) error {
+	return s.setBucketColumn(ctx, `UPDATE buckets SET recovery_recipient = $1 WHERE name = $2`, recipient, bucket)
 }
 
 func (s *Postgres) SetBucketCORS(ctx context.Context, bucket, corsJSON string) error {

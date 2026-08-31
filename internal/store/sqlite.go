@@ -309,6 +309,17 @@ func (s *SQLite) SetBucketVersioning(ctx context.Context, bucket, status string)
 }
 
 // SetBucketCORS sets the bucket's CORS rules JSON.
+func (s *SQLite) SetBucketRecoveryRecipient(ctx context.Context, bucket, recipient string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE buckets SET recovery_recipient = ? WHERE name = ?`, recipient, bucket)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return ErrBucketNotFound
+	}
+	return nil
+}
+
 func (s *SQLite) SetBucketCORS(ctx context.Context, bucket, corsJSON string) error {
 	res, err := s.db.ExecContext(ctx, `UPDATE buckets SET cors = ? WHERE name = ?`, corsJSON, bucket)
 	if err != nil {

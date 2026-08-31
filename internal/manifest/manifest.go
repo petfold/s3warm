@@ -42,16 +42,70 @@ type Commit struct {
 	Parent    string         `json:"parent,omitempty"` // hex root of the previous commit
 	Timestamp time.Time      `json:"timestamp"`
 	Objects   []store.Object `json:"objects"`
+
+	// sealed counts objects whose references were still sealed after load.
+	sealed int
 }
 
-// SSEDescriptor is the manifest fork entry for an SSE object: a 32-byte
-// reference to this document, mirroring the composite/1 indirection. Mantaray
-// fixes a manifest's entry width from its first entry, so a 64-byte SSE
-// reference cannot be a fork entry directly — and publishing it there would
-// hand out the decryption key anyway.
+// CommitVersion is the commit-document format version. Version 2 added
+// SealedRef: an object's reference may be sealed to the bucket's recovery
+// recipient, so a reader that ignores it would silently produce an index of
+// unreadable rows. Readers must refuse documents newer than they understand.
+const CommitVersion = 2
+
+// SSEDescriptor is the manifest fork entry for an object with sealed
+// references: a 32-byte reference to this document, mirroring the composite/1
+// indirection. Mantaray fixes a manifest's entry width from its first entry,
+// so a 64-byte SSE reference cannot be a fork entry directly — and publishing
+// it there would hand out the decryption key anyway.
+//
+// A composite object seals each part, so SealedParts carries them in order and
+// SealedRef is empty; a single-part object is the reverse.
 type SSEDescriptor struct {
-	Kind      string `json:"s3warm"`    // "sse/1"
-	SealedRef string `json:"sealedRef"` // age-encrypted 64-byte reference
+	Kind        string             `json:"s3warm"`                // "sse/1"
+	SealedRef   string             `json:"sealedRef,omitempty"`   // age-encrypted 64-byte reference
+	SealedParts []SealedPart       `json:"sealedParts,omitempty"` // composite objects
+}
+
+// SealedPart is one part of a composite object with its reference sealed.
+type SealedPart struct {
+	PartNumber int    `json:"partNumber"`
+	SealedRef  string `json:"sealedRef"`
+	Size       int64  `json:"size"`
+}
+
+// encRefHexLen is the hex length of an encrypted Swarm reference: 64 bytes,
+// address plus embedded decryption key.
+const encRefHexLen = 128
+
+// keyBearing reports whether a reference carries its own decryption key, and
+// therefore must never be published in the clear.
+//
+// This is decided per reference, not per object. An object's Encrypted flag
+// describes how it was written; a reference can arrive from somewhere else —
+// a whole-object UploadPartCopy reuses the source's reference, so a part of an
+// unencrypted object can hold an encrypted one. Trusting the object flag there
+// published exactly the capability this package exists to protect.
+func keyBearing(ref string) bool {
+	if len(ref) != encRefHexLen {
+		return false
+	}
+	_, err := hex.DecodeString(ref)
+	return err == nil
+}
+
+// HasKeyBearingRefs reports whether any reference in the object must be sealed
+// before the object can enter the commit chain.
+func HasKeyBearingRefs(o store.Object) bool {
+	if keyBearing(o.SwarmRef) {
+		return true
+	}
+	for _, p := range o.Parts {
+		if keyBearing(p.SwarmRef) {
+			return true
+		}
+	}
+	return false
 }
 
 // wireObject is the commit document's on-Swarm shape for one object. It
@@ -129,7 +183,7 @@ func seal(o store.Object, rec age.Recipient) (wireObject, error) {
 			ETag: p.ETag, LastModified: p.LastModified,
 			ActAt: p.ActAt, ActHistory: p.ActHistory,
 		}
-		if o.Encrypted && p.SwarmRef != "" {
+		if keyBearing(p.SwarmRef) {
 			sealed, err := recovery.Encrypt(rec, p.SwarmRef)
 			if err != nil {
 				return wireObject{}, err
@@ -138,7 +192,7 @@ func seal(o store.Object, rec age.Recipient) (wireObject, error) {
 		}
 		w.Parts = append(w.Parts, wp)
 	}
-	if o.Encrypted && o.SwarmRef != "" {
+	if keyBearing(o.SwarmRef) {
 		sealed, err := recovery.Encrypt(rec, o.SwarmRef)
 		if err != nil {
 			return wireObject{}, err
@@ -151,7 +205,8 @@ func seal(o store.Object, rec age.Recipient) (wireObject, error) {
 // open converts a wire row back to an index row, decrypting sealed references
 // when an identity is supplied. Without one, a sealed row comes back with an
 // empty SwarmRef and the caller must treat it as unrestorable.
-func open(w wireObject, id age.Identity) (store.Object, error) {
+func open(w wireObject, id age.Identity) (store.Object, bool, error) {
+	sealed := false
 	o := store.Object{
 		Bucket: w.Bucket, Key: w.Key, SwarmRef: w.SwarmRef, BatchID: w.BatchID,
 		Size: w.Size, ETag: w.ETag, ContentType: w.ContentType,
@@ -168,23 +223,31 @@ func open(w wireObject, id age.Identity) (store.Object, error) {
 			ETag: wp.ETag, LastModified: wp.LastModified,
 			ActAt: wp.ActAt, ActHistory: wp.ActHistory,
 		}
-		if wp.SealedRef != "" && id != nil {
-			ref, err := recovery.Decrypt(id, wp.SealedRef)
-			if err != nil {
-				return store.Object{}, fmt.Errorf("part %d of %q: %w", wp.PartNumber, w.Key, err)
+		if wp.SealedRef != "" {
+			if id == nil {
+				sealed = true
+			} else {
+				ref, err := recovery.Decrypt(id, wp.SealedRef)
+				if err != nil {
+					return store.Object{}, false, fmt.Errorf("part %d of %q: %w", wp.PartNumber, w.Key, err)
+				}
+				p.SwarmRef = ref
 			}
-			p.SwarmRef = ref
 		}
 		o.Parts = append(o.Parts, p)
 	}
-	if w.SealedRef != "" && id != nil {
-		ref, err := recovery.Decrypt(id, w.SealedRef)
-		if err != nil {
-			return store.Object{}, fmt.Errorf("object %q: %w", w.Key, err)
+	if w.SealedRef != "" {
+		if id == nil {
+			sealed = true
+		} else {
+			ref, err := recovery.Decrypt(id, w.SealedRef)
+			if err != nil {
+				return store.Object{}, false, fmt.Errorf("object %q: %w", w.Key, err)
+			}
+			o.SwarmRef = ref
 		}
-		o.SwarmRef = ref
 	}
-	return o, nil
+	return o, sealed, nil
 }
 
 // LoadSaver persists mantaray nodes and commit documents through the Bee
@@ -231,7 +294,7 @@ func Build(ctx context.Context, ls mantaray.LoadSaver, c *Commit, rec age.Recipi
 	root.SetObfuscationKey(mantaray.ZeroObfuscationKey)
 
 	for _, o := range c.Objects {
-		if o.Encrypted && rec == nil {
+		if HasKeyBearingRefs(o) && rec == nil {
 			return "", ErrNoRecoveryRecipient
 		}
 		entry, meta, err := entryFor(ctx, ls, o, rec)
@@ -267,7 +330,7 @@ func Build(ctx context.Context, ls mantaray.LoadSaver, c *Commit, rec age.Recipi
 		return "", fmt.Errorf("saving commit document: %w", err)
 	}
 	err = root.Add(ctx, []byte(CommitPath), docRef,
-		map[string]string{"Content-Type": "application/json", "s3warm": "commit/1"}, ls)
+		map[string]string{"Content-Type": "application/json", "s3warm": "commit/2"}, ls)
 	if err != nil {
 		return "", err
 	}
@@ -289,12 +352,27 @@ func entryFor(ctx context.Context, ls mantaray.LoadSaver, o store.Object, rec ag
 	// reference that instead. `bzz://{root}/{key}` consequently serves the
 	// descriptor, not the object: an encrypted object is not browsable, which
 	// is the point.
-	if o.Encrypted && (o.SwarmRef != "" || len(o.Parts) > 0) {
-		sealed, err := recovery.Encrypt(rec, o.SwarmRef)
-		if err != nil {
-			return nil, nil, err
+	if HasKeyBearingRefs(o) {
+		d := SSEDescriptor{Kind: "sse/1"}
+		if keyBearing(o.SwarmRef) {
+			sealed, err := recovery.Encrypt(rec, o.SwarmRef)
+			if err != nil {
+				return nil, nil, err
+			}
+			d.SealedRef = sealed
 		}
-		desc, err := json.Marshal(SSEDescriptor{Kind: "sse/1", SealedRef: sealed})
+		for _, p := range o.Parts {
+			if !keyBearing(p.SwarmRef) {
+				continue
+			}
+			sealed, err := recovery.Encrypt(rec, p.SwarmRef)
+			if err != nil {
+				return nil, nil, err
+			}
+			d.SealedParts = append(d.SealedParts, SealedPart{
+				PartNumber: p.PartNumber, SealedRef: sealed, Size: p.Size})
+		}
+		desc, err := json.Marshal(d)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -359,32 +437,30 @@ func GetCommit(ctx context.Context, ls mantaray.LoadSaver, rootHex string, id ag
 		Parent: w.Parent, Timestamp: w.Timestamp,
 		Objects: make([]store.Object, 0, len(w.Objects)),
 	}
+	if w.Version > CommitVersion {
+		return nil, fmt.Errorf("commit document version %d is newer than this gateway understands (%d): upgrade s3warm",
+			w.Version, CommitVersion)
+	}
 	for _, wo := range w.Objects {
-		o, err := open(wo, id)
+		o, sealed, err := open(wo, id)
 		if err != nil {
 			return nil, err
+		}
+		if sealed {
+			c.sealed++
 		}
 		c.Objects = append(c.Objects, o)
 	}
 	return &c, nil
 }
 
-// SealedCount reports how many of a commit's objects carry sealed references
-// that were not opened — i.e. how much of the bucket is unrestorable with the
-// identity supplied (none, if it was the right one).
-func (c *Commit) SealedCount() int {
-	n := 0
-	for _, o := range c.Objects {
-		if o.Encrypted && o.SwarmRef == "" && len(o.Parts) == 0 {
-			n++
-			continue
-		}
-		for _, p := range o.Parts {
-			if p.SwarmRef == "" {
-				n++
-				break
-			}
-		}
-	}
-	return n
-}
+// SealedCount reports how many of a commit's objects still carry sealed
+// references after loading — i.e. how much of the bucket cannot be restored
+// with the identity supplied (none, if it was the right one).
+//
+// This counts what the commit document actually said, rather than inferring
+// it from an empty SwarmRef: a zero-byte object legitimately has no reference
+// and nothing sealed, and inferring would make such a bucket permanently
+// unrestorable.
+func (c *Commit) SealedCount() int { return c.sealed }
+

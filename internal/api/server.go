@@ -207,6 +207,10 @@ func (s *Server) dispatchBucket(w http.ResponseWriter, r *http.Request, bucket s
 			s.handlePutBucketEncryption(w, r, bucket)
 			return
 		}
+		if q.Has("x-swarm-recovery-recipient") {
+			s.handlePutBucketRecoveryRecipient(w, r, bucket)
+			return
+		}
 		if q.Has("cors") {
 			s.handlePutBucketCors(w, r, bucket)
 			return

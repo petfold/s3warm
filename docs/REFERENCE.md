@@ -200,7 +200,7 @@ details on top of it.
 | `x-swarm-redundancy-strategy` | GET | Erasure-coding fetch strategy override (0–4) |
 | `x-swarm-redundancy-fallback-mode` | GET | Fetch fallback (`true`/`false`) |
 | `x-swarm-act: true` | CreateBucket | Make the bucket **ACT-protected**: every object is uploaded under Swarm's Access Control Trie (see below) |
-| `x-swarm-recovery-recipient` | CreateBucket | An age X25519 recipient (`age1...`). Required before a bucket holding **SSE** objects can commit: their references are sealed to it before entering the public commit chain (see below) |
+| `x-swarm-recovery-recipient` | CreateBucket, `PUT /{bucket}?x-swarm-recovery-recipient` | An age X25519 recipient (`age1...`). Required before a bucket holding **SSE** objects can commit: their references are sealed to it before entering the public commit chain (see below). Settable after creation; an empty value clears it |
 | `x-swarm-recovery-identity` | `POST ?x-swarm-restore=` | The matching age identity (`AGE-SECRET-KEY-1...`), needed to rebuild an index from a commit root. Supplied per request and never stored |
 
 ### Response headers
@@ -255,6 +255,7 @@ Bee resolves the bucket's latest root via
 |---|---|
 | `PUT /{bucket}?x-swarm-snapshot=<label>` | Forces a commit, records `<label>` → root, pins the root on the gateway's Bee node. Returns JSON `{bucket, label, root, seq, createdAt}` |
 | `GET /{bucket}?x-swarm-snapshot` | Lists snapshots (JSON) |
+| `PUT /{bucket}?x-swarm-recovery-recipient` | Sets (or clears) the bucket's recovery recipient, taken from the header of the same name. A bucket whose chain was frozen for want of a recipient resumes committing |
 | `POST /{bucket}?x-swarm-restore=<label or 64-hex root>` | Atomic whole-bucket rollback: replaces the entire object set from the commit document and points the head at that root. Returns JSON `{bucket, root, seq, objects}`. If the commit contains sealed (SSE) references, pass `x-swarm-recovery-identity`; without it the restore is refused rather than performed half-blind |
 
 Labels match `[A-Za-z0-9._-]{1,64}`. Restore accepts any commit root whose
@@ -308,14 +309,6 @@ uploaded *before* the grant become readable too.
 - ACT references are 64-byte encrypted references: possession alone grants
   nothing, so `x-swarm-reference` is still exposed — but a bare `bzz://`
   URL will not work; native access needs the three values above.
-**SSE objects and the chain.** An SSE object's Swarm reference is 64 bytes and embeds its decryption key, so it can be neither a manifest fork entry (mantaray entries are single-width, and the commit document's own entry is 32 bytes) nor public. Such objects are represented by an `sse/1` descriptor — the same indirection as `composite/1` — holding the reference **encrypted to the bucket's recovery recipient**, and the commit document carries `SealedRef` in place of `SwarmRef`. Consequences, stated plainly:
-
-- A bucket holding SSE objects and **no** recovery recipient **cannot commit**. Snapshots, rollback and feed checkpoints are unavailable for it, and `PUT ?x-swarm-snapshot=` returns `400` saying so. Set `x-swarm-recovery-recipient` at CreateBucket.
-- `bzz://{root}/{key}` serves the descriptor, not the object: an encrypted object is not browsable. That is the point of encrypting it.
-- Restoring such a bucket needs the identity, passed per request. The gateway serves a live bucket from its index and never stores the identity.
-- Losing the identity means losing the ability to rebuild an index from a root. The objects remain readable through a gateway that still has its index; they are unrecoverable from the bare chain. Keep it wherever you keep the rest of your recovery material.
-- The chain still publishes key names, sizes, ETags, batch IDs and user metadata for every bucket. Encryption covers the object bytes, not the shape of the bucket.
-
 - **The public commit chain is off** for ACT buckets (it would leak key
   names and structure), so snapshots/restore are unavailable there.
 - Reference-reusing copies (CopyObject, whole-object UploadPartCopy)
@@ -324,6 +317,19 @@ uploaded *before* the grant become readable too.
   the bucket stay O(1).
 
 ---
+
+## Encrypted objects in the commit chain
+
+An SSE object's Swarm reference is 64 bytes and embeds its decryption key, so it can be neither a manifest fork entry (mantaray entries are single-width, and the commit document's own entry is 32 bytes) nor public. Such objects are represented by an `sse/1` descriptor — the same indirection as `composite/1` — holding the reference **encrypted to the bucket's recovery recipient**, and the commit document carries `SealedRef` in place of `SwarmRef`. Consequences, stated plainly:
+
+- A bucket holding SSE objects and **no** recovery recipient **cannot commit**. Snapshots, rollback and feed checkpoints are unavailable for it, and `PUT ?x-swarm-snapshot=` returns `400` saying so. Set a recipient — at CreateBucket, or afterwards with `PUT /{bucket}?x-swarm-recovery-recipient` — and the chain resumes. You never have to delete objects to unfreeze a bucket.
+- Sealing follows the **reference**, not the object: any 64-byte reference is sealed wherever it appears, including one that reached a plaintext object through a copy. Reference-reusing copies (CopyObject, whole-object UploadPartCopy) cannot cross an SSE boundary, for the same reason they cannot cross an ACT one.
+- Commit documents are **version 2** (`s3warm: commit/2`). A reader that does not understand `SealedRef` would silently build an index of empty references, so readers must refuse documents newer than they understand.
+- Sealing is randomised per commit, so a commit document changes even when the bucket has not. For buckets with encrypted objects the document's chunks therefore do not dedup against the previous commit — object chunks still do, and unchanged manifest forks are still shared, but the document itself is rewritten each time.
+- `bzz://{root}/{key}` serves the descriptor, not the object: an encrypted object is not browsable. That is the point of encrypting it.
+- Restoring such a bucket needs the identity, passed per request. The gateway serves a live bucket from its index and never stores the identity.
+- Losing the identity means losing the ability to rebuild an index from a root. The objects remain readable through a gateway that still has its index; they are unrecoverable from the bare chain. Keep it wherever you keep the rest of your recovery material.
+- The chain still publishes key names, sizes, ETags, batch IDs and user metadata for every bucket. Encryption covers the object bytes, not the shape of the bucket.
 
 ## Errors
 

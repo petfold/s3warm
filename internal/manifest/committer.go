@@ -104,7 +104,6 @@ func (c *Committer) Run(ctx context.Context) {
 					// A frozen chain is invisible from the S3 API — writes keep
 					// succeeding while recovery quietly stops covering new data —
 					// so this is counted, not just logged.
-					metrics.CommitFailures.WithLabelValues(b).Inc()
 					c.log.Warn("commit failed", "bucket", b, "err", err)
 				}
 			}
@@ -157,7 +156,7 @@ func (c *Committer) CommitNow(ctx context.Context, bucket string) (string, int64
 	}
 
 	commit := &Commit{
-		Version:   1,
+		Version:   CommitVersion,
 		Bucket:    bucket,
 		Seq:       b.CommitSeq + 1,
 		Parent:    b.HeadRoot,
@@ -173,6 +172,10 @@ func (c *Committer) CommitNow(ctx context.Context, bucket string) (string, int64
 	ls := NewLoadSaver(c.bee, batch, c.deferred)
 	root, err := Build(ctx, ls, commit, rec)
 	if err != nil {
+		// Counted here rather than in the debounce loop so synchronous
+		// snapshots are covered too: a frozen chain is invisible from the S3
+		// API either way.
+		metrics.CommitFailures.Inc()
 		return "", 0, err
 	}
 	if err := c.store.SetBucketHead(ctx, bucket, root, commit.Seq); err != nil {

@@ -415,3 +415,60 @@ func TestConcurrentConditionalCreate(t *testing.T) {
 		}
 	})
 }
+
+// The recovery recipient must persist and be settable after creation, on every
+// backend. Its absence from this suite is why a missing Postgres migration
+// could ship: CREATE TABLE IF NOT EXISTS is a no-op on an existing table, so
+// only a round trip through a real backend catches it.
+func TestRecoveryRecipientRoundTrip(t *testing.T) {
+	forEachStore(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		const rec = "age1jl0cpxxp7gjsup5n7addcdx6zwdfwca9azw3km9d30ngp2fkqgqq06nad7"
+
+		if err := s.CreateBucket(ctx, Bucket{Name: "made-with", CreatedAt: time.Now().UTC(),
+			RecoveryRecipient: rec}); err != nil {
+			t.Fatal(err)
+		}
+		b, err := s.GetBucket(ctx, "made-with")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b.RecoveryRecipient != rec {
+			t.Fatalf("not persisted through CreateBucket: %q", b.RecoveryRecipient)
+		}
+
+		// Settable afterwards, which is the escape from a frozen chain.
+		if err := s.CreateBucket(ctx, Bucket{Name: "set-later", CreatedAt: time.Now().UTC()}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SetBucketRecoveryRecipient(ctx, "set-later", rec); err != nil {
+			t.Fatal(err)
+		}
+		if b, err = s.GetBucket(ctx, "set-later"); err != nil || b.RecoveryRecipient != rec {
+			t.Fatalf("not persisted through the setter: %q %v", b.RecoveryRecipient, err)
+		}
+
+		// And clearable.
+		if err := s.SetBucketRecoveryRecipient(ctx, "set-later", ""); err != nil {
+			t.Fatal(err)
+		}
+		if b, err = s.GetBucket(ctx, "set-later"); err != nil || b.RecoveryRecipient != "" {
+			t.Fatalf("not cleared: %q %v", b.RecoveryRecipient, err)
+		}
+
+		// ListBuckets must carry it too — a different column list.
+		list, err := s.ListBuckets(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, lb := range list {
+			if lb.Name == "made-with" && lb.RecoveryRecipient != rec {
+				t.Fatalf("ListBuckets dropped the recipient: %q", lb.RecoveryRecipient)
+			}
+		}
+
+		if err := s.SetBucketRecoveryRecipient(ctx, "no-such-bucket", rec); !errors.Is(err, ErrBucketNotFound) {
+			t.Fatalf("want ErrBucketNotFound, got %v", err)
+		}
+	})
+}
