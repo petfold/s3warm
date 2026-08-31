@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/petfold/s3warm/internal/bee"
-	"github.com/petfold/s3warm/internal/manifest"
 	"github.com/petfold/s3warm/internal/store"
 )
 
@@ -177,12 +176,17 @@ func (s *Server) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, bu
 	}
 
 	part := store.Part{PartNumber: partNumber, LastModified: time.Now().UTC()}
-	if rangeSpec := r.Header.Get("x-amz-copy-source-range"); rangeSpec == "" || srcObj.SwarmRef == "" {
+	rangeSpec := r.Header.Get("x-amz-copy-source-range")
+	// Reference reuse is only safe while the copy stays on one side of the
+	// encryption boundary. The reference carries the source's encryption with
+	// it, so reusing it across the boundary would either put a key-bearing
+	// reference in an object nothing seals, or mark an object encrypted whose
+	// bytes are not. S3 allows the copy, so re-stream it instead of refusing:
+	// the read decrypts, the write re-encrypts under the destination's
+	// setting, and the O(1) path is simply not taken.
+	crossesSSE := srcObj.Encrypted != upload.Encrypted
+	if srcObj.SwarmRef == "" || (rangeSpec == "" && !crossesSSE) {
 		// Whole-object copy on a content-addressed store: reuse the reference.
-		if apiErr := sseCopyBoundary(srcObj, upload.Encrypted); apiErr != nil {
-			s.writeError(w, r, *apiErr)
-			return
-		}
 		part.SwarmRef = srcObj.SwarmRef
 		part.Size = srcObj.Size
 		part.ETag = srcObj.ETag
@@ -193,9 +197,12 @@ func (s *Server) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, bu
 		}
 	} else {
 		// x-amz-copy-source-range is strictly bytes=first-last, within bounds
-		// (no clamping, no suffix/open forms).
+		// (no clamping, no suffix/open forms). Absent, this is a whole-object
+		// copy that crossed the encryption boundary and must be re-streamed.
 		var st, en int64
-		if _, err := fmt.Sscanf(rangeSpec, "bytes=%d-%d", &st, &en); err != nil ||
+		if rangeSpec == "" {
+			st, en = 0, srcObj.Size-1
+		} else if _, err := fmt.Sscanf(rangeSpec, "bytes=%d-%d", &st, &en); err != nil ||
 			fmt.Sprintf("bytes=%d-%d", st, en) != rangeSpec ||
 			st > en || en >= srcObj.Size {
 			s.writeError(w, r, errInvalidRange)
@@ -568,31 +575,6 @@ func (s *Server) getCopySource(r *http.Request) (*store.Object, *store.Bucket, *
 		return nil, nil, &errNoSuchKey
 	}
 	return obj, srcB, nil
-}
-
-// sseCopyBoundary rejects reference-reusing copies that cross an encryption
-// boundary. A whole-object copy reuses the source's Swarm reference, but the
-// destination object's Encrypted flag comes from the destination request — so
-// copying an SSE object into a plaintext one would leave a 64-byte
-// key-bearing reference inside an object nothing knows to seal, publishing it
-// in the commit chain; and copying plaintext into an SSE object would mark it
-// encrypted while its bytes are not. Both silently break the bucket's
-// promises, exactly as the ACT boundary does.
-func sseCopyBoundary(srcObj *store.Object, dstEncrypted bool) *apiError {
-	// Keyed off the reference, not the flag — the same doctrine as the rest of
-	// the sealing path. A zero-byte encrypted object has no reference to
-	// smuggle, so refusing that copy would be a behaviour change buying
-	// nothing.
-	if !manifest.HasKeyBearingRefs(*srcObj) && !dstEncrypted {
-		return nil
-	}
-	if srcObj.Encrypted == dstEncrypted {
-		return nil
-	}
-	e := errInvalidRequest.withMessage(
-		"copies across a server-side-encryption boundary cannot reuse references; " +
-			"download and re-upload instead")
-	return &e
 }
 
 // actCopyBoundary rejects reference-reusing copies that cross an ACT
