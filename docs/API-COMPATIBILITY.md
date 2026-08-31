@@ -46,7 +46,7 @@ Design rationale: [`DESIGN.md`](DESIGN.md).
 | CopyObject | ✅ | O(1) — same Swarm reference; `x-amz-metadata-directive` COPY/REPLACE; `x-amz-copy-source-if-*` conditionals; `?versionId` sources with `x-amz-copy-source-version-id` |
 | CreateMultipartUpload | ✅ | Metadata/content-type/storage-class captured; batch validated at initiate |
 | UploadPart | ✅ | Parts stream straight to `/bytes`, no staging; 1–10000, integrity headers enforced |
-| UploadPartCopy | ✅ | Whole-object simple source is O(1) (same reference); byte-range re-streams; composite source 🎯 |
+| UploadPartCopy | ✅ | Whole-object simple source is O(1) (same reference); byte-range re-streams; composite source 🎯. A whole-object copy cannot cross an SSE boundary (`400`) — reusing the reference would put a key-bearing one in an object nothing seals; byte-range copies re-stream and are unaffected. Same rule as the ACT boundary; download and re-upload instead |
 | CompleteMultipartUpload | ✅ | Composite object + S3 multipart ETag; retry-idempotent; conditional (`If-Match`/`If-None-Match`); min part size enforced; async consolidation 🎯 |
 | AbortMultipartUpload | ✅ | Abandoned parts expire with stamps — GC is automatic |
 | ListParts | ✅ | With part-number-marker/max-parts pagination |

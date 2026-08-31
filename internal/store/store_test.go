@@ -488,11 +488,16 @@ func TestPostgresMigratesPreExistingBucketsTable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open postgres: %v", err)
 	}
-	defer admin.Close()
 	if _, err := admin.Exec("CREATE SCHEMA " + schema); err != nil {
+		admin.Close()
 		t.Fatalf("create schema: %v", err)
 	}
-	t.Cleanup(func() { admin.Exec("DROP SCHEMA " + schema + " CASCADE") }) //nolint:errcheck
+	// Drop and close in one cleanup: a deferred Close would run before
+	// t.Cleanup and leave the schema behind for the next run to collide with.
+	t.Cleanup(func() {
+		admin.Exec("DROP SCHEMA " + schema + " CASCADE") //nolint:errcheck
+		admin.Close()
+	})
 
 	// The pre-upgrade shape: every column except recovery_recipient.
 	if _, err := admin.Exec(`CREATE TABLE ` + schema + `.buckets (
@@ -509,7 +514,11 @@ func TestPostgresMigratesPreExistingBucketsTable(t *testing.T) {
 		t.Fatalf("seed legacy row: %v", err)
 	}
 
-	s, err := OpenPostgres(dsn + "?search_path=" + schema)
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	s, err := OpenPostgres(dsn + sep + "search_path=" + schema)
 	if err != nil {
 		t.Fatalf("upgrading an existing deployment must not fail: %v", err)
 	}
