@@ -301,6 +301,39 @@ encrypted objects). Set it per request, as a bucket default
 (`put-bucket-encryption`, exactly as on AWS), or gateway-wide (`-encrypt`).
 SSE-C and SSE-KMS are rejected rather than silently ignored.
 
+### Encrypted buckets and the commit chain
+
+One thing to set up front. An encrypted object's reference *embeds its
+decryption key*, and the commit chain (§5) is published on Swarm for anyone
+to read — so the chain cannot carry that reference in the clear. Give the
+bucket a **recovery recipient** and it seals them instead:
+
+```bash
+age-keygen -o recovery.key                  # keep this file; it is a secret
+aws --endpoint-url http://localhost:8333 s3api create-bucket --bucket vault \
+    --metadata x-swarm-recovery-recipient=age1...   # the public half
+```
+
+A bucket holding encrypted objects **without** one will not commit: snapshots,
+rollback and feed checkpoints stop, with a `400` telling you so. Set a
+recipient at any time — including on a bucket that is already stuck — and the
+chain resumes on the next commit. You never have to delete objects to fix it.
+
+Restoring such a bucket needs the private half, passed on the request and
+never stored by the gateway:
+
+```bash
+curl -X POST "http://localhost:8333/vault?x-swarm-restore=$ROOT" \
+     -H "x-swarm-recovery-identity: $(cat recovery.key)"
+```
+
+**Guard that key like the data.** Without it, an encrypted bucket cannot be
+rebuilt from a bare commit root — the objects stay readable through a gateway
+that still has its index, but the chain alone will not bring them back. And
+rotating the recipient does not re-seal old roots: each stays sealed to
+whichever key was current when it was written, so keep retired keys as long as
+you keep the roots that need them.
+
 ## 7. Teams and private sharing
 
 **Multiple users.** Give each user their own access keys with a

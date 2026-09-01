@@ -27,7 +27,9 @@ S3 clients (aws cli, boto3, rclone, mc, restic, SDKs)
 ([the executable claim](test/s3tests/passing.txt)); objects, listings,
 multipart, conditional writes, presigned URLs, streaming signatures,
 checksums, SSE-S3, CORS, versioning, tagging and multi-tenant credentials —
-plus Swarm-native commit chains with atomic whole-bucket snapshot/rollback,
+plus Swarm-native commit chains with atomic whole-bucket snapshot/rollback
+(encrypted buckets included: their key-bearing references are sealed to a
+recovery key you hold, so a commit root stays safe to publish),
 and private buckets whose grants are enforced by Swarm itself (ACT): a
 grantee reads them from their own Bee node with no gateway in the path.
 Scales to multiple gateways over a shared Postgres index, and keeps the
@@ -88,6 +90,7 @@ internal/api/      S3 REST routing, XML, handlers, CORS, snapshots, grants
 internal/auth/     SigV4: header, presigned, streaming (aws-chunked)
 internal/bee/      Bee HTTP API client
 internal/manifest/ commit chain: mantaray manifests, feeds, committer
+internal/recovery/ sealing of key-bearing references for the commit chain
 internal/stamp/    postage batch manager, chequebook keeper, stamp autopilot
 internal/store/    metadata index (SQLite, Postgres for HA, in-memory)
 demos/             runnable walkthroughs
